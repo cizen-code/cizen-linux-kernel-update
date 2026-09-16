@@ -1,0 +1,33 @@
+# Compilación / artefactos
+*.o
+*.ko
+*.mod
+*.mod.c
+*.symvers
+*.order
+*.cmd
+*.a
+*.tar.xz
+*.sign
+*.pkg.tar.zst
+build/
+linux-*.config
+
+# Estado del notificador
+~/.local/state/kernel-update/
+
+# Copias de seguridad y temporales
+*~
+*.bak
+*.tmp
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# Posibles secretos (no commitear)
+*.pem
+*.key
+*id_ed25519*
+*token*

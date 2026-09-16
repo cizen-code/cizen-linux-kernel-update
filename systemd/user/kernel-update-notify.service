@@ -1,0 +1,12 @@
+[Unit]
+Description=Comprobar nueva release estable del kernel Cizen (kernel-update.sh)
+Documentation=man:kernel-update-notify.sh
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/cizen/kernel-update-notify.sh
+TimeoutStartSec=90
+
+[Install]
+WantedBy=default.target
