@@ -1,0 +1,11 @@
+[Unit]
+Description=Comprobar actualizaciones de Arch (pacman, AUR, Flatpak)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/arch-update/arch-update-checker.sh
+SyslogIdentifier=arch-update-checker
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=15min
+KillMode=process

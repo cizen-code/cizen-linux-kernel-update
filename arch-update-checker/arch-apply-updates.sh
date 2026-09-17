@@ -217,7 +217,7 @@ fi
 ### REFRESCO (background, no bloqueante) ###
 echo
 if (( actualizado == 1 )); then
-  setsid nohup sudo /usr/local/bin/arch-update-checker.sh --quick-refresh >/dev/null 2>&1 &
+  setsid nohup sudo /usr/local/bin/arch-update/arch-update-checker.sh --quick-refresh >/dev/null 2>&1 &
   disown
   echo "✔ Refresco lanzado en segundo plano (se completará en unos segundos)."
 else

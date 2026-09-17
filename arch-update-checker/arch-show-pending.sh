@@ -20,7 +20,7 @@ if [[ -s "$PENDING" ]]; then
   echo
   read -r -p "¿Desea realizar la actualización ahora? [S/n] " r
   if [[ ! "$r" =~ ^[Nn] ]]; then
-    exec env AUC_ALREADY_SHOWN=1 AUC_AUTO_WINDOW="${AUC_AUTO_WINDOW:-}" /usr/local/bin/arch-apply-updates.sh
+    exec env AUC_ALREADY_SHOWN=1 AUC_AUTO_WINDOW="${AUC_AUTO_WINDOW:-}" /usr/local/bin/arch-update/arch-apply-updates.sh
   fi
   pause_final
 else

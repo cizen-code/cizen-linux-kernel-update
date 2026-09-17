@@ -1,0 +1,12 @@
+[Unit]
+Description=Comprobar actualizaciones cada 6 horas (persistente)
+
+[Timer]
+OnCalendar=*-*-* 00/6:00:00
+Persistent=true
+RandomizedDelaySec=10min
+AccuracySec=1min
+Unit=arch-update-checker.service
+
+[Install]
+WantedBy=timers.target

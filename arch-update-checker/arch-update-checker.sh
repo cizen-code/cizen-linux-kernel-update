@@ -38,7 +38,7 @@ LOCK_FILE="${PACMAN_DB}/db.lck"
 notify_users() {
   local hash="$1"
   command -v runuser >/dev/null 2>&1 || return 0
-  [[ -x /usr/local/bin/arch-update-notify-agent.sh ]] || return 0
+  [[ -x /usr/local/bin/arch-update/arch-update-notify-agent.sh ]] || return 0
   local uid user bus home sid leader line dpy wdisp desk
   while read -r uid user; do
     [[ "$uid" =~ ^[0-9]+$ && -n "$user" ]] || continue
@@ -73,7 +73,7 @@ notify_users() {
       XDG_RUNTIME_DIR="/run/user/${uid}" \
       DBUS_SESSION_BUS_ADDRESS="unix:path=${bus}" \
       "${extra[@]}" \
-      setsid nohup /usr/local/bin/arch-update-notify-agent.sh >/dev/null 2>&1 &
+      setsid nohup /usr/local/bin/arch-update/arch-update-notify-agent.sh >/dev/null 2>&1 &
   done < <(loginctl list-users --no-legend 2>/dev/null | awk '{print $1, $2}')
 }
 

@@ -11,17 +11,40 @@ notificaciones de escritorio y flujos de compilación a plena prioridad.
 │   ├── kernel-update.sh           # Motor principal (descarga→Kconfig→build→pacman→UKI)
 │   ├── kernel-update-notify.sh    # Notificador de releases nuevas de kernel.org
 │   ├── kernel-update-menu.sh      # Menú interactivo de modos (check/build/fast)
-│   └── profiles/                  # Perfiles de configuración del kernel
+│   └── profiles/                  # Perfiles + config base (linux-*-cizen-v3.config)
 ├── arch-update-checker/           # Suite de actualización de Arch Linux
 │   ├── arch-update-checker.sh     # Comprueba repos/AUR/flatpak/noticias
 │   ├── arch-apply-updates.sh      # Aplica actualizaciones
 │   ├── arch-update-notify-agent.sh# Notificador de escritorio con acciones
+│   ├── arch-update-notify-user.sh # Wrapper del agente para la unit de usuario
 │   ├── arch-show-pending.sh       # Muestra actualizaciones pendientes
-│   └── arch-open-terminal.sh      # Abre terminal con la ruta indicada
-└── systemd/user/                  # Units de usuario (timer 6h + oneshot)
-    ├── kernel-update-notify.service
-    └── kernel-update-notify.timer
+│   └── arch-open-terminal.sh      # Abre terminal con la ruta indicada (compartido)
+└── systemd/
+    ├── user/                      # Units de usuario
+    │   ├── kernel-update-notify.service
+    │   ├── kernel-update-notify.timer
+    │   └── arch-update-notify.service
+    └── system/                    # Units de sistema
+        ├── arch-update-checker.service
+        └── arch-update-checker.timer
 ```
+
+## Instalación (layout en el host)
+
+Cada suite vive en su propio subdirectorio de `/usr/local/bin/` (no mezclada
+con otras herramientas):
+
+```
+/usr/local/bin/kernel-update/          # kernel-update.sh + notify + menu + profiles/
+/usr/local/bin/arch-update/            # los 5 scripts de la suite Arch
+/usr/local/bin/arch-open-terminal.sh   # helper compartido por ambas suites (plano)
+```
+
+- Config base del kernel: `linux-<versión>-cizen-v3.config` dentro de
+  `/usr/local/bin/kernel-update/profiles/` (override: `CIZEN_CONFIG_DIR`).
+- Units de usuario en `~/.config/systemd/user/`; units de sistema en
+  `/etc/systemd/system/`.
+
 
 ## Modos de kernel-update.sh
 
@@ -39,8 +62,8 @@ notificaciones de escritorio y flujos de compilación a plena prioridad.
 ### Menú interactivo
 
 ```bash
-~/kernel-update-menu.sh          # sin versión (consulta hábil)
-~/kernel-update-menu.sh <remote> # con versión remota en el encabezado
+/usr/local/bin/kernel-update/kernel-update-menu.sh          # sin versión (consulta hábil)
+/usr/local/bin/kernel-update/kernel-update-menu.sh <remote> # con versión remota en el encabezado
 ```
 
 Variables de entorno para override:
@@ -67,9 +90,9 @@ systemctl --user enable --now kernel-update-notify.timer
 
 ## Suite Arch Update Checker
 
-Los scripts de `/usr/local/bin/` comprueban repositorios oficiales, AUR,
-Flatpak y noticias de Arch Linux. Generan un resumen en
-`/var/cache/arch-update-checker/pending` y notifican con acciones accionables.
+Los scripts de la suite (instalados en `/usr/local/bin/arch-update/`) comprueban
+repositorios oficiales, AUR, Flatpak y noticias de Arch Linux. Generan un resumen
+en `/var/cache/arch-update-checker/pending` y notifican con acciones accionables.
 
 La consulta de kernel.org se eliminó de esta suite (2026-09-16); el kernel lo
 vigila el notificador `kernel-update-notify.sh` por separado.

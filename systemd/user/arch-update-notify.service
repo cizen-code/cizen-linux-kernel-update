@@ -1,0 +1,12 @@
+[Unit]
+Description=Notificar actualizaciones pendientes al iniciar sesión gráfica
+After=graphical-session.target
+ConditionPathExists=/var/cache/arch-update-checker/pending
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/arch-update/arch-update-notify-user.sh
+KillMode=process
+
+[Install]
+WantedBy=graphical-session.target

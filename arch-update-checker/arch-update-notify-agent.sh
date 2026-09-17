@@ -122,11 +122,11 @@ fi
 case "$resp" in
   update)
     alog "Acción: Actualizar ahora"
-    /usr/local/bin/arch-open-terminal.sh /usr/local/bin/arch-apply-updates.sh
+    /usr/local/bin/arch-open-terminal.sh /usr/local/bin/arch-update/arch-apply-updates.sh
     ;;
   details|default)
     alog "Acción: Ver detalles"
-    /usr/local/bin/arch-open-terminal.sh /usr/local/bin/arch-show-pending.sh
+    /usr/local/bin/arch-open-terminal.sh /usr/local/bin/arch-update/arch-show-pending.sh
     ;;
   news)
     alog "Acción: Ver noticias"

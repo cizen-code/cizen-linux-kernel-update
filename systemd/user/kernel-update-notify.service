@@ -5,7 +5,7 @@ After=graphical-session.target
 
 [Service]
 Type=oneshot
-ExecStart=/home/cizen/kernel-update-notify.sh
+ExecStart=/usr/local/bin/kernel-update/kernel-update-notify.sh
 TimeoutStartSec=90
 
 [Install]
