@@ -9,7 +9,7 @@
 # versión Cizen instalada, notifica una ÚNICA vez por release
 # (estado persistente en ~/.local/state/kernel-update/) y ofrece
 # una acción que abre una terminal con el menú:
-#     ~/kernel-update-menu.sh <remote>
+#     /usr/local/bin/kernel-update/kernel-update-menu.sh <remote>
 # que presenta las opciones check/checkfast/build/buildfast/force/
 # check-update, cada una ejecutando kernel-update.sh con los flags
 # adecuados.
@@ -22,8 +22,9 @@
 #   KERNEL_RELEASES_JSON_URL  misma fuente que kernel-update.sh
 #   CIZEN_KERNEL_LOCAL_VERSION  fuerza la versión local (tests, --dry-run)
 #   CIZEN_NOTIFY_BIN           binario de notificación (default notify-send)
-#   CIZEN_KERNEL_SCRIPT        ruta de kernel-update.sh (default $HOME/kernel-update.sh)
-#   CIZEN_KERNEL_MENU_SCRIPT   ruta del menú interactivo (default $HOME/kernel-update-menu.sh)
+#   CIZEN_KERNEL_SCRIPT        ruta de kernel-update.sh (default /usr/local/bin/kernel-update/kernel-update.sh)
+#   CIZEN_KERNEL_MENU_SCRIPT   ruta del menú interactivo (default /usr/local/bin/kernel-update/kernel-update-menu.sh)
+#   CIZEN_CONFIG_DIR           dir de configs linux-*-cizen-v3.config (default <dir de KERNEL_SCRIPT>/profiles)
 # ============================================================
 
 set -uo pipefail
@@ -31,8 +32,9 @@ IFS=$'\n\t'
 export LC_ALL=C
 
 KERNEL_RELEASES_JSON_URL="${KERNEL_RELEASES_JSON_URL:-https://www.kernel.org/releases.json}"
-KERNEL_SCRIPT="${CIZEN_KERNEL_SCRIPT:-$HOME/kernel-update.sh}"
-MENU_SCRIPT="${CIZEN_KERNEL_MENU_SCRIPT:-$HOME/kernel-update-menu.sh}"
+KERNEL_SCRIPT="${CIZEN_KERNEL_SCRIPT:-/usr/local/bin/kernel-update/kernel-update.sh}"
+MENU_SCRIPT="${CIZEN_KERNEL_MENU_SCRIPT:-/usr/local/bin/kernel-update/kernel-update-menu.sh}"
+CONFIG_DIR="${CIZEN_CONFIG_DIR:-$(dirname -- "$KERNEL_SCRIPT")/profiles}"
 NOTIFY_BIN="${CIZEN_NOTIFY_BIN:-notify-send}"
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/kernel-update"
@@ -55,7 +57,7 @@ version_gt() {
 
 # Misma lógica que kernel-update.sh: primero el paquete Cizen actual,
 # depois linux-upstream durante la migración y, como último recurso,
-# la configuración estable más reciente en $HOME.
+# la configuración estable más reciente en CONFIG_DIR.
 get_local_kernel_version() {
   local pkgbase installed candidate best_local_version=""
   for pkgbase in linux-cizen-v3 linux-upstream; do
@@ -69,7 +71,7 @@ get_local_kernel_version() {
     fi
   done
   shopt -s nullglob
-  for path in "$HOME"/linux-*-cizen-v3.config; do
+  for path in "$CONFIG_DIR"/linux-*-cizen-v3.config; do
     base="$(basename -- "$path")"
     if [[ "$base" =~ ^linux-([0-9]+\.[0-9]+([.][0-9]+)?)-cizen-v3\.config$ ]]; then
       candidate="${BASH_REMATCH[1]}"

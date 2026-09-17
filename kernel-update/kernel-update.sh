@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.21.16 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.21.17 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / systemd / KVM-libvirt / QEMU-OVMF
+#
+# CHANGELOG v27.21.17 (config base persistente dentro de la suite)
+#   - Los linux-<versión>-cizen-v3.config (config base que find_latest_cizen_config
+#     usa y que se promueve tras un build/check) dejan de leerse/escribirse en
+#     $HOME: viven junto a los perfiles, en $SCRIPT_DIR/profiles (override
+#     CIZEN_CONFIG_DIR). El directorio debe ser escribible por el usuario que
+#     compila para poder promover la configuración.
+#   - get_local_kernel_version(), find_latest_cizen_config() y las dos
+#     promociones de FINAL_CONFIG usan CONFIG_DIR. promote_home_config pasa a
+#     llamarse promote_base_config.
 #
 # CHANGELOG v27.21.15 (--absorb-rebels: rebeldes al perfil automáticamente)
 #   - Nuevo flag --absorb-rebels: cuando la validación detecta símbolos de
@@ -132,7 +142,7 @@
 #     indefinidamente el lock global mientras una terminal queda abandonada.
 #   - Unifica la política de terminal interactiva de confirm_build_after_check()
 #     con confirm_newer_release().
-#   - Evita promover $HOME/linux-<versión>-cizen-v3.config dos veces cuando kcheck
+#   - Evita promover $CONFIG_DIR/linux-<versión>-cizen-v3.config dos veces cuando kcheck
 #     continúa a compilación; solo se promueve al finalizar la rama CHECK o después
 #     de instalación + sincronización UKI.
 
@@ -257,7 +267,7 @@
 #   - Evitar instalar un paquete viejo por error.
 #   - Conservar el tarball y el estado de trabajo útil si la compilación falla; no generar logs/reportes persistentes fuera del árbol de trabajo.
 #   - No crear backups persistentes de .config; la única configuración estable
-#     persistente es ~/linux-<versión>-cizen-v3.config, promovida atómicamente.
+#     persistente es $CONFIG_DIR/linux-<versión>-cizen-v3.config, promovida atómicamente.
 #   - Cargar y validar siempre el perfil externo, pero no repetir su resumen si no cambió.
 #   - Limpiar el cache persistente de kernel para conservar únicamente el tarball y su firma de la versión objetivo, eliminando artefactos antiguos y residuos de descarga.
 #   - Mantener en el tmpfs de compilación únicamente el árbol de fuentes de la versión objetivo más reciente.
@@ -312,7 +322,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.21.16"
+SCRIPT_VERSION="27.21.17"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -322,6 +332,10 @@ LEGACY_PKGBASE="linux-upstream"
 
 RENAME_MAP_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/kernel-update/rename-map.conf"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# Config base persistente (linux-<versión>-cizen-v3.config): por defecto junto
+# a los perfiles, dentro de la propia suite. Debe ser escribible por el usuario
+# que compila (se promueve tras un build/check exitoso).
+CONFIG_DIR="${CIZEN_CONFIG_DIR:-$SCRIPT_DIR/profiles}"
 PROFILE_FILE=""
 
 # El perfil es externo al motor. Buscamos primero la ubicación explícita y
@@ -630,7 +644,7 @@ get_local_kernel_version() {
   done
 
   shopt -s nullglob
-  for path in "$HOME"/linux-*-cizen-v3.config; do
+  for path in "$CONFIG_DIR"/linux-*-cizen-v3.config; do
     base="$(basename -- "$path")"
     if [[ "$base" =~ ^linux-([0-9]+\.[0-9]+([.][0-9]+)?)-cizen-v3\.config$ ]]; then
       candidate="${BASH_REMATCH[1]}"
@@ -1707,7 +1721,7 @@ extract_tarball() {
 find_latest_cizen_config() {
   local f v best_f="" best_v=""
   shopt -s nullglob
-  for f in "$HOME"/linux-*-cizen-v3.config; do
+  for f in "$CONFIG_DIR"/linux-*-cizen-v3.config; do
     [[ "$(basename -- "$f")" =~ ^linux-([0-9]+\.[0-9]+([.][0-9]+)?)-cizen-v3\.config$ ]] || continue
     v="${BASH_REMATCH[1]}"
     # Solo configuraciones de versiones <= a la objetivo: usar una base de
@@ -2882,7 +2896,7 @@ fi
 
 verify_build_tree
 
-promote_home_config() {
+promote_base_config() {
   local src="$1" dst="$2" tmp
   [ -f "$src" ] || fatal "No existe la configuración efectiva a promover: $src"
   tmp="${dst}.tmp-${TS}"
@@ -2924,8 +2938,8 @@ if [ "$CHECK_ONLY" = true ]; then
     ok "Perfecto. La configuración está validada; continuamos con la compilación de $VERSION."
     CHECK_ONLY=false
   else
-    FINAL_CONFIG="$HOME/linux-$VERSION-cizen-v3.config"
-    promote_home_config .config "$FINAL_CONFIG"
+    FINAL_CONFIG="$CONFIG_DIR/linux-$VERSION-cizen-v3.config"
+    promote_base_config .config "$FINAL_CONFIG"
     ok "CHECK EXITOSO: configuración promovida a $FINAL_CONFIG"
     echo
     ok "Todo listo para compilar cuando lo desees; la configuración quedó validada y las fuentes esperan en su sitio."
@@ -3216,9 +3230,9 @@ ok "UKI sincronizado"
 
 prune_stale_packages
 
-# Promover la configuración final en HOME SOLO después de instalación + UKI.
-FINAL_CONFIG="$HOME/linux-$VERSION-cizen-v3.config"
-promote_home_config .config "$FINAL_CONFIG"
+# Promover la configuración final en CONFIG_DIR SOLO después de instalación + UKI.
+FINAL_CONFIG="$CONFIG_DIR/linux-$VERSION-cizen-v3.config"
+promote_base_config .config "$FINAL_CONFIG"
 ok "Configuración final guardada: $FINAL_CONFIG"
 
 

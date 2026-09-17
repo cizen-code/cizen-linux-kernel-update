@@ -10,7 +10,7 @@
 # ============================================================
 set -uo pipefail
 
-SCRIPT="${CIZEN_KERNEL_SCRIPT:-$HOME/kernel-update.sh}"
+SCRIPT="${CIZEN_KERNEL_SCRIPT:-/usr/local/bin/kernel-update/kernel-update.sh}"
 REMOTE="${1:-}"
 
 if [ ! -x "$SCRIPT" ]; then
