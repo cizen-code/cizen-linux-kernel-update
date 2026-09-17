@@ -34,6 +34,7 @@ notificaciones de escritorio y flujos de compilación a plena prioridad.
 | force | `kernel-update.sh --force` | Recompila forzando |
 | check-update | `kernel-update.sh --check-update` | Consulta la release estable sin modificar nada |
 | list-renames | `kernel-update.sh --list-renames` | Muestra el mapa de renombres de config |
+| absorb-rebels | `kernel-update.sh <ver> --absorb-rebels` | Mueve a `EXPECTED_REBELS` los símbolos que Kconfig conserva por dependencias, dejando el perfil limpio |
 
 ### Menú interactivo
 
@@ -72,6 +73,12 @@ Flatpak y noticias de Arch Linux. Generan un resumen en
 
 La consulta de kernel.org se eliminó de esta suite (2026-09-16); el kernel lo
 vigila el notificador `kernel-update-notify.sh` por separado.
+
+`arch-apply-updates.sh` reinicia los servicios cuyos paquetes se actualizaron,
+pero **nunca** los críticos/no reiniciables en caliente (dbus, gestores de
+display y sesión gráfica, `getty@*`, red y subsistemas del núcleo de systemd);
+esos quedan para un reinicio del sistema. El conjunto actualizado se obtiene del
+`pacman.log` real (no de `pacman -Quq` previo).
 
 ## Licencia
 

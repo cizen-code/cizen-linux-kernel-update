@@ -1,8 +1,21 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.21.14 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.21.16 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / systemd / KVM-libvirt / QEMU-OVMF
+#
+# CHANGELOG v27.21.15 (--absorb-rebels: rebeldes al perfil automáticamente)
+#   - Nuevo flag --absorb-rebels: cuando la validación detecta símbolos de
+#     OPTS_DISABLE que Kconfig conserva a =y/=m por dependencias internas
+#     (depends on/select/defaults) y que aún no están en EXPECTED_REBELS,
+#     los mueve de OPTS_DISABLE a EXPECTED_REBELS en el archivo de perfil
+#     (con backup .bak-<ts> y validación bash -n previa a sustituir). Tras
+#     editar, recarga el perfil, reconstruye los arrays efectivos y revalida
+#     para que el mismo chequeo termine limpio y futuras ejecuciones no
+#     reproduzcan los warnings.
+#   - Extrae la construcción de EFF_* a build_effective_arrays() para poder
+#     reconstruir los arrays efectivos tras un --absorb-rebels sin duplicar
+#     lógica.
 #
 # CHANGELOG v27.21.14 (optimización de velocidad de compilación)
 #   - MAKEFLAGS="-j$JOBS" global: los sub-makes (menú, headers, modules,
@@ -33,6 +46,13 @@
 #   - CIZEN_NO_AUTOINSTALL=1 desactiva todo prompt y restaura el
 #     comportamiento estricto previo (abortar si falta una requerida).
 #   - jq sigue siendo opcional (fallback sed); no se exige ni se instala.
+#
+# CHANGELOG v27.21.16 (progreso de descarga silencioso)
+#   - download_file() ya no imprime el "Download Progress Summary" de aria2c
+#     cada segundo en TTY (spam). Intervalo nuevo vía CIZEN_DOWNLOAD_SUMMARY_INTERVAL:
+#       0 (default)  = sin summary de progreso (--summary-interval=0)
+#       N>0          = summary cada N segundos (solo si hay TTY)
+#     Si no hay TTY sigue --quiet como antes. Convención idéntica a descargar.sh.
 #
 # CHANGELOG v27.21.12 (descarga paralela opcional con aria2c)
 #   - Nuevo download_file(): usa aria2c (conexiones paralelas configurables vía
@@ -255,6 +275,7 @@
 #   ./kernel-update.sh --check-update
 #   ./kernel-update.sh [versión] --check
 #   ./kernel-update.sh <versión> --strict
+#   ./kernel-update.sh <versión> --absorb-rebels
 #   ./kernel-update.sh <versión> --force
 #   ./kernel-update.sh <versión> --keep-src
 #   JOBS=3 ./kernel-update.sh <versión>
@@ -291,7 +312,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.21.14"
+SCRIPT_VERSION="27.21.16"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -341,6 +362,7 @@ PKGVER_BASE=""
 CHECK_ONLY=false
 FORCE=false
 STRICT=false
+ABSORB_REBELS=false
 KEEP_SRC=false
 DO_RENAME=false
 RENAME_PAIR=""
@@ -425,6 +447,8 @@ while [ $# -gt 0 ]; do
       FORCE=true; shift ;;
     --strict)
       STRICT=true; shift ;;
+    --absorb-rebels)
+      ABSORB_REBELS=true; shift ;;
     --keep-src)
       KEEP_SRC=true; shift ;;
     --list-renames)
@@ -905,31 +929,45 @@ add_unique() {
   esac
 }
 
-for o in "${OPTS_ENABLE[@]}"; do
-  r="$(resolve_symbol "$o")"
-  [ "$r" != "$o" ] && APPLIED_RENAMES["$o"]="$r"
-  add_unique enable "$r"
-done
-for o in "${OPTS_DISABLE[@]}"; do
-  r="$(resolve_symbol "$o")"
-  [ "$r" != "$o" ] && APPLIED_RENAMES["$o"]="$r"
-  add_unique disable "$r"
-done
-for o in "${CRITICAL_OPTS[@]}"; do
-  r="$(resolve_symbol "$o")"
-  [ "$r" != "$o" ] && APPLIED_RENAMES["$o"]="$r"
-  add_unique critical "$r"
-done
-for o in "${!OPTS_SETVAL[@]}"; do
-  r="$(resolve_symbol "$o")"
-  [ "$r" != "$o" ] && APPLIED_RENAMES["$o"]="$r"
-  EFF_SETVAL["$r"]="${OPTS_SETVAL[$o]}"
-done
-for o in "${!OPTS_SETSTR[@]}"; do
-  r="$(resolve_symbol "$o")"
-  [ "$r" != "$o" ] && APPLIED_RENAMES["$o"]="$r"
-  EFF_SETSTR["$r"]="${OPTS_SETSTR[$o]}"
-done
+# Reconstruye los arrays efectivos EFF_* a partir de los OPTS_* del perfil.
+# Se usa tanto en el arranque como tras --absorb-rebels (que re-sourcea el
+# perfil ya editado). Las asignaciones sin `declare` caen sobre los arrays
+# globales ya declarados arriba, por lo que es segura llamarla desde aquí.
+build_effective_arrays() {
+  local o r
+  EFF_ENABLE=(); EFF_DISABLE=(); EFF_CRITICAL=()
+  EFF_SETVAL=(); EFF_SETSTR=()
+  APPLIED_RENAMES=()
+  SEEN_ENABLE=(); SEEN_DISABLE=(); SEEN_CRITICAL=()
+
+  for o in "${OPTS_ENABLE[@]}"; do
+    r="$(resolve_symbol "$o")"
+    [ "$r" != "$o" ] && APPLIED_RENAMES["$o"]="$r"
+    add_unique enable "$r"
+  done
+  for o in "${OPTS_DISABLE[@]}"; do
+    r="$(resolve_symbol "$o")"
+    [ "$r" != "$o" ] && APPLIED_RENAMES["$o"]="$r"
+    add_unique disable "$r"
+  done
+  for o in "${CRITICAL_OPTS[@]}"; do
+    r="$(resolve_symbol "$o")"
+    [ "$r" != "$o" ] && APPLIED_RENAMES["$o"]="$r"
+    add_unique critical "$r"
+  done
+  for o in "${!OPTS_SETVAL[@]}"; do
+    r="$(resolve_symbol "$o")"
+    [ "$r" != "$o" ] && APPLIED_RENAMES["$o"]="$r"
+    EFF_SETVAL["$r"]="${OPTS_SETVAL[$o]}"
+  done
+  for o in "${!OPTS_SETSTR[@]}"; do
+    r="$(resolve_symbol "$o")"
+    [ "$r" != "$o" ] && APPLIED_RENAMES["$o"]="$r"
+    EFF_SETSTR["$r"]="${OPTS_SETSTR[$o]}"
+  done
+}
+
+build_effective_arrays
 
 check_profile_contradictions() {
   local opt
@@ -1511,9 +1549,14 @@ download_file() {
   local parallel="${CIZEN_DOWNLOAD_PARALLEL:-4}"
   [[ "$parallel" =~ ^[1-9][0-9]?$ ]] || parallel=4
   if [ "${CIZEN_DOWNLOADER:-}" != "wget" ] && command -v aria2c >/dev/null 2>&1; then
+    local summary_interval="${CIZEN_DOWNLOAD_SUMMARY_INTERVAL:-0}"
     local -a dl_progress=()
     if [ -t 2 ]; then
-      dl_progress=(--summary-interval=1)
+      if [[ "$summary_interval" =~ ^[0-9]+$ ]] && [ "$summary_interval" -gt 0 ]; then
+        dl_progress=(--summary-interval="$summary_interval")
+      else
+        dl_progress=(--summary-interval=0)
+      fi
     else
       dl_progress=(--quiet)
     fi
@@ -1999,6 +2042,125 @@ validate_config() {
     return 3
   fi
 
+  return 0
+}
+
+# ============================================================
+# ABSORCIÓN DE REBELDES EN EL PERFIL  (--absorb-rebels)
+# ============================================================
+# Cuando una desactivación de OPTS_DISABLE es conservada por Kconfig a =y/=m
+# por dependencias internas (depends on/select/defaults), la revalidación la
+# reporta una y otra vez como WARNING. --absorb-rebels mueve esos símbolos de
+# OPTS_DISABLE a EXPECTED_REBELS en el archivo de perfil (con backup), de modo
+# que en futuras ejecuciones cuenten como rebeldes esperados y el chequeo quede
+# limpio. La decisión de conservar el símbolo es de Kconfig, no nuestra: solo
+# se absorbe lo que la validación ya demostró que no se puede desactivar.
+absorb_rebels_to_profile() {
+  local symline sym
+  local -a absorb=()
+
+  # DISABLE_WARN son líneas "CONFIG_X=estado (Kconfig la conserva...)".
+  # Extraemos el nombre integro del símbolo (la parte antes del primer '=').
+  for symline in "${DISABLE_WARN[@]}"; do
+    sym="${symline%%=*}"
+    sym="${sym#CONFIG_}"
+    [ -n "$sym" ] && absorb+=("$sym")
+  done
+
+  if [ "${#absorb[@]}" -eq 0 ]; then
+    info "--absorb-rebels: no hay desactivaciones conservadas que mover."
+    return 0
+  fi
+
+  log "Absorbiendo ${#absorb[@]} símbolos conservados por Kconfig a EXPECTED_REBELS..."
+  for symline in "${absorb[@]}"; do
+    info "  → $symline"
+  done
+
+  # Los símbolos absorbidos deben borrarse de OPTS_DISABLE en el array de
+  # UNO en UNO porque pueden compartir línea literal con otros símbolos
+  # (p.ej. `"A" "B" "C"`); borrar la línea entera eliminaría vecinos legítimos.
+  # Estructura del perfil: declare -a OPTS_DISABLE=( ... ) y
+  # declare -a EXPECTED_REBELS=( ... ). Este awk edita ambas secciones.
+  local awk_prog='
+    BEGIN {
+      n = split(AWS, S, " ")
+      for (i = 1; i <= n; i++) q[i] = "\"" S[i] "\""
+      for (i = 1; i <= n; i++) still_absent[i] = 1
+      in_disable = 0
+      in_rebels = 0
+    }
+    /^declare -a OPTS_DISABLE=\(/ { in_disable = 1; print; next }
+    in_disable && /^\)/ { in_disable = 0; print; next }
+    /^declare -a EXPECTED_REBELS=\(/ { in_rebels = 1; print; next }
+    in_rebels && /^\)/ {
+      to_add = 0
+      for (i = 1; i <= n; i++)
+        if (still_absent[i]) to_add = 1
+      if (to_add) print "# Absorbidos por --absorb-rebels: Kconfig los conserva por dependencia."
+      for (i = 1; i <= n; i++)
+        if (still_absent[i]) print q[i]
+      if (to_add) print "# ---"
+      print
+      in_rebels = 0
+      next
+    }
+    in_disable {
+      line = $0
+      if (line ~ /^[[:space:]]*#/) { print line; next }
+      for (i = 1; i <= n; i++) {
+        while (line ~ ("^[[:space:]]*" q[i]))
+          sub("^[[:space:]]*" q[i], "", line)
+        while (line ~ (q[i] "[[:space:]]*"))
+          sub(q[i] "[[:space:]]*", "", line)
+      }
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+      gsub(/[[:space:]]+/, " ", line)
+      if (line != "") print line
+      next
+    }
+    in_rebels {
+      for (i = 1; i <= n; i++)
+        if (index($0, q[i]) > 0) still_absent[i] = 0
+      print
+      next
+    }
+    { print }
+  '
+  local syms tmpfile backup
+  syms="${absorb[*]}"
+  tmpfile="$(mktemp "${PROFILE_FILE}.XXXXXX")" || return 1
+
+  if ! awk -v AWS="$syms" "$awk_prog" "$PROFILE_FILE" > "$tmpfile"; then
+    rm -f "$tmpfile"
+    err "Fallo al reescribir el perfil (awk)."
+    return 1
+  fi
+
+  if ! bash -n "$tmpfile"; then
+    rm -f "$tmpfile"
+    err "El perfil reescrito no es Bash válido; se conserva el original."
+    return 1
+  fi
+
+  touch "$tmpfile"
+  # Backup con timestamp antes de sustituir.
+  backup="${PROFILE_FILE}.bak-$(date +%Y%m%d-%H%M%S)"
+  if ! cp -a -- "$PROFILE_FILE" "$backup"; then
+    rm -f "$tmpfile"
+    err "No se pudo crear backup del perfil en $backup"
+    return 1
+  fi
+
+  if ! mv -f -- "$tmpfile" "$PROFILE_FILE"; then
+    rm -f "$tmpfile" "$backup"
+    err "No se pudo sustituir el perfil (mv)."
+    return 1
+  fi
+
+  ok "Perfil actualizado: ${#absorb[@]} símbolos movidos de OPTS_DISABLE a EXPECTED_REBELS."
+  info "Backup del perfil previo: $backup"
+  info "Revísalo si el cambio te resulta inesperado (los símbolos son los que Kconfig conserva de forma efectiva)."
   return 0
 }
 
@@ -2697,6 +2859,26 @@ validate_config || {
   rc=$?
   fatal "Validación de configuración fallida (rc=$rc). No se compila."
 }
+
+# --absorb-rebels: si Kconfig conservó desactivaciones que aún no estaban en
+# EXPECTED_REBELS, muévelas al perfil (con backup) y revalida con los arrays
+# recargados para que este mismo chequeo termine limpio y la próxima ejecución
+# no reproduzca los warnings.
+if [ "$ABSORB_REBELS" = true ] && [ "${#DISABLE_WARN[@]}" -gt 0 ]; then
+  if absorb_rebels_to_profile; then
+    source "$PROFILE_FILE"
+    load_profile
+    build_effective_arrays
+    check_profile_contradictions
+    log "Re-validando con el perfil actualizado (símbolos absorbidos)..."
+    validate_config || {
+      rc=$?
+      fatal "Re-validación tras --absorb-rebels fallida (rc=$rc)."
+    }
+  else
+    warn "--absorb-rebels no pudo completarse; se continúa con la validación previa."
+  fi
+fi
 
 verify_build_tree
 

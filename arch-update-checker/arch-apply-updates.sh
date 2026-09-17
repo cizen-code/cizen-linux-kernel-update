@@ -32,12 +32,16 @@ fi
 actualizado=0
 updated_pkgs=""
 
+# Offset del log de pacman para detectar SOLO lo realmente actualizado en esta sesión
+PACMAN_LOG="/var/log/pacman.log"
+PACMAN_LOG_OFF=0
+[[ -r "$PACMAN_LOG" ]] && PACMAN_LOG_OFF="$(stat -c%s "$PACMAN_LOG" 2>/dev/null || echo 0)"
+
 ### REPOS OFICIALES ###
 if [[ -z "$n_off" ]] || (( n_off > 0 )); then
   read -r -p "¿Actualizar repositorios oficiales con pacman? [S/n] " r
   if [[ ! "$r" =~ ^[Nn] ]]; then
     sudo pacman -Sy
-    updated_pkgs="$(pacman -Quq 2>/dev/null)"
     if command -v snapper >/dev/null 2>&1; then
       read -r -p "¿Crear snapshot Btrfs previo con snapper? [S/n] " s
       if [[ ! "$s" =~ ^[Nn] ]]; then
@@ -125,9 +129,33 @@ else
 fi
 
 ### 3) Servicios que requieren reinicio ###
+# updated_pkgs = SOLO lo realmente actualizado en esta sesión (vía pacman.log)
+if [[ -n "$PACMAN_LOG_OFF" ]] && (( PACMAN_LOG_OFF > 0 )); then
+  updated_pkgs="$(tail -c +$((PACMAN_LOG_OFF+1)) "$PACMAN_LOG" 2>/dev/null | sed -n 's/.*\[ALPM\] upgraded \([^ ]*\) .*/\1/p' | sort -u)"
+fi
 if [[ -n "$updated_pkgs" ]]; then
+  # Unidades que JAMÁS se reinician en caliente (rompen sesión gráfica, red o servicios críticos)
+  never_restart() {
+    case "$1" in
+      # D-Bus: reiniciar el bus tumba las conexiones de la sesión gráfica y de los servicios
+      dbus.service|dbus.socket|dbus-broker.service) return 0 ;;
+      # Gestores de display / sesión gráfica
+      display-manager.service|sddm.service|gdm.service|lightdm.service|lxdm.service|plasmalogin.service) return 0 ;;
+      # Sesión gráfica de usuario (plasma-login / kwin)
+      plasma-login.service|plasma-login-kwin_wayland.service) return 0 ;;
+      # Consolas virtuales
+      getty@*.service) return 0 ;;
+      # Red crítica (caída momentánea de red/DNS)
+      NetworkManager.service|systemd-networkd.service|systemd-resolved.service|nftables.service) return 0 ;;
+      # Subsistemas del núcleo de systemd (logind/udev/journald/…)
+      systemd-logind.service|systemd-user-sessions.service|systemd-udevd.service|systemd-journald.service|systemd-timesyncd.service) return 0 ;;
+    esac
+    return 1
+  }
   declare -A sys_units=() usr_units=()
   for pkg in $updated_pkgs; do
+    # El paquete systemd no se trata aquí: su update se aplica con daemon-reexec + reboot
+    [[ "$pkg" == "systemd" ]] && continue
     while read -r u; do
       [[ -n "$u" ]] && sys_units["$u"]=1
     done < <(pacman -Ql "$pkg" 2>/dev/null | awk '{print $2}' | grep -E '/usr/lib/systemd/system/[^/]+\.(service|socket|timer)$' | xargs -rn1 basename 2>/dev/null)
@@ -135,26 +163,36 @@ if [[ -n "$updated_pkgs" ]]; then
       [[ -n "$u" ]] && usr_units["$u"]=1
     done < <(pacman -Ql "$pkg" 2>/dev/null | awk '{print $2}' | grep -E '/usr/lib/systemd/user/[^/]+\.(service|socket|timer)$' | xargs -rn1 basename 2>/dev/null)
   done
-  sys_active=""
+  sys_skipped=""; usr_skipped=""; sys_active=""; usr_active=""
   for u in "${!sys_units[@]}"; do
-    systemctl is-active --quiet "$u" 2>/dev/null && sys_active+="$u "
+    systemctl is-active --quiet "$u" 2>/dev/null || continue
+    if never_restart "$u"; then sys_skipped+="$u "; else sys_active+="$u "; fi
   done
-  usr_active=""
   for u in "${!usr_units[@]}"; do
-    systemctl --user is-active --quiet "$u" 2>/dev/null && usr_active+="$u "
+    systemctl --user is-active --quiet "$u" 2>/dev/null || continue
+    if never_restart "$u"; then usr_skipped+="$u "; else usr_active+="$u "; fi
   done
-  if [[ -n "$sys_active" || -n "$usr_active" ]]; then
-    echo "⚙ Servicios activos cuyos paquetes se actualizaron:"
+  if [[ -z "$sys_active" && -z "$usr_active" ]]; then
+    echo "· Ningún servicio activo seguro requiere reinicio ahora."
+  else
+    echo "⚙ Servicios activos cuyos paquetes se actualizaron (seguros de reiniciar en caliente):"
     [[ -n "$sys_active" ]] && printf '   • [sistema] %s\n' $sys_active
     [[ -n "$usr_active" ]] && printf '   • [usuario] %s\n' $usr_active
     read -r -p "¿Reiniciarlos ahora? [S/n] " rs
     if [[ ! "$rs" =~ ^[Nn] ]]; then
-      [[ -n "$sys_active" ]] && sudo systemctl restart $sys_active
-      [[ -n "$usr_active" ]] && systemctl --user restart $usr_active
-      echo "✔ Servicios reiniciados."
+      err=0
+      for u in $sys_active; do
+        sudo systemctl restart "$u" && echo "   ✔ $u reiniciado" || { err=1; echo "   ✗ fallo al reiniciar $u (systemctl status $u)"; }
+      done
+      for u in $usr_active; do
+        systemctl --user restart "$u" && echo "   ✔ $u reiniciado (usuario)" || { err=1; echo "   ✗ fallo al reiniciar $u (usuario)"; }
+      done
+      [[ "$err" -eq 0 ]] && echo "✔ Servicios reiniciados."
     fi
-  else
-    echo "· Ningún servicio activo requiere reinicio."
+  fi
+  if [[ -n "$sys_skipped" || -n "$usr_skipped" ]]; then
+    echo "⚠ NO reiniciados en caliente (romperían sesión/red; se aplican con un reinicio del sistema):"
+    [[ -n "$sys_skipped" ]] && printf '   • %s\n' $sys_skipped
   fi
   if grep -qx systemd <<<"$updated_pkgs"; then
     echo "⚙ systemd actualizado: ejecutando daemon-reexec…"

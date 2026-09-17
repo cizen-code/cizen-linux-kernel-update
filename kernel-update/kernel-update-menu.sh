@@ -56,10 +56,10 @@ echo
 while true; do
   read -r -p "  Selección [0-6]: " choice
   case "$choice" in
-    1) exec "$SCRIPT" --check ;;
-    2) CIZEN_BUILD_PRIORITY=normal exec "$SCRIPT" --check ;;
-    3) exec "$SCRIPT" ;;
-    4) CIZEN_BUILD_PRIORITY=normal exec "$SCRIPT" ;;
+    1) exec "$SCRIPT" --absorb-rebels --check ;;
+    2) CIZEN_BUILD_PRIORITY=normal exec "$SCRIPT" --absorb-rebels --check ;;
+    3) exec "$SCRIPT" --absorb-rebels ;;
+    4) CIZEN_BUILD_PRIORITY=normal exec "$SCRIPT" --absorb-rebels ;;
     5) exec "$SCRIPT" --force ;;
     6) exec "$SCRIPT" --check-update ;;
     0) echo "  Saliendo."; exit 0 ;;
