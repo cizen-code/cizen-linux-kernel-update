@@ -7,6 +7,9 @@
 #
 # Uso: ./kernel-update-menu.sh [remote]
 #   remote = versión estable de kernel.org a mostrar en el encabezado
+# Opciones: 1-5 validación/build (check/checkfast/build/buildfast/force),
+# 6 check-update, 7/8 BORE (--patch bore), 9 rollback, 10 kcfg, 11 selftest,
+# 12 changelog, 0 salir.
 # ============================================================
 set -uo pipefail
 
@@ -47,9 +50,14 @@ echo "    ${G}3${N}) build       compilar e instalar directamente (prioridad baj
 echo "    ${G}4${N}) buildfast   compilar e instalar a plena prioridad"
 echo "    ${G}5${N}) force       recompilar forzado (--force)"
 echo
-echo "  ${C}BORE (scheduler interactivo CachyOS):${N}"
+echo "  ${C}BORE / parches (v27.24.0, framework de parches):${N}"
 echo "    ${G}7${N}) build bore  compilar con BORE (prioridad baja)"
 echo "    ${G}8${N}) boresfast   compilar con BORE a plena prioridad"
+echo
+echo "  ${C}Configuración y mantenimiento:${N}"
+echo "    ${G}10${N}) kcfg       editar la config validada con menuconfig (--menuconfig)"
+echo "    ${G}11${N}) selftest   autoevaluación del motor (--selftest)"
+echo "    ${G}12${N}) changelog  bumpear versión + borrador de changelog (--changelog)"
 echo
 echo "  ${C}Consulta:${N}"
 echo "    ${G}6${N}) check-update consultar última release estable (sin modificar nada)"
@@ -62,7 +70,7 @@ echo "    ${G}0${N}) salir"
 echo
 
 while true; do
-  read -r -p "  Selección [0-9]: " choice
+  read -r -p "  Selección [0-12]: " choice
   case "$choice" in
     1) exec "$SCRIPT" --absorb-rebels --check ;;
     2) CIZEN_BUILD_PRIORITY=normal exec "$SCRIPT" --absorb-rebels --check ;;
@@ -70,9 +78,12 @@ while true; do
     4) CIZEN_BUILD_PRIORITY=normal exec "$SCRIPT" --absorb-rebels ;;
     5) exec "$SCRIPT" --force ;;
     6) exec "$SCRIPT" --check-update ;;
-    7) exec "$SCRIPT" --absorb-rebels --bore ;;
-    8) CIZEN_BUILD_PRIORITY=normal exec "$SCRIPT" --absorb-rebels --bore ;;
+    7) exec "$SCRIPT" --absorb-rebels --patch bore ;;
+    8) CIZEN_BUILD_PRIORITY=normal exec "$SCRIPT" --absorb-rebels --patch bore ;;
     9) exec /usr/local/bin/kernel-update/kernel-update-rollback.sh ;;
+    10) exec "$SCRIPT" --absorb-rebels --menuconfig ;;
+    11) exec "$SCRIPT" --selftest ;;
+    12) exec "$SCRIPT" --changelog ;;
     0) echo "  Saliendo."; exit 0 ;;
     *) printf "  %bOpción no válida.%b\n" "$R" "$N" ;;
   esac

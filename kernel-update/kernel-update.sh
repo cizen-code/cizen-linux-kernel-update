@@ -1,8 +1,57 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.23.0 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.24.1 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / systemd / KVM-libvirt / QEMU-OVMF
+#
+# CHANGELOG v27.24.1 (confirmación de recompilación sin release nueva — 2026-09-20)
+#   - Cuando se elige una opción de compilación (build/buildfast/force/BORE) sin
+#     versión explícita y NO hay una release estable nueva (instalada == stable),
+#     en lugar de abortar con "No hay una release estable nueva..." el motor ahora
+#     Pregunta (confirm_recompile_current, /dev/tty): "¿Quieres continuar con la
+#     recompilación del kernel <versión>? [S/n]". S/sí -> VERSION se fija a la
+#     versión instalada y la recompilación continúa (p. ej. para aplicar el perfil
+#     v5.10.0 pendiente o BORE); N/no (o sin terminal) -> "Recompilación
+#     cancelada" y salida sin hacer nada, igual que antes. kcheck (validación)
+#     sigue sin prompt; la consulta de release nueva previa (confirm_newer_release)
+#     no cambia.
+#
+# CHANGELOG v27.24.0 (framework de parches, kcfg, btf, clang, selftest, repo, changelog — 2026-09-20)
+#   - 1) FRAMEWORK DE PARCHES GENÉRICO: apply_bore_patch() se generaliza a un
+#     motor declarativo de parches de terceros. Cada parche es un descriptor
+#     (URL por rama X.Y, subdir, fichero principal + respaldo upstream, símbolos
+#     Kconfig, marcadores de árbol ya parcheado, cadena mágica de validación).
+#     BORE es el primer plugin (`--bore` = `--patch bore`). El motor descarga
+#     SIEMPRE en fresco (rm previo + auto-file-renaming=false), valida el parche,
+#     hace dry-run, degrada al respaldo del autor si CachyOS no aplica sobre la
+#     release final, y registra los símbolos (ENABLE + rebeldes esperados) sin
+#     ensuciar la validación. Fallo → advertencia y build vanilla (nunca rompe).
+#     Nuevo: `--patch <n>` (repetible) / CIZEN_PATCHES="a,b". ``--bore`` sigue
+#     funcionando (alias). El árbol conservado ya-parcheado se detecta por
+#     marcadores (no re-descargan ni re-aplican).
+#   - 2) kcfg / --menuconfig: abre `make menuconfig` sobre la config Cizen ya
+#     validada, re-audita y revalida al salir, y genera un diff del perfil
+#     (cambiados/añadidos/retirados) con la sugerencia de entrada OPTS_*
+#     correspondiente. La config editada se promueve a base y queda lista para
+#     compilar (--menuconfig con build) o para un --check posterior.
+#   - 3) --selftest: batería interna (bash -n del propio motor, carga del perfil
+#     y de contradicciones, herramientas imprescindibles) + harness funcional
+#     de la suite ($SCRIPT_DIR/tests/selftest.sh) cuando existe.
+#   - 4) --publish-repo / CIZEN_PUBLISH_REPO: tras instalar con éxito, copia el
+#     .pkg.tar.zst a un repo local pacman (default /var/lib/kernel-update/repo,
+#     db "cizen-linux") vía repo-add, para que las VMs libvirt puedan instalarlo
+#     con pacman (file:// o por red). Fallo suave; requiere pacman-contrib.
+#   - 5) --btf / CIZEN_BTF=1: fuerza CONFIG_DEBUG_INFO+DEBUG_INFO_BTF (+ los
+#     marca como esperados en la auditoría). Pide instalar pahole si falta
+#     (opcional); degrade a sin-BTF si no se puede.
+#   - 6) --clang / CIZEN_CLANG=1: build LLVM/clang (LLVM=1, ld.lld). Si falta
+#     clang o lld → warning y build GCC. Combinable con ccache.
+#   - 7) --changelog: mantenimiento — bumpea cabecera+SCRIPT_VERSION y añade un
+#     borrador de changelog al top con el diff --stat del espejo git (si existe).
+#     NO commit: el texto lo completa el mantenedor.
+#   - El resumen final muestra ahora también Parches/BTF/Toolchain y el repo
+#     local publicado; write_verify_signature graba patches/btf/clang para que
+#     kernel-update-verify.sh los compruebe post-boot.
 #
 # CHANGELOG v27.23.0 (operativa: diff de config, post-boot, rollback, snapshots — 2026-09-20)
 #   - 1) Config-diff: tras validar, se compara la config efectiva nueva vs la del
@@ -391,6 +440,16 @@
 #   ./kernel-update.sh <versión> --absorb-rebels
 #   ./kernel-update.sh <versión> --force
 #   ./kernel-update.sh <versión> --keep-src
+#   ./kernel-update.sh <versión> --patch bore                 # framework de parches
+#   ./kernel-update.sh <versión> --bore                       # alias de --patch bore
+#   CIZEN_PATCHES="bore" ./kernel-update.sh <versión>         # parches por env
+#   ./kernel-update.sh <versión> --btf                        # CONFIG_DEBUG_INFO_BTF=y
+#   ./kernel-update.sh <versión> --clang                      # build LLVM/clang (opt-in)
+#   ./kernel-update.sh <versión> --menuconfig                 # editar config con menuconfig
+#   ./kernel-update.sh [versión] --publish-repo               # publicar pkg a repo pacman local
+#   CIZEN_PUBLISH_REPO=/srv/repo ./kernel-update.sh <versión> # dónde publicar (default /var/lib/kernel-update/repo)
+#   ./kernel-update.sh --selftest                             # autoevaluación interna
+#   ./kernel-update.sh --changelog                            # bump versión + borrador de changelog
 #   JOBS=3 ./kernel-update.sh <versión>
 #   CIZEN_DOWNLOAD_PARALLEL=8 ./kernel-update.sh <versión>   # conexiones paralelas (aria2c)
 #   CIZEN_DOWNLOADER=wget ./kernel-update.sh <versión>       # fuerza el wget clásico
@@ -429,7 +488,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.23.0"
+SCRIPT_VERSION="27.24.1"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -485,12 +544,30 @@ FORCE=false
 STRICT=false
 ABSORB_REBELS=false
 KEEP_SRC=false
-BORE_REQUESTED=false
 BORE_ENABLED=false
 DO_RENAME=false
 RENAME_PAIR=""
 DO_LIST=false
 CHECK_UPDATE=false
+
+# ── Framework de parches, BTF, clang y utilidades (v27.24.0) ──
+# PATCH_NAMES: lista de parches de terceros solicitados (--patch / CIZEN_PATCHES
+# / --bore). PATCHES_APPLIED: los que realmente se aplicaron en este run.
+PATCH_REQUESTED=false
+declare -a PATCH_NAMES=()
+declare -a PATCHES_APPLIED=()
+# Símbolos Kconfig que aportan los parches aplicados y BTF: entran en ENABLE y
+# se reconocen como rebeldes esperados (no ensucian la auditoría ni --strict).
+declare -a PATCH_ENABLE_ALL=() PATCH_REBEL_ALL=()
+declare -A PATCH_KCONFIG_FILTER=()   # símbolos nuevos esperados de parches/BTF
+BTF_REQUESTED=false
+CLANG_REQUESTED=false
+MENUCONFIG_REQUESTED=false
+SELFTEST=false
+DO_CHANGELOG=false
+PUBLISH_REPO=false
+PUBLISH_REPO_DIR=""
+PUBLISH_REPO_MSG=""
 
 # Rama de kernel.org a seguir: stable (default) o longterm/LTS mayor.
 CIZEN_KERNEL_TRACK="${CIZEN_KERNEL_TRACK:-stable}"
@@ -588,8 +665,39 @@ while [ $# -gt 0 ]; do
       STRICT=true; shift ;;
     --absorb-rebels)
       ABSORB_REBELS=true; shift ;;
+    --patch)
+      PATCH_REQUESTED=true
+      if [ -n "${2:-}" ] && [[ ! "$2" =~ ^-- ]]; then
+        IFS=',' read -r -a __patchs <<< "$2"
+        for __patchn in "${__patchs[@]:-}"; do [ -n "$__patchn" ] && PATCH_NAMES+=("$__patchn"); done
+        unset __patchs __patchn
+        shift 2
+      else
+        err "--patch requiere un nombre de parche (p. ej. bore). Todos: --patch <nombre>"
+        exit 1
+      fi ;;
+    --patch=*)
+      PATCH_REQUESTED=true
+      IFS=',' read -r -a __patchs <<< "${1#--patch=}"
+      for __patchn in "${__patchs[@]:-}"; do [ -n "$__patchn" ] && PATCH_NAMES+=("$__patchn"); done
+      unset __patchs __patchn
+      shift ;;
     --bore)
-      BORE_REQUESTED=true; shift ;;
+      PATCH_REQUESTED=true
+      PATCH_NAMES+=(bore)
+      shift ;;
+    --btf)
+      BTF_REQUESTED=true; shift ;;
+    --clang)
+      CLANG_REQUESTED=true; shift ;;
+    --menuconfig)
+      MENUCONFIG_REQUESTED=true; shift ;;
+    --selftest)
+      SELFTEST=true; shift ;;
+    --publish-repo)
+      PUBLISH_REPO=true; shift ;;
+    --changelog)
+      DO_CHANGELOG=true; shift ;;
     --keep-src)
       KEEP_SRC=true; shift ;;
     --list-renames)
@@ -617,6 +725,40 @@ while [ $# -gt 0 ]; do
       shift ;;
   esac
 done
+
+# Entorno para parches/BTF/clang (se suma a los flags; CIZEN_ENABLE_BORE
+# sigue funcionando igual que antes como forma de pedir BORE).
+if [ "${CIZEN_ENABLE_BORE:-0}" = "1" ]; then
+  PATCH_NAMES+=(bore)
+  PATCH_REQUESTED=true
+fi
+if [ -n "${CIZEN_PATCHES:-}" ]; then
+  PATCH_REQUESTED=true
+  IFS=',' read -r -a __patchs <<< "$CIZEN_PATCHES"
+  for __patchn in "${__patchs[@]:-}"; do [ -n "$__patchn" ] && PATCH_NAMES+=("$__patchn"); done
+  unset __patchs __patchn
+fi
+[ "${CIZEN_BTF:-0}" = "1" ] && BTF_REQUESTED=true
+[ "${CIZEN_CLANG:-0}" = "1" ] && CLANG_REQUESTED=true
+[ -n "${CIZEN_PUBLISH_REPO:-}" ] && PUBLISH_REPO=true
+PUBLISH_REPO_DIR="${CIZEN_PUBLISH_REPO:-/var/lib/kernel-update/repo}"
+
+# Deduplicar PATCH_NAMES conservando el orden.
+if [ "${#PATCH_NAMES[@]}" -gt 0 ]; then
+  declare -A __seen=()
+  declare -a __uniq=()
+  for __patchn in "${PATCH_NAMES[@]}"; do
+    [ -n "${__seen[$__patchn]:-}" ] && continue
+    __seen["$__patchn"]=1
+    __uniq+=("$__patchn")
+  done
+  unset __seen
+  PATCH_NAMES=("${__uniq[@]}")
+  unset __uniq __patchn
+  if [ "${#PATCH_NAMES[@]}" -eq 0 ]; then
+    PATCH_REQUESTED=false
+  fi
+fi
 
 # ============================================================
 # RENAME MAP
@@ -1129,13 +1271,31 @@ build_effective_arrays() {
     EFF_SETSTR["$r"]="${OPTS_SETSTR[$o]}"
   done
 
-  # BORE (opcional): si el parche se aplicó en este run, SCHED_BORE debe entrar
-  # en ENABLE (para que apply_config_requests la fuerce a =y) y los símbolos
-  # que introduce el parche se reconocen como esperados en la validación.
-  if [ "$BORE_ENABLED" = true ]; then
-    add_unique enable "SCHED_BORE"
-    EXPECTED_REBEL_SET["SCHED_BORE"]=1
-    EXPECTED_REBEL_SET["MIN_BASE_SLICE_NS"]=1
+  # Parches de terceros (v27.24.0): cada parche aplicado aporta símbolos Kconfig
+  # nuevos que deben entrar en ENABLE (apply_config_requests los fuerza a =y) y
+  # registrarse como rebeldes esperados para que la auditoría/validación no
+  # ensucie (ni el --strict bloquee por ellos).
+  local __ps
+  for __ps in "${PATCH_ENABLE_ALL[@]}"; do
+    add_unique enable "$__ps"
+    EXPECTED_REBEL_SET["$__ps"]=1
+    PATCH_KCONFIG_FILTER[$__ps]=1
+  done
+  unset __ps
+  for __ps in "${PATCH_REBEL_ALL[@]}"; do
+    EXPECTED_REBEL_SET["$__ps"]=1
+    PATCH_KCONFIG_FILTER[$__ps]=1
+  done
+  unset __ps
+
+  # BTF (opcional): DEBUG_INFO + DEBUG_INFO_BTF =y, marcados como esperados.
+  if [ "$BTF_REQUESTED" = true ]; then
+    add_unique enable "DEBUG_INFO"
+    add_unique enable "DEBUG_INFO_BTF"
+    EXPECTED_REBEL_SET["DEBUG_INFO"]=1
+    EXPECTED_REBEL_SET["DEBUG_INFO_BTF"]=1
+    PATCH_KCONFIG_FILTER[DEBUG_INFO]=1
+    PATCH_KCONFIG_FILTER[DEBUG_INFO_BTF]=1
   fi
 }
 
@@ -1874,14 +2034,35 @@ extract_tarball() {
 }
 
 # ============================================================
-# BORE SCHEDULER (OPCIONAL)
+# FRAMEWORK DE PARCHES DE TERCEROS (OPCIONAL)  — v27.24.0
 # ============================================================
-# Aplica el parche BORE (Burst-Oriented Response Enhancer) de CachyOS sobre
-# el scheduler EEVDF vanilla, mejorando la responsividad interactiva con
-# coste de equidad. Solo bajo demanda: `--bore` (también CIZEN_ENABLE_BORE=1).
-# El parche se busca por rama X.Y del kernel objetivo en el repo CachyOS
-# kernel-patches. Los símbolos que introduce (SCHED_BORE, MIN_BASE_SLICE_NS)
-# se validan como rebeldes esperados para no ensuciar kcheck.
+# Mecanismo DECLARATIVO para aplicar parches de terceros sobre las fuentes
+# vanilla. Cada parche es un descriptor (función `patch_desc_<nombre>`) que
+# define TODOS los parámetros; la lógica de aplicación es genérica y común.
+#
+# Descriptor (variables que debe fijar patch_desc_<n>):
+#   PATCH_DESC           descripción humana
+#   PATCH_DISP_NAME      nombre corto para logs
+#   PATCH_BRANCH         rama X.Y del kernel objetivo (7.2.6 -> 7.2)
+#   PATCH_URL_PREFIX     base del repo donde se publica (incluye "master")
+#   PATCH_CDN_SUBDIR     subdirectorio bajo la rama (sched/)
+#   PATCH_MAIN_FILE      fichero principal (forward-port del mantenedor del repo)
+#   PATCH_FALLBACK_FILE  respaldo del autor upstream (se sincroniza por release)
+#   PATCH_CACHE_NAME     prefijo del fichero en KERNEL_BUILD_ROOT (-> name-$br.patch)
+#   PATCH_SYMBOLS        símbolos Kconfig que el parche introduce (=y + rebelde)
+#   PATCH_MAGIC          cadena que debe aparecer en un parche válido
+#   PATCH_MARKERS        array "ruta:patrón" para detectar un árbol ya parcheado
+#
+# La lógica común (v27.22.2 y v27.22.4 heredadas de BORE):
+#   - Detección de árbol conservado ya-parcheado por marcadores: no se vuelve a
+#     descargar ni a aplicar (evita el "Reversed patch detected" del dry-run).
+#   - Cada intento de descarga BORRA el destino antes (download_file usa aria2c
+#     con --allow-overwrite=false + --continue; sin borrar un fichero existente
+#     se daría por completo o se renombraría a .1, dejando huérfano el bueno).
+#   - Degrade automático principal -> upstream si no aplica limpio sobre X.Y.Z.
+#   - Cualquier fallo es fatal suave: warning y build vanilla (nunca rompe).
+#   - Al aplicar, los símbolos se registran (apply_patch_register) para que
+#     build_effective_arrays los fuerce a =y y los marque como esperados.
 bore_branch_from_version() {
   # 7.2.6 -> 7.2 ; 7.2 -> 7.2 ; 6.1.77 -> 6.1
   if [[ "$1" =~ ^([0-9]+\.[0-9]+) ]]; then
@@ -1891,92 +2072,113 @@ bore_branch_from_version() {
   fi
 }
 
-bore_patch_url() {
-  printf '%s\n' "https://raw.githubusercontent.com/CachyOS/kernel-patches/master/$(bore_branch_from_version "$VERSION")/sched/0001-bore-cachy.patch"
+# Descriptor del plugin BORE (firelzrd, reenviado por CachyOS).
+patch_desc_bore() {
+  PATCH_DESC="BORE scheduler (Burst-Oriented Response Enhancer)"
+  PATCH_DISP_NAME="BORE"
+  PATCH_BRANCH="$(bore_branch_from_version "$VERSION")"
+  PATCH_URL_PREFIX="https://raw.githubusercontent.com/CachyOS/kernel-patches/master"
+  PATCH_CDN_SUBDIR="sched"
+  PATCH_MAIN_FILE="0001-bore-cachy.patch"
+  PATCH_FALLBACK_FILE="0001-bore.patch"
+  PATCH_CACHE_NAME="bore"
+  PATCH_SYMBOLS=(SCHED_BORE MIN_BASE_SLICE_NS)
+  PATCH_MAGIC="config SCHED_BORE"
+  PATCH_MARKERS=( "kernel/sched/bore.c:" "kernel/sched/fair.c:SCHED_BORE|burst" )
 }
 
-# URL del parche BORE upstream (firelzrd). Se usa como respaldo: a veces el
-# forward-port de CachyOS queda desfasado respecto a la última release estable
-# X.Y.Z (el suyo se regenera contra una RC), mientras que el upstream del autor
-# se mantiene por release y aplica limpio sobre la versión final.
-bore_patch_url_upstream() {
-  printf '%s\n' "https://raw.githubusercontent.com/CachyOS/kernel-patches/master/$(bore_branch_from_version "$VERSION")/sched/0001-bore.patch"
+# Comprueba los marcadores de "árbol ya parcheado" del descriptor actual.
+# PATCH_MARKERS es "ruta:patrón" relativa a $SRC; patrón vacío = basta con que
+# el fichero exista.
+patch_markers_hit() {
+  local m path pat
+  for m in "${PATCH_MARKERS[@]:-}"; do
+    path="${m%%:*}"
+    pat="${m#*:}"
+    [ -f "$SRC/$path" ] || return 1
+    [ -z "$pat" ] || grep -Eq -- "$pat" "$SRC/$path" 2>/dev/null || return 1
+  done
+  return 0
 }
 
-# Descarga y aplica el parche BORE fuente. Devuelve 0 = aplicado, 1 = no (fatal suave).
-# IMPORTANTE: cada intento borra el destino ANTES de descargar. download_file usa
-# aria2c con --allow-overwrite=false y --continue=true: si el fichero ya existe
-# (p. ej. el parche CachyOS del intento 1 en el mismo nombre bore-$br.patch),
-# aria2c Ni lo sobrescribe ni lo re-descarga, y sin --auto-file-renaming=false lo
-# renombraba a bore-$br.1.patch dejando huérfano el parche bueno. Con --continue
-# además un fichero existente del mismo tamaño se considera "completo" aunque sea
-# otro parche. Borrar antes garantiza contenido fresco en cada descarga.
-apply_bore_patch() {
-  local url patch_file br
-  br="$(bore_branch_from_version "$VERSION")"
-  patch_file="$KERNEL_BUILD_ROOT/bore-$br.patch"
-
-  log "BORE habilitado: descargando parche para la rama $br ..."
-
-  case "$BORE_REQUESTED" in
-    true) ;;
-    *)
-      if [ "${CIZEN_ENABLE_BORE:-0}" = "1" ]; then
-        :
-      else
-        warn "BORE solicitado pero sin flag --bore ni CIZEN_ENABLE_BORE=1; se omite."
-        return 1
-      fi
-      ;;
-  esac
-
-  # Árbol conservado de una ejecución BORE previa (p. ej. cancelada tras aplicar
-  # el parche): `fair.c` toquetado y `kernel/sched/bore.c` presente son la firma
-  # de que BORE YA está aplicado. Volver a hacer `patch --dry-run` sobre un árbol
-  # ya parcheado responde "Reversed (or previously applied) patch detected" (rc=1)
-  # y el motor degradaría a vanilla a pesar de que el árbol SÍ lo lleva.
-  if [ -f "$SRC/kernel/sched/bore.c" ] \
-     && grep -q 'SCHED_BORE\|burst' "$SRC/kernel/sched/fair.c" 2>/dev/null; then
-    ok "BORE scheduler ya estaba aplicado en el árbol conservado (kernel/sched/bore.c)."
+# Registra un parche como aplicado: añade a la lista de aplicados y acumula sus
+# símbolos Kconfig para que build_effective_arrays los fuerce a =y y los marque
+# como rebeldes esperados. BORE mantiene además BORE_ENABLED (resumen y firma).
+apply_patch_register() {
+  local p="$1" s
+  PATCHES_APPLIED+=("$p")
+  for s in "${PATCH_SYMBOLS[@]:-}"; do
+    PATCH_ENABLE_ALL+=("$s")
+    PATCH_REBEL_ALL+=("$s")
+  done
+  unset s
+  if [ "$p" = "bore" ]; then
     BORE_ENABLED=true
+  fi
+}
+
+# Descarga y aplica el parche <nombre>. Devuelve 0 = aplicado, 1 = no
+# (fatal suave: la build continúa vanilla tras un warning).
+apply_patch_plugin() {
+  local name="$1"
+  local patch_file main_url fallback_url
+
+  # Carga el descriptor del parche (función patch_desc_<nombre> global).
+  if ! declare -F "patch_desc_$name" >/dev/null 2>&1; then
+    warn "Parche '$name' desconocido o sin descriptor en el motor; se omite."
+    return 1
+  fi
+  "patch_desc_$name"
+
+  log "Parche ${PATCH_DISP_NAME:-$name} habilitado: descargando para la rama ${PATCH_BRANCH:-?} ..."
+
+  # Árbol conservado de una ejecución previa (p. ej. cancelada tras aplicar):
+  # los marcadores del descriptor son la firma de que el parche YA está
+  # aplicado. Volver a hacer `patch --dry-run` sobre un árbol ya parcheado
+  # respondería "Reversed (or previously applied) patch detected" (rc=1) y se
+  # degradaría a vanilla pese a que el árbol SÍ lo lleva.
+  if patch_markers_hit; then
+    ok "${PATCH_DISP_NAME:-$name} ya estaba aplicado en el árbol conservado."
+    apply_patch_register "$name"
     return 0
   fi
 
-  # Intento 1: parche CachyOS (0001-bore-cachy.patch). Si no descarga, está
-  # vacío, no es válido o no aplica limpio sobre X.Y.Z, se degrada al parche
-  # upstream del autor (0001-bore.patch), que se sincroniza por release final.
-  url="$(bore_patch_url)"
+  if ! command -v patch >/dev/null 2>&1; then
+    warn "patch no está instalado; no se puede aplicar $name. Instale con: sudo pacman -S patch"
+    return 1
+  fi
+
+  patch_file="$KERNEL_BUILD_ROOT/${PATCH_CACHE_NAME}-${PATCH_BRANCH}.patch"
+
+  # Intento 1: fichero principal (forward-port del repo; p. ej. CachyOS lo
+  # regenera contra una RC y a veces no aplica sobre la release final X.Y.Z).
+  main_url="${PATCH_URL_PREFIX}/${PATCH_BRANCH}/${PATCH_CDN_SUBDIR}/${PATCH_MAIN_FILE}"
   rm -f -- "$patch_file"
-  if download_file "$url" "$patch_file" \
+  if download_file "$main_url" "$patch_file" \
      && [ -s "$patch_file" ] \
-     && grep -q 'config SCHED_BORE' "$patch_file" \
+     && grep -Fq "$PATCH_MAGIC" "$patch_file" \
      && patch -p1 --dry-run -d "$SRC" < "$patch_file" >/dev/null 2>&1; then
     :
   else
-    warn "Parche CachyOS (0001-bore-cachy.patch) no disponible/no aplica sobre $VERSION; probando upstream (0001-bore.patch) ..."
-    url="$(bore_patch_url_upstream)"
+    warn "${PATCH_DISP_NAME:-$name}: ${PATCH_MAIN_FILE} no disponible/no aplica sobre $VERSION; probando upstream (${PATCH_FALLBACK_FILE}) ..."
     rm -f -- "$patch_file"
-    if ! download_file "$url" "$patch_file" \
+    fallback_url="${PATCH_URL_PREFIX}/${PATCH_BRANCH}/${PATCH_CDN_SUBDIR}/${PATCH_FALLBACK_FILE}"
+    if ! download_file "$fallback_url" "$patch_file" \
        || [ ! -s "$patch_file" ] \
-       || ! grep -q 'config SCHED_BORE' "$patch_file" \
+       || ! grep -Fq "$PATCH_MAGIC" "$patch_file" \
        || ! patch -p1 --dry-run -d "$SRC" < "$patch_file" >/dev/null 2>&1; then
-      warn "Ningún parche BORE disponible para la rama $br / $VERSION; se continúa con EEVDF vanilla."
+      warn "Ningún parche ${PATCH_DISP_NAME:-$name} disponible para la rama ${PATCH_BRANCH:-?} / $VERSION; se continúa vanilla."
       return 1
     fi
   fi
 
-  if ! command -v patch >/dev/null 2>&1; then
-    warn "patch no está instalado; no se puede aplicar BORE. Instale con: sudo pacman -S patch"
-    return 1
-  fi
-
   if ! patch -p1 -d "$SRC" < "$patch_file" >/dev/null 2>&1; then
-    warn "Aplicación real del parche BORE falló inesperadamente; se continúa con EEVDF vanilla."
+    warn "Aplicación real del parche ${PATCH_DISP_NAME:-$name} falló inesperadamente; se continúa vanilla."
     return 1
   fi
 
-  BORE_ENABLED=true
-  ok "BORE scheduler aplicado (SCHED_BORE=y) sobre fuentes $VERSION."
+  apply_patch_register "$name"
+  ok "${PATCH_DESC:-${PATCH_DISP_NAME:-$name}} aplicado (${PATCH_SYMBOLS[0]:-símbolos nuevos}) sobre fuentes $VERSION."
   return 0
 }
 
@@ -2150,13 +2352,20 @@ run_kconfig_audit() {
   log "Detectando símbolos nuevos antes de olddefconfig..."
   NEWCONFIG_OUTPUT="$(make listnewconfig 2>&1 || true)"
   if printf '%s\n' "$NEWCONFIG_OUTPUT" | grep -qE '^CONFIG_|^# CONFIG_'; then
-    # Con BORE activo, SCHED_BORE/MIN_BASE_SLICE_NS aparecerán aquí como
-    # nuevos (los introduce el parche). Son esperados; se auditán en la
-    # validación vía EXPECTED_REBEL_SET. Aquí solo se informa si hay otros.
-    if [ "$BORE_ENABLED" = true ]; then
-      if printf '%s\n' "$NEWCONFIG_OUTPUT" | grep -vE 'CONFIG_(SCHED_BORE|MIN_BASE_SLICE_NS)' | grep -qE '^CONFIG_|^# CONFIG_'; then
-        warn "Se detectaron símbolos nuevos/pendientes (además de los de BORE)."
+    # Con parches/BTF activos, sus símbolos aparecerán aquí como nuevos (los
+    # introduce el parche). Son esperados; se auditán en la validación vía
+    # EXPECTED_REBEL_SET. Aquí solo se informa si hay OTROS.
+    if [ "${#PATCH_KCONFIG_FILTER[@]}" -gt 0 ]; then
+      local __fs __name_regex=""
+      for __fs in "${!PATCH_KCONFIG_FILTER[@]}"; do
+        [ -n "$__name_regex" ] && __name_regex="$__name_regex|"
+        __name_regex="$__name_regex$__fs"
+      done
+      unset __fs
+      if printf '%s\n' "$NEWCONFIG_OUTPUT" | grep -vE "CONFIG_($__name_regex)" | grep -qE '^CONFIG_|^# CONFIG_'; then
+        warn "Se detectaron símbolos nuevos/pendientes (además de los de parches/BTF)."
       fi
+      unset __name_regex
     else
       warn "Se detectaron símbolos nuevos/pendientes."
     fi
@@ -2948,6 +3157,12 @@ write_verify_signature() {
   {
     printf 'version=%s\n' "$rel"
     printf 'bore=%s\n' "$([ "$BORE_ENABLED" = true ] && echo yes || echo no)"
+    if [ "${#PATCHES_APPLIED[@]}" -gt 0 ]; then
+      # bore permanece aparte por compatibilidad; el resto de parches van en patches=.
+      printf 'patches=%s\n' "${PATCHES_APPLIED[*]}"
+    fi
+    printf 'btf=%s\n' "$([ "$BTF_REQUESTED" = true ] && echo yes || echo no)"
+    printf 'clang=%s\n' "$([ "$CLANG_BUILD" = true ] && echo yes || echo no)"
     printf 'pkgrel=%s\n' "$PKGREL"
     printf 'profile_sha=%s\n' "${profile_hash:-}"
     printf 'ts=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -3189,6 +3404,253 @@ ensure_cizen_efi_updated() {
 }
 
 # ============================================================
+# MENUCONFIG / PAHOLE / SELFTEST / REPO / CHANGELOG  (v27.24.0)
+# ============================================================
+
+# BTF (opcional): pahole genera el .BTF en la compilación. Solo se pide/instala
+# cuando --btf está activo; si no se puede, BTF_REQUESTED=false (fatal suave).
+ensure_optional_pahole() {
+  [ "$BTF_REQUESTED" = true ] || return 0
+  command -v pahole >/dev/null 2>&1 && { ok "pahole disponible (BTF habilitado)."; return 0; }
+  if [ "${CIZEN_NO_AUTOINSTALL:-0}" != "1" ] && ask_user_yes "BTF necesita 'pahole' para generar el .BTF. ¿Instalarlo ('sudo pacman -S --needed pahole')? [S/n]"; then
+    if sudo pacman -S --needed pahole && command -v pahole >/dev/null 2>&1; then
+      ok "pahole instalado (BTF habilitado)."
+      return 0
+    fi
+  fi
+  warn "pahole no disponible; BTF se desactiva para esta ejecución (sudo pacman -S pahole)."
+  BTF_REQUESTED=false
+  return 1
+}
+
+# kcfg / --menuconfig: edición visual de la config Cizen ya validada. Guarda un
+# diff frente a la config previa (con sugerencias de entrada OPTS_* por cambio),
+# re-normaliza con olddefconfig y revalida para no dejar pasar un cambio roto.
+report_menuconfig_diff() {
+  local base="$1" line sym b c a
+  declare -A base_state=()
+  local -a changed=() added=() removed=()
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ ^CONFIG_([A-Za-z0-9_]+)=(.*)$ ]]; then
+      base_state["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+    elif [[ "$line" =~ ^#\ CONFIG_([A-Za-z0-9_]+)\ is\ not\ set$ ]]; then
+      base_state["${BASH_REMATCH[1]}"]="n"
+    fi
+  done < "$base"
+
+  while IFS= read -r sym; do
+    [ -n "$sym" ] || continue
+    b=""; c=""
+    [ -n "${base_state[$sym]+x}" ] && b="${base_state[$sym]}"
+    [ -n "${CONFIG_STATE[$sym]+x}" ] && c="${CONFIG_STATE[$sym]}"
+    if [ -z "$b" ] && [ -n "$c" ] && [ "$c" != "n" ]; then
+      added+=("$sym=$c")
+    elif [ -n "$b" ] && [ -z "$c" ]; then
+      removed+=("$sym")
+    elif [ -n "$b" ] && [ -n "$c" ] && [ "$b" != "$c" ]; then
+      # y<->m es solo un cambio de modo (ENABLE/DISABLE del perfil ya admite
+      # cualquiera); no se reporta como cambio de valor real.
+      if { [ "$b" = "y" ] && [ "$c" = "m" ]; } || { [ "$b" = "m" ] && [ "$c" = "y" ]; }; then
+        :
+      else
+        changed+=("$sym: $b -> $c")
+      fi
+    fi
+  done < <( { for a in "${!base_state[@]}"; do printf '%s\n' "$a"; done
+             for a in "${!CONFIG_STATE[@]}"; do printf '%s\n' "$a"; done; } | sort -u )
+  unset line sym b c a base_state
+
+  local out="$KERNEL_BUILD_ROOT/menuconfig-diff-${TS}.txt"
+  {
+    printf '# menuconfig diff vs la config Cizen ya validada (%s)\n' "$(date +%F\ %T)"
+    printf '# Para que un cambio sobreviva a la PRÓXIMA versión, añádelo al perfil\n'
+    printf '# %s en el array que corresponde (la config base se promueve igualmente).\n' "$PROFILE"
+    printf '\n== NUEVOS (=y/m)  -> añadir a OPTS_ENABLE ==\n'
+    for line in "${added[@]}"; do printf 'CONFIG_%s\n' "$line"; done
+    printf '\n== RETIRADOS (=n) -> añadir a OPTS_DISABLE ==\n'
+    for line in "${removed[@]}"; do printf 'CONFIG_%s\n' "$line"; done
+    printf '\n== CAMBIADOS      -> actualizar OPTS_SETVAL/OPTS_SETSTR ==\n'
+    for line in "${changed[@]}"; do printf '%s\n' "$line"; done
+  } > "$out" 2>/dev/null || true
+
+  [ "${#added[@]}" -gt 0 ] && info "menuconfig: nuevos ${#added[@]} (ver OPTS_ENABLE en el diff)."
+  [ "${#removed[@]}" -gt 0 ] && info "menuconfig: retirados ${#removed[@]} (ver OPTS_DISABLE en el diff)."
+  [ "${#changed[@]}" -gt 0 ] && info "menuconfig: cambiados ${#changed[@]} (ver OPTS_SETVAL/SETSTR en el diff)."
+  [ "$(( ${#added[@]} + ${#removed[@]} + ${#changed[@]} ))" -eq 0 ] && info "menuconfig: sin cambios reales respecto a la config Cizen."
+}
+
+menuconfig_edit() {
+  [ "$MENUCONFIG_REQUESTED" = true ] || return 0
+  if ! [ -t 0 ] && ! [ -t 1 ]; then
+    warn "--menuconfig requiere una terminal interactiva; se omite."
+    return 0
+  fi
+  if ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --exists ncurses >/dev/null 2>&1; then
+    warn "menuconfig necesita ncurses (paquete 'ncurses'). Se omite; usa scripts/config o edita el perfil."
+    return 0
+  fi
+
+  local base="$KERNEL_BUILD_ROOT/config-pre-menuconfig-${TS}"
+  cp -f .config "$base" 2>/dev/null || { warn "No se pudo guardar la config previa; se omite menuconfig."; return 0; }
+  info "Abriendo menuconfig sobre la config Cizen validada de $VERSION (edita, guarda y sal)..."
+  if ! make menuconfig >/dev/null 2>&1; then
+    warn "make menuconfig falló; se restaura la configuración previa."
+    cp -f "$base" .config 2>/dev/null || true
+    return 0
+  fi
+  load_config_state
+  report_menuconfig_diff "$base"
+  log "Re-normalizando la configuración editada (olddefconfig + validación)..."
+  run_kconfig_audit || fatal "Auditoría Kconfig tras menuconfig fallida."
+  validate_config || fatal "La configuración editada con menuconfig no supera la validación del perfil."
+  ok "Configuración editada con menuconfig validada."
+  return 0
+}
+
+# --selftest: autoevaluación del motor (sintaxis, perfil, herramientas) + el
+# harness funcional de la suite cuando existe.
+run_selftest() {
+  local rc=0 t
+  echo
+  info "Autoevaluación del motor kernel-update.sh v$SCRIPT_VERSION ..."
+  if bash -n -- "$0" 2>/dev/null; then
+    ok "Sintaxis del motor: bash -n OK"
+  else
+    err "Sintaxis del motor: bash -n falló"
+    rc=1
+  fi
+
+  if load_profile 2>/dev/null; then
+    ok "Perfil cargado: $PROFILE_FILE"
+    build_effective_arrays
+    if check_profile_contradictions 2>/dev/null; then
+      ok "Perfil sin contradicciones ENABLE/DISABLE/SETVAL/SETSTR"
+    else
+      err "Perfil con contradicciones ENABLE/DISABLE/SETVAL/SETSTR"
+      rc=1
+    fi
+  else
+    err "El perfil no se puede cargar ($PROFILE_FILE)"
+    rc=1
+  fi
+
+  for t in patch aria2c xz gpg tar ccache clang ld.lld pahole; do
+    if command -v "$t" >/dev/null 2>&1; then
+      ok "herramienta '$t' disponible"
+    else
+      info "herramienta '$t' ausente (opcional)"
+    fi
+  done
+
+  local harness="$SCRIPT_DIR/tests/selftest.sh"
+  # Si aún no está instalado en la suite (crear tests/ exige sudo), se cae al
+  # espejo del repo git local (no compromete la suite de producción).
+  [ -f "$harness" ] || harness="$HOME/cizen-linux-kernel-update/kernel-update/tests/selftest.sh"
+  if [ -f "$harness" ]; then
+    info "Ejecutando harness funcional: $harness"
+    if bash "$harness" "$0"; then
+      ok "Harness de tests: TODO CORRECTO"
+    else
+      err "Harness de tests: fallo(s)"
+      rc=1
+    fi
+  else
+    warn "No existe el harness funcional (tests/selftest.sh); se omiten los tests funcionales."
+  fi
+
+  [ "$rc" -eq 0 ] && ok "Autoevaluación completada sin fallos." || err "Autoevaluación completada con $rc fallo(s)."
+  return "$rc"
+}
+
+# --publish-repo: tras instalar, copia el paquete a un repositorio local pacman
+# y refresca su base de datos con repo-add (para las VMs libvirt / otros hosts).
+publish_repo_package() {
+  [ "$PUBLISH_REPO" = true ] || return 0
+  [ -s "${PKG:-}" ] || { warn "No hay paquete que publicar; se omite el repo local."; return 0; }
+  if ! command -v repo-add >/dev/null 2>&1; then
+    warn "repo-add no está instalado (paquete pacman-contrib). Se omite la publicación: sudo pacman -S pacman-contrib"
+    return 0
+  fi
+  if ! sudo -n true 2>/dev/null; then
+    warn "Sin ticket sudo vigente; se omite la publicación en $PUBLISH_REPO_DIR."
+    return 0
+  fi
+
+  local pkgfile="$(basename -- "$PKG")"
+  sudo mkdir -p -- "$PUBLISH_REPO_DIR" || { warn "No se pudo crear $PUBLISH_REPO_DIR"; return 0; }
+  sudo cp -f -- "$PKG" "$PUBLISH_REPO_DIR/$pkgfile" || { warn "No se pudo copiar el paquete al repo local."; return 0; }
+  if sudo repo-add -q -- "$PUBLISH_REPO_DIR/cizen-linux.db.tar.gz" "$PUBLISH_REPO_DIR/$pkgfile"; then
+    ok "Publicado en repo local: $PUBLISH_REPO_DIR (db 'cizen-linux')"
+    PUBLISH_REPO_MSG="Repo local  : $PUBLISH_REPO_DIR (cizen-linux)
+   Para usarlo en VMs/compañeros añade a /etc/pacman.conf:
+     [cizen-linux]
+     Server = file://$PUBLISH_REPO_DIR
+     SigLevel = Optional
+   (o sirve el directorio por HTTP/NFS y cambia Server.)"
+  else
+    warn "repo-add falló al publicar $pkgfile."
+  fi
+  return 0
+}
+
+# --changelog: mantenimiento. Bumpea cabecera + SCRIPT_VERSION a X.Y.(Z+1) y
+# añade al top un borrador de changelog con el diff --stat del espejo git (si
+# existe). NO hace commit ni push; el texto del parche lo completa el mantenedor.
+changelog_bump() {
+  local cur new patch ts mirror repo stat_info tmp
+  cur="$SCRIPT_VERSION"
+  patch="${cur##*.}"
+  [[ "$patch" =~ ^[0-9]+$ ]] || { err "SCRIPT_VERSION inválido: $cur"; return 1; }
+  new="${cur%.*}.$((patch + 1))"
+  ts="$(date +%Y-%m-%d)"
+  mirror="${CIZEN_KERNEL_MIRROR:-$HOME/cizen-linux-kernel-update/kernel-update}"
+  repo="$(dirname -- "$mirror")"
+  stat_info=""
+  if [ -f "$mirror/kernel-update.sh" ] && git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    stat_info="$(git -C "$repo" diff --stat HEAD -- kernel-update/ 2>/dev/null || true)"
+  fi
+  if [ -n "$stat_info" ]; then
+    info "Resumen git del espejo (referencia para el changelog):"
+    printf '%s\n' "$stat_info"
+  fi
+
+  log "Preparando bump v$cur -> v$new con borrador de changelog ($ts)..."
+  tmp="$(mktemp "${SCRIPT_DIR}/.kernel-update-XXXXXX")" || return 1
+  awk -v new="$new" -v cur="$cur" -v ts="$ts" -v stat="$stat_info" '
+    BEGIN { bumped=0; bumpver=0; n=split(stat, s, "\n") }
+    !bumped && NR<=3 && $0 ~ /^# kernel-update\.sh — Cizen v/ {
+      sub(/Cizen v[0-9]+[.][0-9]+[.][0-9]+/, "Cizen v" new)
+      print; next
+    }
+    !bumped && $0 ~ /^# CHANGELOG v[0-9]/ {
+      print "# CHANGELOG v" new " (borrador — completa la descripción — " ts ")"
+      print "#   - RELLENAR: describe qué cambia frente a la v" cur "."
+      if (n > 0) print "#   - Referencia del espejo git (diff --stat):"
+      for (i=1; i<=n; i++) if (s[i] != "") print "#       " s[i]
+      print "#"
+      bumped=1
+    }
+    !bumpver && $0 ~ /^SCRIPT_VERSION="[0-9]+[.][0-9]+[.][0-9]+"$/ {
+      sub(/SCRIPT_VERSION="[0-9]+[.][0-9]+[.][0-9]+"/, "SCRIPT_VERSION=\"" new "\"")
+      bumpver=1
+    }
+    { print }
+  ' "$0" > "$tmp" || { rm -f -- "$tmp"; err "Fallo al generar el borrador."; return 1; }
+
+  if ! bash -n -- "$tmp" 2>/dev/null; then
+    err "El borrador resultante no pasa bash -n; no se aplica."
+    rm -f -- "$tmp"
+    return 1
+  fi
+  chmod --reference="$0" "$tmp" 2>/dev/null || true
+  mv -f -- "$tmp" "$0" || { rm -f -- "$tmp"; err "No se pudo reemplazar el motor."; return 1; }
+  ok "Bumpeado a v$new y borrador añadido al top de $0."
+  ok "Completa el texto del changelog y sincroniza el espejo: cp \"$0\" \"$mirror/kernel-update.sh\""
+  return 0
+}
+
+# ============================================================
 # DECISIÓN SOBRE RELEASE MÁS NUEVA
 # ============================================================
 confirm_newer_release() {
@@ -3212,6 +3674,29 @@ confirm_newer_release() {
   esac
 }
 
+# Confirma antes de recompilar la versión ya instalada cuando no hay una release
+# estable nueva. Devolver 0 -> continuar con la recompilación; 1 -> no hacer nada.
+confirm_recompile_current() {
+  local version="$1" answer
+
+  if ! [ -t 0 ] && ! [ -t 1 ]; then
+    warn "No hay una release estable nueva y no hay terminal interactiva; se cancela (no se recompila $version)."
+    return 1
+  fi
+
+  printf '\n'
+  printf '  No hay una release estable nueva para compilar (instalada: %s).\n' "$version"
+  read -r -p "  ¿Quieres continuar con la recompilación del kernel $version? [S/n] " answer < /dev/tty || answer="n"
+  case "${answer:-s}" in
+    s|S|si|SI|Sí|sí|y|Y|yes|YES)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 # ============================================================
 # INICIO PRINCIPAL
 # ============================================================
@@ -3220,8 +3705,25 @@ PKG=""
 PKG_NAME=""
 PKG_VERSION=""
 
+# Modos de mantenimiento sin sudo/red/descarga: se ejecutan pronto y salen.
+if [ "$SELFTEST" = true ]; then
+  run_selftest || exit 1
+  exit 0
+fi
+if [ "$DO_CHANGELOG" = true ]; then
+  changelog_bump || exit 1
+  exit 0
+fi
+
 prepare_dirs
 check_prerequisites
+
+# BTF (opcional): necesita pahole para el .BTF. Si no se consigue se degrada a
+# sin-BTF; se reconstruyen los arrays efectivos por si el BTF se desactivó.
+if [ "$BTF_REQUESTED" = true ]; then
+  ensure_optional_pahole
+  build_effective_arrays
+fi
 
 # Con una versión explícita, kernel.org se consulta antes de descargar.
 # Si existe una stable posterior, se pregunta una sola vez y la respuesta
@@ -3253,15 +3755,20 @@ if [ "$CHECK_UPDATE" = true ]; then
 fi
 
 if [ -z "$VERSION" ]; then
-  resolve_latest_release
-  VERSION="$REMOTE_STABLE_VERSION"
-  # kcheck sin versión siempre trabaja contra la stable actual; la regla
-  # "no compilar si no hay actualización" aplica solo al flujo de build.
-  if [ "$CHECK_ONLY" = false ] && [ -n "$LOCAL_KERNEL_VERSION" ] && ! version_gt "$VERSION" "$LOCAL_KERNEL_VERSION"; then
-    ok "No hay una release estable nueva para compilar. Usa una versión explícita para recompilar: $LOCAL_KERNEL_VERSION"
-    exit 0
+    resolve_latest_release
+    VERSION="$REMOTE_STABLE_VERSION"
+    # kcheck sin versión siempre trabaja contra la stable actual; la regla
+    # "no compilar si no hay actualización" aplica solo al flujo de build.
+    if [ "$CHECK_ONLY" = false ] && [ -n "$LOCAL_KERNEL_VERSION" ] && ! version_gt "$VERSION" "$LOCAL_KERNEL_VERSION"; then
+      if confirm_recompile_current "$LOCAL_KERNEL_VERSION"; then
+        VERSION="$LOCAL_KERNEL_VERSION"
+        ok "Se continúa con la recompilación de la versión instalada: $VERSION"
+      else
+        ok "Recompilación cancelada: no hay una release estable nueva para compilar."
+        exit 0
+      fi
+    fi
   fi
-fi
 
 # La versión ya está resuelta: a partir de aquí todas las rutas son deterministas.
 MAJOR="${VERSION%%.*}"
@@ -3342,19 +3849,21 @@ cd "$SRC"
 ok "Fuentes listas: $SRC"
 T_DL="$(date +%s)"
 
-# BORE (opcional): se aplica antes de elegir config base porque introduce
-# símbolos Kconfig nuevos (SCHED_BORE, MIN_BASE_SLICE_NS) que deben existir
-# para que olddefconfig/validación los vean.
-if [ "$BORE_REQUESTED" = true ] || [ "${CIZEN_ENABLE_BORE:-0}" = "1" ]; then
-  if apply_bore_patch; then
-    # El parche ya está en el árbol: reconstruir arrays efectivos para que
-    # build_effective_arrays voltee SCHED_BORE a ENABLE y lo marque como
-    # símbolo esperado (no ensucia la auditoría ni bloquea con --strict).
-    build_effective_arrays
-  else
-    warn "BORE no aplicado; la build continúa con el scheduler EEVDF vanilla."
-    BORE_ENABLED=false
-  fi
+# Parches de terceros (v27.24.0): --patch / --bore / CIZEN_PATCHES. Se aplican
+# antes de elegir la config base porque introducen símbolos Kconfig nuevos que
+# deben existir para que olddefconfig/validación los vean.
+if [ "${#PATCH_NAMES[@]}" -gt 0 ]; then
+  for __patch in "${PATCH_NAMES[@]}"; do
+    if apply_patch_plugin "$__patch"; then
+      # Reconstruir arrays efectivos para que build_effective_arrays active los
+      # símbolos del parche y los marque como esperados (no ensucia kcheck ni
+      # bloquea con --strict).
+      build_effective_arrays
+    else
+      warn "Parche $__patch no aplicado; la build continúa vanilla."
+    fi
+  done
+  unset __patch
 fi
 
 # Config Cizen primero; /proc/config.gz o /boot/config como fallback.
@@ -3399,6 +3908,10 @@ fi
 verify_build_tree
 report_config_diff
 T_CFG="$(date +%s)"
+
+# kcfg / --menuconfig (opcional): edición visual de la config ya validada.
+# Se hace tras la absorción de rebeldes y ANTES de promover la config base.
+menuconfig_edit
 
 promote_base_config() {
   local src="$1" dst="$2" tmp
@@ -3483,6 +3996,28 @@ else
 fi
 
 export KCFLAGS="${KCFLAGS:--pipe}"
+
+# Build con LLVM/Clang (--clang): Kbuild aplica LLVM=1 (CC=clang, ld.lld,
+# llvm-ar/nm, etc.). Si clang o ld.lld no están, se degrada a GCC (fatal suave).
+CLANG_BUILD=false
+if [ "$CLANG_REQUESTED" = true ]; then
+  if command -v clang >/dev/null 2>&1 && command -v ld.lld >/dev/null 2>&1; then
+    if command -v ccache >/dev/null 2>&1; then
+      MAKE_CC_OPTS+=(
+        'LLVM=1'
+        'CC=ccache clang'
+        'HOSTCC=ccache clang'
+      )
+    else
+      MAKE_CC_OPTS+=('LLVM=1')
+    fi
+    export LLVM=1
+    CLANG_BUILD=true
+    ok "Compilación con LLVM/Clang (LLVM=1)."
+  else
+    warn "clang/ld.lld no están instalados; --clang se degrada a GCC (sudo pacman -S clang lld)."
+  fi
+fi
 
 # Límite máximo configurable para la compilación. 1 h cubre con margen
 # una build completa en una máquina seca (cold ~19 min, warm ~4 min),
@@ -3754,6 +4289,10 @@ FINAL_CONFIG="$CONFIG_DIR/linux-$VERSION-cizen-v3.config"
 promote_base_config .config "$FINAL_CONFIG"
 ok "Configuración final guardada: $FINAL_CONFIG"
 
+# Repo local pacman (--publish-repo): copia el paquete instalado a un repositorio
+# de archivos servible a las VMs libvirt / otros hosts.
+publish_repo_package
+
 T_END="$(date +%s)"
 
 # Desglose de tiempos (feature 7). t_* en segundos; cada fase se muestra solo
@@ -3795,9 +4334,12 @@ ACTUALIZACIÓN COMPLETADA — CIZEN v$SCRIPT_VERSION
 ===============================================================
  Versión     : $VERSION-cizen-v3
  pkgrel      : $PKGREL
- Perfil      : $PROFILE
- BORE        : $([ "$BORE_ENABLED" = true ] && echo 'sí (SCHED_BORE=y)' || echo 'no (EEVDF vanilla)')
- Hilos       : $JOBS
+Perfil      : $PROFILE
+  Parches     : ${PATCHES_APPLIED[*]:---}
+  BTF         : $([ "$BTF_REQUESTED" = true ] && echo 'sí' || echo 'no')
+  CC          : $([ "$CLANG_BUILD" = true ] && echo 'LLVM/Clang' || echo 'GCC')
+${PUBLISH_REPO_MSG:+  ${PUBLISH_REPO_MSG}}
+  Hilos       : $JOBS
  Build prio  : $BUILD_PRIORITY (CIZEN_BUILD_PRIORITY=normal para máxima velocidad)
  Paquete     : $(basename "$PKG")
  Config base : $FINAL_CONFIG

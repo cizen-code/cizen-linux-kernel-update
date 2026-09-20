@@ -8,7 +8,7 @@
 #   a) PERFIL   : que la configuración del kernel EN EJECUCIÓN cumple el
 #                 perfil cizen (OPTS_ENABLE / CRITICAL_OPTS / SETVAL / SETSTR)
 #                 aplicando el mapa de renames, y que el scheduler coincide
-#                 con la firma del último build (cone BORE si se pidió).
+#                 con la firma del último build (BORE, BTF si se pidieron).
 #   b) BOOT     : compara systemd-analyze (kernel/userspace/total) del boot
 #                 actual con el del boot previo registrado y avisa si el total
 #                 empeora más allá de un factor/umbral.
@@ -253,13 +253,30 @@ for opt in "${OPTS_ENABLE[@]:-}"; do
   fi
 
   if [ -f "$BUILD_SIG" ]; then
-    local sig_bore="" sig_ver=""
+    local sig_bore="no" sig_btf="no" sig_ver="" sig_patches=""
     # shellcheck disable=SC1090,SC1091
     source "$BUILD_SIG"
-    sig_ver="${sig_version:-}"
-    if [ "${sig_bore:-no}" = "yes" ] && [ "${bore_run:-}" != "y" ]; then
+    sig_bore="${bore:-no}"
+    sig_btf="${btf:-no}"
+    sig_ver="${version:-}"
+    sig_patches="${patches:-}"
+    if [ "$sig_bore" = "yes" ] && [ "${bore_run:-}" != "y" ]; then
       pc_warn "El último build pedía BORE pero el kernel arrancado NO lo tiene (SCHED_BORE=${bore_run:-no})."
       issues=$((issues + 1))
+    elif [ "$sig_bore" != "yes" ] && [ "${bore_run:-}" = "y" ]; then
+      pc_warn "El kernel arrancado tiene BORE pero el último build era vanilla (¿paquete foráneo o rollback?)."
+      issues=$((issues + 1))
+    fi
+    if [ "$sig_btf" = "yes" ]; then
+      local btf_run=""
+      [ -n "${RUN_CFG[DEBUG_INFO_BTF]+x}" ] && btf_run="${RUN_CFG[DEBUG_INFO_BTF]}"
+      if [ "${btf_run:-n}" != "y" ]; then
+        pc_warn "El último build pedía BTF pero CONFIG_DEBUG_INFO_BTF=${btf_run:-n} en el kernel arrancado."
+        issues=$((issues + 1))
+      else
+        pc_ok "BTF presente (DEBUG_INFO_BTF=y) según la firma del último build."
+      fi
+      unset btf_run
     fi
   fi
   printf '%s\n' "${issues:-0}"
