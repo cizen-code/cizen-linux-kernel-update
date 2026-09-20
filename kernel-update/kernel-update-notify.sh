@@ -20,6 +20,7 @@
 #
 # Variables de entorno (override):
 #   KERNEL_RELEASES_JSON_URL  misma fuente que kernel-update.sh
+#   CIZEN_KERNEL_TRACK        rama a vigilar: stable (default), longterm o lts
 #   CIZEN_KERNEL_LOCAL_VERSION  fuerza la versión local (tests, --dry-run)
 #   CIZEN_NOTIFY_BIN           binario de notificación (default notify-send)
 #   CIZEN_KERNEL_SCRIPT        ruta de kernel-update.sh (default /usr/local/bin/kernel-update/kernel-update.sh)
@@ -36,6 +37,11 @@ KERNEL_SCRIPT="${CIZEN_KERNEL_SCRIPT:-/usr/local/bin/kernel-update/kernel-update
 MENU_SCRIPT="${CIZEN_KERNEL_MENU_SCRIPT:-/usr/local/bin/kernel-update/kernel-update-menu.sh}"
 CONFIG_DIR="${CIZEN_CONFIG_DIR:-$(dirname -- "$KERNEL_SCRIPT")/profiles}"
 NOTIFY_BIN="${CIZEN_NOTIFY_BIN:-notify-send}"
+KERNEL_TRACK="${CIZEN_KERNEL_TRACK:-stable}"
+case "$KERNEL_TRACK" in
+  stable|longterm|lts) : ;;
+  *) KERNEL_TRACK="stable" ;;
+esac
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/kernel-update"
 LAST_FILE="$STATE_DIR/notify-last-version"
@@ -85,11 +91,21 @@ get_local_kernel_version() {
 }
 
 # jq como vía preferida, el mismo fallback sed que kernel-update.sh.
+# Con CIZEN_KERNEL_TRACK=longterm|lts se vigila la última version de la rama
+# longterm (moniker longterm|lts en releases.json); si no se puede resolver
+# (p. ej. sin jq), cae a latest_stable con warn registrado en el log.
 get_remote_latest_stable() {
-  local json latest
+  local json latest="" track="$KERNEL_TRACK"
   json="$(wget -qO- --timeout=30 --tries=2 "$KERNEL_RELEASES_JSON_URL" 2>/dev/null)" || return 1
   if command -v jq >/dev/null 2>&1; then
-    latest="$(printf '%s\n' "$json" | jq -r '.latest_stable.version // empty' 2>/dev/null || true)"
+    if [ "$track" = "longterm" ] || [ "$track" = "lts" ]; then
+      latest="$(printf '%s\n' "$json" | jq -r --arg m 'longterm|lts' \
+        '[.releases[] | select(.moniker | test($m)) | .version] | max // empty' 2>/dev/null || true)"
+      [ -n "$latest" ] || alog "CIZEN_KERNEL_TRACK=$track no resuelto con jq; fallback a latest_stable"
+    fi
+    if [ -z "${latest:-}" ]; then
+      latest="$(printf '%s\n' "$json" | jq -r '.latest_stable.version // empty' 2>/dev/null || true)"
+    fi
   fi
   if [ -z "${latest:-}" ]; then
     latest="$(printf '%s\n' "$json" | tr '\n' ' ' | sed -n 's/.*"latest_stable"[[:space:]]*:[[:space:]]*{[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^" ]*\)"[[:space:]]*}.*/\1/p')"

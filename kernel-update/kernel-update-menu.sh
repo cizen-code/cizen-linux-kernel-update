@@ -54,11 +54,15 @@ echo
 echo "  ${C}Consulta:${N}"
 echo "    ${G}6${N}) check-update consultar última release estable (sin modificar nada)"
 echo
+echo "  ${C}Post-instalación:${N}"
+echo "    ${G}9${N}) rollback   restaurar el kernel previo archivado por la última instalación"
+echo "          (la verificación post-boot corre sola tras el arranque: kernel-update-verify)"
+echo
 echo "    ${G}0${N}) salir"
 echo
 
 while true; do
-  read -r -p "  Selección [0-8]: " choice
+  read -r -p "  Selección [0-9]: " choice
   case "$choice" in
     1) exec "$SCRIPT" --absorb-rebels --check ;;
     2) CIZEN_BUILD_PRIORITY=normal exec "$SCRIPT" --absorb-rebels --check ;;
@@ -68,6 +72,7 @@ while true; do
     6) exec "$SCRIPT" --check-update ;;
     7) exec "$SCRIPT" --absorb-rebels --bore ;;
     8) CIZEN_BUILD_PRIORITY=normal exec "$SCRIPT" --absorb-rebels --bore ;;
+    9) exec /usr/local/bin/kernel-update/kernel-update-rollback.sh ;;
     0) echo "  Saliendo."; exit 0 ;;
     *) printf "  %bOpción no válida.%b\n" "$R" "$N" ;;
   esac

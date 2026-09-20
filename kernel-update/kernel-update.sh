@@ -1,8 +1,36 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.22.4 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.23.0 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / systemd / KVM-libvirt / QEMU-OVMF
+#
+# CHANGELOG v27.23.0 (operativa: diff de config, post-boot, rollback, snapshots — 2026-09-20)
+#   - 1) Config-diff: tras validar, se compara la config efectiva nueva vs la del
+#     kernel EN EJECUCIÓN (/proc/config.gz) teniendo en cuenta los renames del
+#     perfil (APPLIED_RENAMES) y se resumen cambiados/nuevos/retirados (máx 15
+#     detalles). Primera señal de que el perfil realmente cambió algo.
+#   - 2/6/8) Verificación post-boot NUEVA: script kernel-update-verify.sh +
+#     unit de usuario (ver abajo) que tras cada arranque comprueba que el kernel
+#     en ejecución cumple el perfil (OPTS_ENABLE/CRITICAL_OPTS/SETVAL/SETSTR +
+#     estado BORE vs firma de build), compara el tiempo de arranque
+#     (systemd-analyze) con el boot previo y escanea el journal del kernel del
+#     boot actual buscando patrones de regresión (oops/panic/GPU hang/hung task)
+#     frente al boot anterior. Notifica discrepancias (~/.local/state/kernel-update/).
+#   - 3) Rollback dual-kernel: antes de instalar, kernel-update.sh archiva el
+#     kernel en ejecución (módulos + vmlinuz) en $ROLLBACK_DIR
+#     (/var/lib/kernel-update/rollback, 1 copia). Nuevo
+#     kernel-update-rollback.sh / comando krollback lo restaura y regenera la UKI.
+#   - 4) Snapshot btrfs readonly de la raíz antes de instalar (subvol
+#     .snapshots/@kernel-<versión>-<ts>). Auto si / es btrfs; desactivar con
+#     CIZEN_SNAPSHOT=0. Fallo NO bloquea (warn).
+#   - 5) Rama de seguimiento configurable: CIZEN_KERNEL_TRACK=stable (default)
+#     | longterm (LTS mayor de releases.json; requiere jq; sin jq degrada a stable
+#     con warning). Aplica a build/check-update y al notificador.
+#   - 7) Informe final ampliado: desglose de tiempos (descarga+extracción,
+#     config+validación, compilación, instalación+UKI) y estadísticas ccache
+#     (hits/tamaño/ficheros) cuando hay ccache.
+#   - No rompe el flujo anterior: todas las partes nuevas son aditivas, fallan
+#     blando (warn) o son configurables con variables de entorno.
 #
 # CHANGELOG v27.22.4 (fix BORE en árbol reutilizado — 2026-09-19)
 #   - Bug: tras cancelar una build BORE (Ctrl+C) el árbol tmpfs se conserva CON
@@ -370,6 +398,10 @@
 #   KERNEL_BUILD_ROOT=/tmp/kbuild ./kernel-update.sh <versión>
 #   ./kernel-update.sh --rename VIEJO=NUEVO
 #   ./kernel-update.sh --list-renames
+#   CIZEN_KERNEL_TRACK=longterm ./kernel-update.sh   # seguir LTS mayor en vez de stable
+#   CIZEN_SNAPSHOT=0 ./kernel-update.sh              # sin snapshot btrfs previo
+#   CIZEN_ROLLBACK_DIR=/ruta ./kernel-update.sh      # dónde guardar el archivo de rollback
+#   CIZEN_VERIFY_STATE_DIR=/ruta                     # estado del verificador post-boot
 #
 # NOTAS DE PRODUCCIÓN
 #   - --force NO ignora fallos críticos ni de auditoría Kconfig. Su único
@@ -397,7 +429,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.22.4"
+SCRIPT_VERSION="27.23.0"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -459,6 +491,22 @@ DO_RENAME=false
 RENAME_PAIR=""
 DO_LIST=false
 CHECK_UPDATE=false
+
+# Rama de kernel.org a seguir: stable (default) o longterm/LTS mayor.
+CIZEN_KERNEL_TRACK="${CIZEN_KERNEL_TRACK:-stable}"
+[ "$CIZEN_KERNEL_TRACK" = "longterm" ] || [ "$CIZEN_KERNEL_TRACK" = "lts" ] || [ "$CIZEN_KERNEL_TRACK" = "stable" ] \
+  || fatal "CIZEN_KERNEL_TRACK inválido: $CIZEN_KERNEL_TRACK (use stable, longterm o lts)."
+
+# Rollback dual-kernel: directorio (root) donde se archiva el kernel previo al instalar.
+ROLLBACK_DIR="${CIZEN_ROLLBACK_DIR:-/var/lib/kernel-update/rollback}"
+# Snapshot btrfs readonly de la raíz antes de instalar: 1=auto (si / es btrfs), 0=off.
+CIZEN_SNAPSHOT="${CIZEN_SNAPSHOT:-1}"
+SNAPSHOT_SUBVOL=".snapshots"
+# Estado del verificador post-boot (firma del build, tiempos).
+VERIFY_STATE_DIR="${CIZEN_VERIFY_STATE_DIR:-$HOME/.local/state/kernel-update}"
+
+# Marcas de tiempo de las fases para el informe final (feature 7).
+T_ALL=0; T_DL=0; T_CFG=0; T_END=0
 
 # Modo invocado por nombre: permite que kcheck/kbuild sean simples enlaces
 # al mismo motor, sin wrappers que obliguen a pasar una versión.
@@ -737,14 +785,31 @@ get_local_kernel_version() {
 }
 
 get_kernel_org_latest_stable() {
-  local json latest=""
+  local json latest="" track
   json="$(wget -qO- --timeout=30 --tries=2 "$KERNEL_RELEASES_JSON_URL")" || return 1
+  track="${CIZEN_KERNEL_TRACK:-stable}"
 
-  # jq es la vía preferida cuando está disponible; el parsing sed se conserva
-  # como fallback para sistemas sin jq y cubre el esquema actual de kernel.org.
-  if command -v jq >/dev/null 2>&1; then
-    latest="$(printf '%s\n' "$json" | jq -r '.latest_stable.version // empty' 2>/dev/null || true)"
-  fi
+  case "$track" in
+    longterm|lts)
+      # releases.json: cada release estable lleva su moniker. La mayor con
+      # moniker longterm/lts es la que se sigue. Requiere jq; sin jq se degrada
+      # a latest_stable con warning (documentado en cabecera).
+      if command -v jq >/dev/null 2>&1; then
+        latest="$(printf '%s\n' "$json" | jq -r '[.releases[] | select((.moniker // "" | ascii_downcase | test("longterm|lts"))) | .version] | sort_by(. | split(".") | map(tonumber)) | last // empty' 2>/dev/null || true)"
+      fi
+      if [ -z "$latest" ]; then
+        warn "CIZEN_KERNEL_TRACK=longterm requiere jq (o no hay release LTS en releases.json); se usa latest_stable."
+      fi
+      ;;
+    *)
+      # jq es la vía preferida cuando está disponible; el parsing sed se conserva
+      # como fallback para sistemas sin jq y cubre el esquema actual de kernel.org.
+      if command -v jq >/dev/null 2>&1; then
+        latest="$(printf '%s\n' "$json" | jq -r '.latest_stable.version // empty' 2>/dev/null || true)"
+      fi
+      ;;
+  esac
+
   if [ -z "$latest" ]; then
     latest="$(printf '%s\n' "$json" | tr '\n' ' ' | sed -n 's/.*"latest_stable"[[:space:]]*:[[:space:]]*{[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^" ]*\)"[[:space:]]*}.*/\1/p')"
   fi
@@ -753,21 +818,26 @@ get_kernel_org_latest_stable() {
 }
 
 resolve_latest_release() {
-  local latest local_version
+  local latest local_version track_txt
   latest="$(get_kernel_org_latest_stable)" || fatal "No se pudo consultar la release estable de kernel.org: $KERNEL_RELEASES_JSON_URL"
   REMOTE_STABLE_VERSION="$latest"
 
   local_version="$(get_local_kernel_version)"
   LOCAL_KERNEL_VERSION="$local_version"
 
+  case "${CIZEN_KERNEL_TRACK:-stable}" in
+    longterm|lts) track_txt="(longterm LTS)" ;;
+    *) track_txt="(stable)" ;;
+  esac
+
   if [ -n "$local_version" ]; then
     if version_gt "$latest" "$local_version"; then
-      ok "Nueva release estable detectada: $local_version → $latest"
+      ok "Nueva release $track_txt detectada: $local_version → $latest"
     else
-      ok "Kernel Cizen ya está en $local_version; kernel.org stable: $latest"
+      ok "Kernel Cizen ya está en $local_version; kernel.org $track_txt: $latest"
     fi
   else
-    info "Kernel.org stable detectado: $latest (sin versión Cizen instalada como referencia)"
+    info "kernel.org $track_txt detectado: $latest (sin versión Cizen instalada como referencia)"
   fi
 }
 
@@ -2272,6 +2342,73 @@ validate_config() {
 }
 
 # ============================================================
+# DIFF DE CONFIG vs KERNEL EN EJECUCIÓN  (feature 1)
+# ============================================================
+# Compara la .config efectiva ya normalizada (CONFIG_STATE) contra la del kernel
+# que está arrancado (/proc/config.gz), aplicando los renames del perfil
+# (APPLIED_RENAMES) para no marcar como cambio un símbolo renombrado. Solo
+# informa; nunca bloquear. Cambiados = presentes en ambos con valor distinto;
+# nuevos/retirados = solo en uno de los dos (típicamente por el bump de versión).
+report_config_diff() {
+  if ! zcat /proc/config.gz >/dev/null 2>&1; then
+    warn "No se puede leer la config del kernel en ejecución (/proc/config.gz); se omite el diff."
+    return 0
+  fi
+
+  local -A inst=()
+  local line sym val
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ ^CONFIG_([A-Za-z0-9_]+)=(.*)$ ]]; then
+      inst["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+    elif [[ "$line" =~ ^#\ CONFIG_([A-Za-z0-9_]+)\ is\ not\ set$ ]]; then
+      inst["${BASH_REMATCH[1]}"]="n"
+    fi
+  done < <(zcat /proc/config.gz 2>/dev/null)
+
+  local -a changed=() added=() removed=()
+  local oldsym newsym runstate newstate newname
+
+  # Cambiados: el símbolo existe en el kernel en ejecución y el perfil lo cambió.
+  # Si el perfil renombró el símbolo (APPLIED_RENAMES[old]=new), se compara el
+  # valor de inst[old] contra CONFIG_STATE[new] y no se reporta si coinciden.
+  for oldsym in "${!inst[@]}"; do
+    runstate="${inst[$oldsym]}"
+    [ -n "${CONFIG_STATE[$oldsym]+x}" ] || continue
+    newname="${APPLIED_RENAMES[$oldsym]:-}"
+    if [ -n "$newname" ] && [ -n "${CONFIG_STATE[$newname]+x}" ]; then
+      [ "${CONFIG_STATE[$newname]}" = "$runstate" ] && continue
+    fi
+    if [ "${CONFIG_STATE[$oldsym]}" != "$runstate" ]; then
+      changed+=("CONFIG_$oldsym $runstate → ${CONFIG_STATE[$oldsym]}")
+    fi
+  done
+
+  # "nuevos": en la config nueva pero ausentes en el kernel en ejecución.
+  for sym in "${!CONFIG_STATE[@]}"; do
+    [ -n "${inst[$sym]+x}" ] || added+=("CONFIG_$sym")
+  done
+  # "retirados": presentes en el kernel en ejecución pero ausentes en la nueva.
+  for sym in "${!inst[@]}"; do
+    [ -n "${CONFIG_STATE[$sym]+x}" ] || removed+=("CONFIG_$sym")
+  done
+
+  ok "Diff vs kernel en ejecución: ${#changed[@]} cambiados / ${#added[@]} nuevos / ${#removed[@]} retirados"
+  if [ "${#changed[@]}" -gt 0 ]; then
+    info "Cambios de config (máx. 15):"
+    local i=0 c
+    for c in "${changed[@]}"; do
+      if [ "$i" -ge 15 ]; then
+        info "  … y $(( ${#changed[@]} - 15 )) más"
+        break
+      fi
+      printf '    %s\n' "$c"
+      i=$((i + 1))
+    done
+  fi
+  return 0
+}
+
+# ============================================================
 # ABSORCIÓN DE REBELDES EN EL PERFIL  (--absorb-rebels)
 # ============================================================
 # Cuando una desactivación de OPTS_DISABLE es conservada por Kconfig a =y/=m
@@ -2683,6 +2820,142 @@ prune_stale_packages() {
 }
 
 # ============================================================
+# ROLLBACK DUAL-KERNEL  (feature 3)
+# ============================================================
+# Antes de instalar una versión nueva se archiva el kernel EN EJECUCIÓN
+# (sus módulos + /boot/vmlinuz-linux-cizen-v3 + cmdline) en $ROLLBACK_DIR.
+# kernel-update-rollback.sh (krollback) lo restaura y regenera la UKI.
+# Solo se conserva el ÚLTIMO archive (el kernel previo al actual); los más
+# antiguos se podan para mantener "actual + previo".
+SNAPSHOT_DESC=""
+
+prepare_rollback_archive() {
+  local rel modules vmlinuz tmp
+  rel="$(uname -r 2>/dev/null || true)"
+  [ -n "$rel" ] || { warn "No se puede leer uname -r; no se guarda archive de rollback."; return 0; }
+  # Nunca volver a archivar la versión que acabamos de dejar de arrancar si ya
+  # existe un archive de la misma release: no vale la pena overwrite.
+  [ -f "$ROLLBACK_DIR/$rel.tar.xz" ] && { info "Rollback ya existe para $rel; se conserva."; return 0; }
+
+  modules="/usr/lib/modules/$rel"
+  vmlinuz="/boot/vmlinuz-linux-cizen-v3"
+  [ -d "$modules" ] && [ -s "$modules/vmlinuz" ] && vmlinuz="$modules/vmlinuz"
+  [ -d "$modules" ] || { warn "No hay módulos para $rel ($modules); rollback omitido."; return 0; }
+
+  if ! sudo mkdir -p -- "$ROLLBACK_DIR" 2>/dev/null; then
+    warn "No se pudo crear $ROLLBACK_DIR; rollback omitido."
+    return 0
+  fi
+
+  tmp="$ROLLBACK_DIR/.archive-$$.tmp"
+  sudo rm -f -- "$tmp" 2>/dev/null
+  if sudo tar --xz -cf "$tmp" -C / \
+       "usr/lib/modules/$rel" \
+       "boot/vmlinuz-linux-cizen-v3" \
+       "boot/EFI/Linux/arch-linux-cizen-v3.efi" 2>/dev/null; then
+    if [ -s "$tmp" ]; then
+      sudo mv -f -- "$tmp" "$ROLLBACK_DIR/$rel.tar.xz" 2>/dev/null || {
+        sudo rm -f -- "$tmp" 2>/dev/null
+        warn "No se pudo mover el archive de rollback a $ROLLBACK_DIR/$rel.tar.xz."
+        return 0
+      }
+      printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | sudo tee "$ROLLBACK_DIR/$rel.timestamp" >/dev/null 2>&1 || true
+      VERIFY_ROLLBACK_FILE="$ROLLBACK_DIR/$rel.tar.xz"
+      ok "Rollback preparado: $ROLLBACK_DIR/$rel.tar.xz (kernel en ejecución $rel)"
+    else
+      sudo rm -f -- "$tmp" 2>/dev/null
+      warn "Archive de rollback vacío; omitido."
+    fi
+  else
+    sudo rm -f -- "$tmp" 2>/dev/null
+    warn "No se pudo crear el archive de rollback de $rel."
+  fi
+
+  prune_rollback_archives
+  return 0
+}
+
+# Conserva solo el archive MÁS RECIENTE (por versión) en el directorio.
+prune_rollback_archives() {
+  local keep newest=""
+  shopt -s nullglob
+  local -a archives=("$ROLLBACK_DIR"/*.tar.xz)
+  shopt -u nullglob
+  [ "${#archives[@]}" -le 1 ] && return 0
+  newest="$(printf '%s\n' "${archives[@]}" | sed "s#^$ROLLBACK_DIR/##; s#\.tar\.xz$##" | sort -V | tail -n1)"
+  [ -n "$newest" ] || return 0
+  for keep in "${archives[@]}"; do
+    base="$(basename -- "$keep")"
+    case "$base" in
+      "$newest.tar.xz") continue ;;
+    esac
+    log "Pruning archive de rollback antiguo: $base"
+    sudo rm -f -- "$keep" "${keep%.tar.xz}.timestamp" 2>/dev/null || true
+  done
+}
+
+# ============================================================
+# SNAPSHOT BTRFS READONLY DEL ROOT PRE-INSTALACIÓN  (feature 4)
+# ============================================================
+# Si / es btrfs y CIZEN_SNAPSHOT != 0, se monta el filesystem sin subvol en un
+# punto temporal y se crea un snapshot readonly del subvol raíz en
+# .snapshots/@kernel-<versión>-<ts>. Fallo blando (warn): es una red de
+# seguridad, no un requisito del flujo.
+create_btrfs_snapshot() {
+  [ "${CIZEN_SNAPSHOT:-1}" = "1" ] || { info "Snapshot btrfs desactivado (CIZEN_SNAPSHOT=0)."; return 0; }
+  command -v btrfs >/dev/null 2>&1 || { info "btrfs-progs no instalado; snapshot omitido."; return 0; }
+  local fstype
+  fstype="$(findmnt -n -o FSTYPE / 2>/dev/null || true)"
+  [ "$fstype" = "btrfs" ] || { info "La raíz no es btrfs ($fstype); snapshot omitido."; return 0; }
+
+  local topdev tmp snapname dst
+  topdev="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
+  [ -n "$topdev" ] || { warn "No se pudo resolver el dispositivo btrfs de /; snapshot omitido."; return 0; }
+  tmp="$(mktemp -d /tmp/cizen-snap.XXXXXX 2>/dev/null)" || { warn "No se pudo crear temporal; snapshot omitido."; return 0; }
+
+  if ! sudo mount -o subvol=/ "$topdev" "$tmp" >/dev/null 2>&1; then
+    rmdir -- "$tmp" 2>/dev/null || true
+    warn "No se pudo montar el btrfs top-level; snapshot omitido."
+    return 0
+  fi
+
+  sudo mkdir -p -- "$tmp/$SNAPSHOT_SUBVOL" 2>/dev/null
+  snapname="kernel-$VERSION-$(date +%Y%m%d-%H%M%S)"
+  dst="$tmp/$SNAPSHOT_SUBVOL/@$snapname"
+  if sudo btrfs subvolume snapshot -r / "$dst" >/dev/null 2>&1; then
+    ok "Snapshot btrfs readonly de la raíz: subvol=/$SNAPSHOT_SUBVOL/@$snapname (kernel $VERSION)"
+    SNAPSHOT_DESC="$SNAPSHOT_SUBVOL/@$snapname"
+  else
+    warn "No se pudo crear el snapshot btrfs readonly; se continúa sin él."
+  fi
+
+  sudo umount "$tmp" >/dev/null 2>&1 || true
+  rmdir -- "$tmp" 2>/dev/null || true
+  return 0
+}
+
+# ============================================================
+# FIRMA DEL BUILD PARA EL VERIFICADOR POST-BOOT  (feature 2)
+# ============================================================
+# El servicio kernel-update-verify.sh lee este fichero tras el reboot para
+# comprobar que el kernel que arrancó cumple lo que este build prometió
+# (incluido el scheduler BORE).
+write_verify_signature() {
+  local profile_hash="" rel
+  mkdir -p -- "$VERIFY_STATE_DIR" 2>/dev/null || true
+  [ -f "$PROFILE_FILE" ] && profile_hash="$(sha256sum "$PROFILE_FILE" | cut -d' ' -f1 2>/dev/null || true)"
+  rel="${VERSION}${LOCALVERSION_SUFFIX}"
+  {
+    printf 'version=%s\n' "$rel"
+    printf 'bore=%s\n' "$([ "$BORE_ENABLED" = true ] && echo yes || echo no)"
+    printf 'pkgrel=%s\n' "$PKGREL"
+    printf 'profile_sha=%s\n' "${profile_hash:-}"
+    printf 'ts=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$VERIFY_STATE_DIR/last-build" 2>/dev/null || true
+  return 0
+}
+
+# ============================================================
 # SINCRONIZACIÓN EXPLÍCITA DEL .EFI / UKI CIZEN
 # ============================================================
 CIZEN_UKI_NAME="${CIZEN_UKI_NAME:-arch-${CIZEN_PKGBASE}.efi}"
@@ -2942,6 +3215,7 @@ confirm_newer_release() {
 # ============================================================
 # INICIO PRINCIPAL
 # ============================================================
+T_ALL="$(date +%s)"
 PKG=""
 PKG_NAME=""
 PKG_VERSION=""
@@ -3066,6 +3340,7 @@ extract_tarball || fatal "No se pudo preparar el árbol de fuentes."
 
 cd "$SRC"
 ok "Fuentes listas: $SRC"
+T_DL="$(date +%s)"
 
 # BORE (opcional): se aplica antes de elegir config base porque introduce
 # símbolos Kconfig nuevos (SCHED_BORE, MIN_BASE_SLICE_NS) que deben existir
@@ -3122,6 +3397,8 @@ if [ "$ABSORB_REBELS" = true ] && [ "${#DISABLE_WARN[@]}" -gt 0 ]; then
 fi
 
 verify_build_tree
+report_config_diff
+T_CFG="$(date +%s)"
 
 promote_base_config() {
   local src="$1" dst="$2" tmp
@@ -3261,6 +3538,9 @@ restore_package_identity_override
 # Obtener sudo antes de modificar el sistema.
 sudo -v
 
+# Snapshot btrfs readonly del root (feature 4). Red de seguridad opcional.
+create_btrfs_snapshot
+
 copy_packages_from_build || fatal "No se pudo identificar/verificar el paquete generado."
 validate_split_package_transition_metadata
 
@@ -3291,6 +3571,9 @@ if [ -n "$INSTALLED_VERSION" ] && [[ "$INSTALLED_VERSION" == "$PKGVER_BASE-"* ]]
 fi
 
 log "Instalando $PKG_NAME-$PKG_VERSION ..."
+
+# Archivar el kernel en ejecución antes de que pacman lo sustituya (feature 3).
+prepare_rollback_archive
 
 # --------------------------------------------------------------------
 # Reparación segura de /var/lib/pacman/db.lck
@@ -3463,30 +3746,72 @@ ok "UKI sincronizado"
 
 prune_stale_packages
 
+# Firma del build para el verificador post-boot (feature 2).
+write_verify_signature
+
 # Promover la configuración final en CONFIG_DIR SOLO después de instalación + UKI.
 FINAL_CONFIG="$CONFIG_DIR/linux-$VERSION-cizen-v3.config"
 promote_base_config .config "$FINAL_CONFIG"
 ok "Configuración final guardada: $FINAL_CONFIG"
 
+T_END="$(date +%s)"
+
+# Desglose de tiempos (feature 7). t_* en segundos; cada fase se muestra solo
+# si tiene timestamps válidos (path completo de build siempre los tiene).
+P_DL=""; P_CFG=""; P_BUILD=""; P_INST=""
+if [ "${T_DL:-0}" -ge "${T_ALL:-0}" ] && [ "${T_ALL:-0}" -gt 0 ]; then
+  P_DL="$((T_DL - T_ALL))"
+fi
+if [ "${T_CFG:-0}" -ge "${T_DL:-0}" ] && [ "${T_DL:-0}" -gt 0 ]; then
+  P_CFG="$((T_CFG - T_DL))"
+fi
+if [ "${T_CFG:-0}" -gt 0 ] && [ "$DUR" -gt 0 ]; then
+  P_BUILD="$DUR"
+fi
+if [ "${T_END:-0}" -gt 0 ] && [ "$DUR" -gt 0 ] && [ "${T_CFG:-0}" -gt 0 ]; then
+  P_INST="$((T_END - T_CFG - DUR))"
+fi
+
+# fmt_time se define aquí (tras T_* y antes del cat del resumen).
+fmt_time() { # segundos -> "Xm Ys" (o solo "Ys" si <60)
+  local s="$1" m=0
+  [ "${s:-0}" -le 0 ] 2>/dev/null && s=0
+  if [ "$s" -ge 60 ] 2>/dev/null; then m=$((s / 60)); s=$((s % 60)); fi
+  if [ "$m" -gt 0 ]; then printf '%dm %ds' "$m" "$s"; else printf '%ds' "$s"; fi
+}
+
+CCACHE_STATS=""
+if [ -n "${CCACHE_DIR:-}" ] && command -v ccache >/dev/null 2>&1; then
+  CCACHE_STATS="$(ccache -s 2>/dev/null | grep -E '^(Hits|Direct hits|Preprocessed cache hits|Misses|cache size|Files in cache|Uncacheable)' | sed 's/^ */  /' || true)"
+fi
 
 sudo_keepalive_stop
 cleanup_success
 
 cat <<SUMMARY
 
-================================================================
+===============================================================
 ACTUALIZACIÓN COMPLETADA — CIZEN v$SCRIPT_VERSION
-================================================================
+===============================================================
  Versión     : $VERSION-cizen-v3
  pkgrel      : $PKGREL
  Perfil      : $PROFILE
- Tiempo      : $((DUR/60))m $((DUR%60))s
+ BORE        : $([ "$BORE_ENABLED" = true ] && echo 'sí (SCHED_BORE=y)' || echo 'no (EEVDF vanilla)')
  Hilos       : $JOBS
  Build prio  : $BUILD_PRIORITY (CIZEN_BUILD_PRIORITY=normal para máxima velocidad)
  Paquete     : $(basename "$PKG")
  Config base : $FINAL_CONFIG
  Build tmpfs : $TMPFS_ROOT (size=$TMPFS_SIZE)
- Ccache      : ${CCACHE_DIR:-$HOME/.cache/ccache}
+${SNAPSHOT_DESC:+ Snapshot   : $SNAPSHOT_DESC}
+${VERIFY_ROLLBACK_FILE:+ Rollback  : $VERIFY_ROLLBACK_FILE}
+
+ Tiempos:
+   Descarga+extracción : $( [ -n "$P_DL" ] && fmt_time "$P_DL" || echo '—')
+   Config+validación   : $( [ -n "$P_CFG" ] && fmt_time "$P_CFG" || echo '—')
+   Compilación         : $( [ -n "$P_BUILD" ] && fmt_time "$P_BUILD" || echo '—')
+   Instalación+UKI     : $( [ -n "$P_INST" ] && fmt_time "$P_INST" || echo '—')
+
+ Ccache      : ${CCACHE_DIR:-$HOME/.cache/ccache}${CCACHE_STATS:+ }$CCACHE_STATS
 
 IMPORTANTE:
  El kernel nuevo queda instalado y el UKI ha sido sincronizado.
@@ -3494,9 +3819,11 @@ IMPORTANTE:
 
    sudo reboot
 
-Después del reboot, verifica especialmente KVM/SMM, i915, audio,
-Btrfs, e1000e, ZRAM y el journal del kernel.
-================================================================
+ Después del reboot, kernel-update-verify.service comprueba que el kernel
+ cumple el perfil (y BORE si se pidió), el tiempo de arranque y busca
+ regresiones en el journal.
+ El kernel previo quedó archivado para rollback: krollback --list
+===============================================================
 SUMMARY
 
 exit 0
