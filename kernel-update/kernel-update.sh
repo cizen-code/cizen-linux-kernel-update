@@ -1,8 +1,83 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.21.17 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.22.4 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / systemd / KVM-libvirt / QEMU-OVMF
+#
+# CHANGELOG v27.22.4 (fix BORE en árbol reutilizado — 2026-09-19)
+#   - Bug: tras cancelar una build BORE (Ctrl+C) el árbol tmpfs se conserva CON
+#     el parche ya aplicado (kernel/sched/bore.c + fair.c toquetado). Al relanzar
+#     `--bore`, apply_bore_patch() volvía a descargar el parche bueno y patch(1)
+#     respondía "Reversed (or previously applied) patch detected" en el dry-run
+#     (rc=1) → el motor degradaba a EEVDF vanilla pese a que el árbol SÍ lo lleva.
+#   - Fix: detección de parche ya aplicado al inicio de apply_bore_patch() —
+#     si `kernel/sched/bore.c` existe y `fair.c` contiene SCHED_BORE/burst, se
+#     marca BORE_ENABLED=true y se continúa sin re-descargar ni re-aplicar.
+#   - Verificado contra el árbol real conservado (bore.c=SI, fair.c marcado=SI).
+#     `bash -n` OK.
+#
+# CHANGELOG v27.22.3 (fix falso error en índice de Kconfig — 2026-09-19)
+#   - Bug: build_kconfig_symbol_index() construye su índice vía un
+#     process-substitution `done < <(find | xargs grep | awk | sort -u)` que
+#     hereda `set -Eeuo pipefail`. xargs parte la lista de Kconfig en lotes y un
+#     lote cuyo grep no encuentra ningún `config`/`menuconfig` sale con status 1:
+#     con pipefail el pipeline completo reporta error, el trap ERR del subshell
+#     dispara `on_err` ("Error 1 ... sort -u") y aunque el `exit` del subshell no
+#     aborta el script, queda un falso fallo + índice supuestamente truncado.
+#     Reproducido: `xargs -n 1` + pipefail → rc=123 sin `|| true`; rc=0 con él.
+#   - Fix: `sort -u || true` al final del pipeline interno. El índice se construye
+#     leyendo el stream (input) del process-substitution, no por su exit status:
+#     el rc legítimo de grep/xargs no debe disparar set -e, y un fallo REAL de
+#     escalado (Kconfig ausente) sigue dejando el índice vacío sin enmascararse.
+#   - Verificación: test con set -Eeuo pipefail + trap ERR → sin on_err, built=true,
+#     índice 21717 símbolos, SCHED_BORE presente. `bash -n` OK.
+#
+# CHANGELOG v27.22.2 (fix descarga parche BORE huérfana — 2026-09-19)
+#   - Bug: el intento 2 del parche BORE (upstream) volvía a usar el mismo
+#     `--out` (bore-$br.patch) que el intento 1 (CachyOS). aria2c (--continue
+#     + --allow-overwrite=false) no re-descarga un fichero existente: con el
+#     tamaño coincidente lo daba por completo (contenido CachyOS) o lo
+#     renombraba a bore-$br.1.patch (auto-file-renaming), dejando el parche
+#     upstream bueno huérfano y validando siempre el CachyOS que no aplica.
+#   - Fix doble: (a) `--auto-file-renaming=false` en download_file() (aria2c)
+#     para que el nombre de salida sea SIEMPRE el `--out` pedido; (b) cada
+#     intento BORE hace `rm -f` del destino antes de descargar, garantizando
+#     contenido fresco y evitando el falso "completo" por tamaño coincidente.
+#   - Verificado en vivo 2026-09-19 19:36: cachy 7.2-rc5 no aplica sobre
+#     7.2.6 → degrade upstream correcto (40229 B, firelzrd) descargado pero
+#     ignorado por el bug; con el fix aplica limpio y SCHED_BORE=y.
+#
+# CHANGELOG v27.22.1 (cancelar la build con Ctrl+C — 2026-09-19)
+#   - timeout(1) sin --foreground creaba un grupo de procesos PROPIO para make,
+#     aislado del grupo foreground de la terminal: Ctrl+C (SIGINT al grupo
+#     foreground) llegaba solo al script y NO cancelaba la compilación.
+#   - Fix: la invocación make ahora usa `timeout --foreground --signal=TERM
+#     --kill-after=60s`, de modo que make (y sus sub-makes/gcc) heredan el
+#     grupo de la terminal y puede cancelarse desde el teclado en cualquier
+#     momento. make hace la limpieza de .o vía sus traps INT/TERM.
+#
+# CHANGELOG v27.22.0 (BORE scheduler opcional — 2026-09-19)
+#   - Nuevo flag `--bore` / env CIZEN_ENABLE_BORE=1: aplica el parche BORE
+#     (Burst-Oriented Response Enhancer) de CachyOS sobre el scheduler EEVDF,
+#     priorizando por "burstiness" para mejorar la responsividad interactiva
+#     (input/audio/gaming) con coste de equidad. Es OPCIONAL: sin el flag la
+#     build es 100% vanilla como antes.
+#   - El parche se descarga por rama X.Y del kernel objetivo desde
+#     https://raw.githubusercontent.com/CachyOS/kernel-patches/master/
+#     <rama>/sched/0001-bore-cachy.patch (p. ej. 7.2 → 7.2/sched/...). Si el
+#     forward-port de CachyOS no aplica limpio sobre la release final X.Y.Z
+#     (se regenera contra una RC), se degrada automáticamente al parche del
+#     autor upstream 0001-bore.patch de la misma rama, que se mantiene por
+#     release y aplica sobre la versión estable.
+#   - Si la descarga falla, el parche no aplica limpio o sha/forma inválida →
+#     warn y CONTINÚA con EEVDF vanilla (nunca rompe la build).
+#   - Al aplicar, SCHED_BORE se fuerza a =y y se marca junto a MIN_BASE_SLICE_NS
+#     como símbolos esperados en la auditoría (no ensucia kcheck ni aborta en
+#     modo --strict). build_effective_arrays() se re-ejecuta tras el parche.
+#   - Mantenimiento: CachyOS publica el parche por rama mayor; las bilds con
+#     --bore quedan ligadas a la rama X.Y del objetivo (7.2.6 → 7.2). Si una
+#     rama nueva no tiene parche, el motor degrada a vanilla con warning.
+#   - Compatibilidad: el perfil v5.10.0 es compatible con BORE (HZ_1000 + IRQ_TIME_ACCOUNTING).
 #
 # CHANGELOG v27.21.17 (config base persistente dentro de la suite)
 #   - Los linux-<versión>-cizen-v3.config (config base que find_latest_cizen_config
@@ -322,7 +397,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.21.17"
+SCRIPT_VERSION="27.22.4"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -378,6 +453,8 @@ FORCE=false
 STRICT=false
 ABSORB_REBELS=false
 KEEP_SRC=false
+BORE_REQUESTED=false
+BORE_ENABLED=false
 DO_RENAME=false
 RENAME_PAIR=""
 DO_LIST=false
@@ -463,6 +540,8 @@ while [ $# -gt 0 ]; do
       STRICT=true; shift ;;
     --absorb-rebels)
       ABSORB_REBELS=true; shift ;;
+    --bore)
+      BORE_REQUESTED=true; shift ;;
     --keep-src)
       KEEP_SRC=true; shift ;;
     --list-renames)
@@ -979,6 +1058,15 @@ build_effective_arrays() {
     [ "$r" != "$o" ] && APPLIED_RENAMES["$o"]="$r"
     EFF_SETSTR["$r"]="${OPTS_SETSTR[$o]}"
   done
+
+  # BORE (opcional): si el parche se aplicó en este run, SCHED_BORE debe entrar
+  # en ENABLE (para que apply_config_requests la fuerce a =y) y los símbolos
+  # que introduce el parche se reconocen como esperados en la validación.
+  if [ "$BORE_ENABLED" = true ]; then
+    add_unique enable "SCHED_BORE"
+    EXPECTED_REBEL_SET["SCHED_BORE"]=1
+    EXPECTED_REBEL_SET["MIN_BASE_SLICE_NS"]=1
+  fi
 }
 
 build_effective_arrays
@@ -1577,7 +1665,7 @@ download_file() {
     aria2c --continue=true --max-tries=5 --timeout=30 --connect-timeout=30 \
       --retry-wait=2 --max-connection-per-server="$parallel" \
       --split="$parallel" --min-split-size=1M --file-allocation=none \
-      --allow-overwrite=false --console-log-level=warn "${dl_progress[@]}" \
+      --allow-overwrite=false --auto-file-renaming=false --console-log-level=warn "${dl_progress[@]}" \
       --dir="$(dirname -- "$out")" --out="$(basename -- "$out")" "$url"
   else
     local -a wget_progress=()
@@ -1716,6 +1804,113 @@ extract_tarball() {
 }
 
 # ============================================================
+# BORE SCHEDULER (OPCIONAL)
+# ============================================================
+# Aplica el parche BORE (Burst-Oriented Response Enhancer) de CachyOS sobre
+# el scheduler EEVDF vanilla, mejorando la responsividad interactiva con
+# coste de equidad. Solo bajo demanda: `--bore` (también CIZEN_ENABLE_BORE=1).
+# El parche se busca por rama X.Y del kernel objetivo en el repo CachyOS
+# kernel-patches. Los símbolos que introduce (SCHED_BORE, MIN_BASE_SLICE_NS)
+# se validan como rebeldes esperados para no ensuciar kcheck.
+bore_branch_from_version() {
+  # 7.2.6 -> 7.2 ; 7.2 -> 7.2 ; 6.1.77 -> 6.1
+  if [[ "$1" =~ ^([0-9]+\.[0-9]+) ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  else
+    printf '%s\n' "${1%%.*}"
+  fi
+}
+
+bore_patch_url() {
+  printf '%s\n' "https://raw.githubusercontent.com/CachyOS/kernel-patches/master/$(bore_branch_from_version "$VERSION")/sched/0001-bore-cachy.patch"
+}
+
+# URL del parche BORE upstream (firelzrd). Se usa como respaldo: a veces el
+# forward-port de CachyOS queda desfasado respecto a la última release estable
+# X.Y.Z (el suyo se regenera contra una RC), mientras que el upstream del autor
+# se mantiene por release y aplica limpio sobre la versión final.
+bore_patch_url_upstream() {
+  printf '%s\n' "https://raw.githubusercontent.com/CachyOS/kernel-patches/master/$(bore_branch_from_version "$VERSION")/sched/0001-bore.patch"
+}
+
+# Descarga y aplica el parche BORE fuente. Devuelve 0 = aplicado, 1 = no (fatal suave).
+# IMPORTANTE: cada intento borra el destino ANTES de descargar. download_file usa
+# aria2c con --allow-overwrite=false y --continue=true: si el fichero ya existe
+# (p. ej. el parche CachyOS del intento 1 en el mismo nombre bore-$br.patch),
+# aria2c Ni lo sobrescribe ni lo re-descarga, y sin --auto-file-renaming=false lo
+# renombraba a bore-$br.1.patch dejando huérfano el parche bueno. Con --continue
+# además un fichero existente del mismo tamaño se considera "completo" aunque sea
+# otro parche. Borrar antes garantiza contenido fresco en cada descarga.
+apply_bore_patch() {
+  local url patch_file br
+  br="$(bore_branch_from_version "$VERSION")"
+  patch_file="$KERNEL_BUILD_ROOT/bore-$br.patch"
+
+  log "BORE habilitado: descargando parche para la rama $br ..."
+
+  case "$BORE_REQUESTED" in
+    true) ;;
+    *)
+      if [ "${CIZEN_ENABLE_BORE:-0}" = "1" ]; then
+        :
+      else
+        warn "BORE solicitado pero sin flag --bore ni CIZEN_ENABLE_BORE=1; se omite."
+        return 1
+      fi
+      ;;
+  esac
+
+  # Árbol conservado de una ejecución BORE previa (p. ej. cancelada tras aplicar
+  # el parche): `fair.c` toquetado y `kernel/sched/bore.c` presente son la firma
+  # de que BORE YA está aplicado. Volver a hacer `patch --dry-run` sobre un árbol
+  # ya parcheado responde "Reversed (or previously applied) patch detected" (rc=1)
+  # y el motor degradaría a vanilla a pesar de que el árbol SÍ lo lleva.
+  if [ -f "$SRC/kernel/sched/bore.c" ] \
+     && grep -q 'SCHED_BORE\|burst' "$SRC/kernel/sched/fair.c" 2>/dev/null; then
+    ok "BORE scheduler ya estaba aplicado en el árbol conservado (kernel/sched/bore.c)."
+    BORE_ENABLED=true
+    return 0
+  fi
+
+  # Intento 1: parche CachyOS (0001-bore-cachy.patch). Si no descarga, está
+  # vacío, no es válido o no aplica limpio sobre X.Y.Z, se degrada al parche
+  # upstream del autor (0001-bore.patch), que se sincroniza por release final.
+  url="$(bore_patch_url)"
+  rm -f -- "$patch_file"
+  if download_file "$url" "$patch_file" \
+     && [ -s "$patch_file" ] \
+     && grep -q 'config SCHED_BORE' "$patch_file" \
+     && patch -p1 --dry-run -d "$SRC" < "$patch_file" >/dev/null 2>&1; then
+    :
+  else
+    warn "Parche CachyOS (0001-bore-cachy.patch) no disponible/no aplica sobre $VERSION; probando upstream (0001-bore.patch) ..."
+    url="$(bore_patch_url_upstream)"
+    rm -f -- "$patch_file"
+    if ! download_file "$url" "$patch_file" \
+       || [ ! -s "$patch_file" ] \
+       || ! grep -q 'config SCHED_BORE' "$patch_file" \
+       || ! patch -p1 --dry-run -d "$SRC" < "$patch_file" >/dev/null 2>&1; then
+      warn "Ningún parche BORE disponible para la rama $br / $VERSION; se continúa con EEVDF vanilla."
+      return 1
+    fi
+  fi
+
+  if ! command -v patch >/dev/null 2>&1; then
+    warn "patch no está instalado; no se puede aplicar BORE. Instale con: sudo pacman -S patch"
+    return 1
+  fi
+
+  if ! patch -p1 -d "$SRC" < "$patch_file" >/dev/null 2>&1; then
+    warn "Aplicación real del parche BORE falló inesperadamente; se continúa con EEVDF vanilla."
+    return 1
+  fi
+
+  BORE_ENABLED=true
+  ok "BORE scheduler aplicado (SCHED_BORE=y) sobre fuentes $VERSION."
+  return 0
+}
+
+# ============================================================
 # CONFIG BASE
 # ============================================================
 find_latest_cizen_config() {
@@ -1801,6 +1996,14 @@ build_kconfig_symbol_index() {
   [ "$KCONFIG_SYMBOL_INDEX_BUILT" = true ] && return 0
 
   local sym
+  # El pipeline interno puede devolver rc!=0 legítimamente: xargs parte la lista
+  # en varios lotes y un lote cuyo grep no encuentre ningún `config`/`menuconfig`
+  # sale con status 1. Con `set -Eeuo pipefail` (heredado por el subshell del
+  # process-substitution), el `find | xargs | grep | awk | sort` del pipeline entero
+  # reportaría error y el trap ERR del subshell dispararía `on_err` falsamente
+  # (salida "Error ... sort -u", índice ya construido pero abortado en apariencia).
+  # El índice se construye leyendo el stream: `|| true` absorbe ese rc legítimo sin
+  # enmascarar un fallo de ESCALADO (Kconfig no encontrado sigue dejando el índice vacío).
   while IFS= read -r sym; do
     [ -n "$sym" ] || continue
     KCONFIG_SYMBOL_KNOWN["$sym"]=1
@@ -1808,7 +2011,7 @@ build_kconfig_symbol_index() {
     find "$SRC" \( -name 'Kconfig' -o -name 'Kconfig.*' \) -print0 2>/dev/null |
       xargs -0 -r grep -hoE '^[[:space:]]*(menuconfig|config)[[:space:]]+[A-Za-z0-9_]+' 2>/dev/null |
       awk '{print $2}' |
-      sort -u
+      sort -u || true
   )
 
   KCONFIG_SYMBOL_INDEX_BUILT=true
@@ -1877,7 +2080,16 @@ run_kconfig_audit() {
   log "Detectando símbolos nuevos antes de olddefconfig..."
   NEWCONFIG_OUTPUT="$(make listnewconfig 2>&1 || true)"
   if printf '%s\n' "$NEWCONFIG_OUTPUT" | grep -qE '^CONFIG_|^# CONFIG_'; then
-    warn "Se detectaron símbolos nuevos/pendientes."
+    # Con BORE activo, SCHED_BORE/MIN_BASE_SLICE_NS aparecerán aquí como
+    # nuevos (los introduce el parche). Son esperados; se auditán en la
+    # validación vía EXPECTED_REBEL_SET. Aquí solo se informa si hay otros.
+    if [ "$BORE_ENABLED" = true ]; then
+      if printf '%s\n' "$NEWCONFIG_OUTPUT" | grep -vE 'CONFIG_(SCHED_BORE|MIN_BASE_SLICE_NS)' | grep -qE '^CONFIG_|^# CONFIG_'; then
+        warn "Se detectaron símbolos nuevos/pendientes (además de los de BORE)."
+      fi
+    else
+      warn "Se detectaron símbolos nuevos/pendientes."
+    fi
   fi
 
   log "Normalizando con olddefconfig..."
@@ -2855,6 +3067,21 @@ extract_tarball || fatal "No se pudo preparar el árbol de fuentes."
 cd "$SRC"
 ok "Fuentes listas: $SRC"
 
+# BORE (opcional): se aplica antes de elegir config base porque introduce
+# símbolos Kconfig nuevos (SCHED_BORE, MIN_BASE_SLICE_NS) que deben existir
+# para que olddefconfig/validación los vean.
+if [ "$BORE_REQUESTED" = true ] || [ "${CIZEN_ENABLE_BORE:-0}" = "1" ]; then
+  if apply_bore_patch; then
+    # El parche ya está en el árbol: reconstruir arrays efectivos para que
+    # build_effective_arrays voltee SCHED_BORE a ENABLE y lo marque como
+    # símbolo esperado (no ensucia la auditoría ni bloquea con --strict).
+    build_effective_arrays
+  else
+    warn "BORE no aplicado; la build continúa con el scheduler EEVDF vanilla."
+    BORE_ENABLED=false
+  fi
+fi
+
 # Config Cizen primero; /proc/config.gz o /boot/config como fallback.
 choose_base_config
 
@@ -3002,7 +3229,13 @@ export KBUILD_REVISION="$PKGREL"
 export PACMAN_PKGBASE="$CIZEN_PKGBASE"
 sudo_keepalive_start
 build_rc=0
-if time "${BUILD_PRIORITY_WRAP[@]}" timeout --signal=TERM --kill-after=60s "$BUILD_TIMEOUT" \
+# --foreground: hace que make corra en el MISMO grupo de procesos de la
+# terminal. Sin él, timeout(1) crea un grupo propio para make, aislado del
+# foreground de la terminal, de modo que Ctrl+C (SIGINT al grupo foreground)
+# solo llegaba al script y NO cancelaba la compilación. Con --foreground,
+# Ctrl+C llega directo a make (que ya tiene traps INT/TERM y remata sus .o y
+# sub-makes), permitiendo cancelar la build en cualquier momento.
+if time "${BUILD_PRIORITY_WRAP[@]}" timeout --foreground --signal=TERM --kill-after=60s "$BUILD_TIMEOUT" \
     make -j"$JOBS" "${MAKE_CC_OPTS[@]}" KBUILD_REVISION="$PKGREL" pacman-pkg; then
   :
 else

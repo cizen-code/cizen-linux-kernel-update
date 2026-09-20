@@ -47,6 +47,10 @@ echo "    ${G}3${N}) build       compilar e instalar directamente (prioridad baj
 echo "    ${G}4${N}) buildfast   compilar e instalar a plena prioridad"
 echo "    ${G}5${N}) force       recompilar forzado (--force)"
 echo
+echo "  ${C}BORE (scheduler interactivo CachyOS):${N}"
+echo "    ${G}7${N}) build bore  compilar con BORE (prioridad baja)"
+echo "    ${G}8${N}) boresfast   compilar con BORE a plena prioridad"
+echo
 echo "  ${C}Consulta:${N}"
 echo "    ${G}6${N}) check-update consultar última release estable (sin modificar nada)"
 echo
@@ -54,7 +58,7 @@ echo "    ${G}0${N}) salir"
 echo
 
 while true; do
-  read -r -p "  Selección [0-6]: " choice
+  read -r -p "  Selección [0-8]: " choice
   case "$choice" in
     1) exec "$SCRIPT" --absorb-rebels --check ;;
     2) CIZEN_BUILD_PRIORITY=normal exec "$SCRIPT" --absorb-rebels --check ;;
@@ -62,6 +66,8 @@ while true; do
     4) CIZEN_BUILD_PRIORITY=normal exec "$SCRIPT" --absorb-rebels ;;
     5) exec "$SCRIPT" --force ;;
     6) exec "$SCRIPT" --check-update ;;
+    7) exec "$SCRIPT" --absorb-rebels --bore ;;
+    8) CIZEN_BUILD_PRIORITY=normal exec "$SCRIPT" --absorb-rebels --bore ;;
     0) echo "  Saliendo."; exit 0 ;;
     *) printf "  %bOpción no válida.%b\n" "$R" "$N" ;;
   esac
