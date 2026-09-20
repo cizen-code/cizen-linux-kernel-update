@@ -1,8 +1,19 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.24.1 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.24.2 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / systemd / KVM-libvirt / QEMU-OVMF
+#
+# CHANGELOG v27.24.2 (Ctrl+C ya no se reporta como error — 2026-09-20)
+#   - Al cancelar la build/descarga con Ctrl+C (SIGINT) o SIGTERM el motor
+#     seguía mostrando "⚠ La ejecución terminó con error (130)" (mensaje del
+#     trap EXIT cuando rc≠0). Ahora `cleanup_interrupt()` marca INTERRUPT_CAUGHT
+#     antes de `exit 130` y `cleanup_tmpfs_on_exit()` distingue: si rc==130 con
+#     INTERRUPT_CAUGHT=true imprime con `info` "La compilación fue cancelada por
+#     el usuario; no es un error..." (mismo tmpfs conservado para diagnóstico).
+#     Un fallo REAL sigue reportándose como error (rc≠130 o sin señal capturada).
+#     El código de salida sigue siendo 130 (terminación por SIGINT, convención
+#     de Bash 128+2): solo cambia la redacción, no el status.
 #
 # CHANGELOG v27.24.1 (confirmación de recompilación sin release nueva — 2026-09-20)
 #   - Cuando se elige una opción de compilación (build/buildfast/force/BORE) sin
@@ -488,7 +499,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.24.1"
+SCRIPT_VERSION="27.24.2"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -1681,6 +1692,7 @@ sudo_keepalive_stop() {
 # TRAPS / LIMPIEZA
 # ============================================================
 CLEANUP_DONE=false
+INTERRUPT_CAUGHT=false
 
 cleanup_success() {
   [ "$CLEANUP_DONE" = true ] && return 0
@@ -1707,6 +1719,7 @@ cleanup_success() {
 
 cleanup_interrupt() {
   local sig="$1"
+  INTERRUPT_CAUGHT=true
   echo
   warn "Interrupción recibida ($sig)."
   if [ -d "$SRC" ]; then
@@ -1757,8 +1770,13 @@ cleanup_tmpfs_on_exit() {
   # Las rutas normales llaman cleanup_success explícitamente.
   # Si algo falla inesperadamente, dejamos el tmpfs montado para diagnóstico.
   if [ "$TMPFS_MOUNTED" = true ] && [ "$rc" -ne 0 ]; then
-    warn "La ejecución terminó con error ($rc); se conserva el tmpfs montado para diagnóstico: $TMPFS_ROOT"
-    warn "Para desmontarlo después: sudo umount ${TMPFS_ROOT}"
+    if [ "$rc" -eq 130 ] && [ "$INTERRUPT_CAUGHT" = true ]; then
+      info "La compilación fue cancelada por el usuario; no es un error. Se conserva el tmpfs montado: $TMPFS_ROOT"
+      info "Para desmontarlo después: sudo umount ${TMPFS_ROOT}"
+    else
+      warn "La ejecución terminó con error ($rc); se conserva el tmpfs montado para diagnóstico: $TMPFS_ROOT"
+      warn "Para desmontarlo después: sudo umount ${TMPFS_ROOT}"
+    fi
   fi
 }
 trap cleanup_tmpfs_on_exit EXIT
