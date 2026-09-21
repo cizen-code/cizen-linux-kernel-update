@@ -1,8 +1,24 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.24.3 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.24.4 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / systemd / KVM-libvirt / QEMU-OVMF
+#
+# CHANGELOG v27.24.4 (deps requeridas auto-instalables + perfil 7050 v5.11.1 — 2026-09-21)
+#   - ccache y pahole pasan a dependencias REQUERIDAS del preflight: se añaden
+#     al array tools y a TOOL_PKG ([ccache]=ccache, [pahole]=pahole) para que
+#     check_prerequisites() las pida/instale interactivamente como el resto.
+#     ccache se usa en el build (CC/HOSTCC="ccache gcc"); pahole la exige el
+#     propio makepkg para generar el BTF del paquete (sin ella el build muere en
+#     "==> Dependencias que faltan: pahole").
+#   - Perfil cizen-optiplex7050 v5.11.1: BTRFS_FS y DRM_I915 pasan de
+#     solo-CRITICAL a OPTS_ENABLE (el boot sin initramfs exige =y estricto en
+#     boot_critical: X86_NATIVE_CPU BTRFS_FS DRM_I915 KVM_SMM; una base ajena,
+#     p. ej. /proc/config.gz LTS en bootstrap, los deja en =m). v5.11.0 ya había
+#     añadido X86_NATIVE_CPU/NET_SCH_DEFAULT y los rivales de CHOICE.
+#   - Nuevo script cizen-uki-sync: genera/aplica la UKI Cizen (arch-linux-cizen-v3.efi)
+#     desde el último kernel instalado; kernel-update.sh lo invoca vía sudo tras
+#     instalar el paquete (flujo UKI automático, antes script perdido).
 #
 # CHANGELOG v27.24.3 (rollback: solo se conserva el kernel PREVIO — 2026-09-20)
 #   - Se refuerza la política de "no acumular kernels": prune_rollback_archives()
@@ -513,7 +529,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.24.3"
+SCRIPT_VERSION="27.24.4"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -1362,14 +1378,16 @@ check_profile_contradictions
 # (igual que antes de esta versión).
 declare -A TOOL_PKG=(
   [awk]=gawk          [bash]=bash          [bc]=bc
-  [bison]=bison       [cat]=coreutils      [cmp]=diffutils
+  [bison]=bison       [cat]=coreutils      [ccache]=ccache
+  [cmp]=diffutils
   [cp]=coreutils      [date]=coreutils     [df]=coreutils
   [du]=coreutils      [find]=findutils     [findmnt]=util-linux
   [flex]=flex         [flock]=util-linux   [fuser]=psmisc
   [gcc]=gcc           [gpg]=gnupg          [grep]=grep
   [head]=coreutils    [id]=coreutils       [ls]=coreutils
   [make]=make         [mktemp]=coreutils   [mount]=util-linux
-  [nproc]=coreutils   [rm]=coreutils       [sed]=sed
+  [nproc]=coreutils   [pahole]=pahole     [rm]=coreutils
+  [sed]=sed
   [sleep]=coreutils   [sort]=coreutils     [stat]=coreutils
   [tar]=tar           [timeout]=coreutils  [tr]=coreutils
   [umount]=util-linux [wget]=wget          [xargs]=findutils
@@ -1414,7 +1432,7 @@ install_dependency_packages() {
 
 check_prerequisites() {
   local cmd pkg rc
-  local -a tools=(awk bash bc bison cat cmp cp date df du find findmnt flex flock fuser grep gcc gpg head id ls make mktemp mount nproc pacman rm sed sleep sort stat tar tr umount wget xargs xz timeout cizen-uki-sync)
+  local -a tools=(awk bash bc bison cat ccache cmp cp date df du find findmnt flex flock fuser grep gcc gpg head id ls make mktemp mount nproc pacman pahole rm sed sleep sort stat tar tr umount wget xargs xz timeout cizen-uki-sync)
   local -a missing_cmds=() missing_pkgs=()
 
   for cmd in "${tools[@]}"; do

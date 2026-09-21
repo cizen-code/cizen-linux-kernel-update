@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+# ============================================================
+# cizen-uki-sync — Sincroniza la UKI Cizen con el ESP tras instalar
+# un kernel nuevo.
+#
+# Replica la lógica directa de kernel-update.sh (sync_cizen_efi /
+# build_cizen_uki): localiza el kernel Cizen instalado más reciente,
+# prepara la línea de comandos, genera la UKI del sistema (por defecto
+# arch-linux-cizen-v3.efi) y la escribe de forma atómica en todos los
+# objetivos existentes del ESP.
+#
+# Uso:
+#   sudo cizen-uki-sync               # ejecución normal (la invoca kernel-update.sh)
+#   cizen-uki-sync --dry-run          # imprime todos los parámetros sin escribir
+#
+# Variables de entorno (override):
+#   CIZEN_UKI_NAME              nombre del .efi (default arch-linux-cizen-v3.efi)
+#   CIZEN_UKI_PKGBASE           pkgbase Cizen (default linux-cizen-v3)
+#   CIZEN_UKI_SUFFIX            LOCALVERSION_SUFFIX (default -cizen-v3)
+#   CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK  copiar el vmlinuz pelado (default 0)
+# ============================================================
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+export LC_ALL=C
+
+CIZEN_UKI_NAME="${CIZEN_UKI_NAME:-arch-linux-cizen-v3.efi}"
+CIZEN_UKI_PKGBASE="${CIZEN_UKI_PKGBASE:-linux-cizen-v3}"
+CIZEN_UKI_SUFFIX="${CIZEN_UKI_SUFFIX:--cizen-v3}"
+CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK="${CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK:-0}"
+
+# ── Colores ─────────────────────────────────────────────────
+if [ -t 1 ]; then
+  R=$'\033[0;31m'; G=$'\033[0;32m'; Y=$'\033[1;33m'; B=$'\033[0;34m'; C=$'\033[0;36m'; N=$'\033[0m'
+else
+  R=""; G=""; Y=""; B=""; C=""; N=""
+fi
+
+log(){  printf '%s[%s]%s %s\n' "$B" "$(date +%H:%M:%S)" "$N" "$*"; }
+ok(){   printf '%s  ✓%s %s\n' "$G" "$N" "$*"; }
+warn(){ printf '%s  ⚠%s %s\n' "$Y" "$N" "$*"; }
+err(){  printf '%s  ✗%s %s\n' "$R" "$N" "$*" >&2; }
+info(){ printf '%s  •%s %s\n' "$C" "$N" "$*"; }
+fatal(){ err "$*"; exit 1; }
+
+# Privilegios: normalmente se ejecuta bajo `sudo cizen-uki-sync`, pero si el
+# usuario lo lanza sin sudo, elevamos solo los pasos que lo necesitan.
+SUDO=()
+if [ "$(id -u)" != 0 ]; then
+  SUDO=(sudo)
+fi
+
+START_EPOCH="$(date +%s)"
+
+find_cizen_installed_kernel() {
+  local -a cand=()
+  local c rel
+
+  while IFS= read -r c; do
+    [ -n "$c" ] && cand+=("$c")
+  done < <(ls -1d /usr/lib/modules/*"$CIZEN_UKI_SUFFIX"/vmlinuz 2>/dev/null || true)
+  while IFS= read -r c; do
+    [ -n "$c" ] && cand+=("$c")
+  done < <(ls -1 /boot/vmlinuz-"$CIZEN_UKI_PKGBASE" 2>/dev/null || true)
+  while IFS= read -r c; do
+    [ -n "$c" ] && cand+=("$c")
+  done < <(ls -1 /boot/vmlinuz-*"$CIZEN_UKI_SUFFIX" 2>/dev/null || true)
+
+  [ "${#cand[@]}" -gt 0 ] || return 1
+
+  # El kernel recién instalado es el de mtime más reciente.
+  local best="" bm=0
+  for c in "${cand[@]}"; do
+    local m
+    m="$("${SUDO[@]}" stat -c '%Y' "$c" 2>/dev/null || echo 0)"
+    if [ "$m" -gt "$bm" ]; then
+      bm="$m"; best="$c"
+    fi
+  done
+  [ "$best" != "" ] || return 1
+  printf '%s\n' "$best"
+}
+
+prepare_cmdline_file() {
+  local tmp
+  tmp="$(mktemp /tmp/cizen-cmdline.XXXXXX)" || return 1
+
+  if [ -s /etc/kernel/cmdline ]; then
+    tr '\n' ' ' < /etc/kernel/cmdline |
+      sed -E -e 's/[[:space:]]+/ /g' -e 's/^ //' -e 's/[[:space:]]$//' > "$tmp" || { rm -f "$tmp"; return 1; }
+  elif [ -r /proc/cmdline ]; then
+    sed -E \
+      -e 's/(^|[[:space:]])BOOT_IMAGE=[^[:space:]]*//g' \
+      -e 's/(^|[[:space:]])initrd=[^[:space:]]*//g' \
+      -e 's/[[:space:]]+/ /g' \
+      -e 's/^ //' \
+      -e 's/[[:space:]]$//' \
+      /proc/cmdline > "$tmp" || { rm -f "$tmp"; return 1; }
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+
+  printf '%s\n' "$tmp"
+}
+
+detect_esp_root() {
+  local r fstype
+  for r in /efi /boot/efi /boot; do
+    [ -d "$r" ] || continue
+    fstype="$(findmnt -n -M "$r" -o FSTYPE 2>/dev/null || true)"
+    if [[ "$fstype" =~ ^(vfat|msdos|fuseblk)$ ]]; then
+      printf '%s\n' "$r"
+      return 0
+    fi
+  done
+  return 1
+}
+
+find_uki_targets() {
+  local name="$1" r f
+  local -a found=()
+
+  for r in /efi /boot/efi /boot; do
+    [ -d "$r" ] || continue
+    while IFS= read -r f; do
+      [ -n "$f" ] && found+=("$f")
+    done < <("${SUDO[@]}" find "$r" -maxdepth 5 -type f -iname "$name" 2>/dev/null || true)
+  done
+
+  if [ "${#found[@]}" -gt 0 ]; then
+    printf '%s\n' "${found[@]}" | sort -u
+    return 0
+  fi
+  return 1
+}
+
+build_uki() {
+  local kernel="$1" cmdline_file="$2" out="$3"
+  local cmdline_text ukify_bin stub s initrd
+
+  cmdline_text="$(<"$cmdline_file")"
+
+  ukify_bin="$(command -v ukify 2>/dev/null || true)"
+  if [ -z "$ukify_bin" ] && [ -x /usr/lib/systemd/ukify ]; then
+    ukify_bin="/usr/lib/systemd/ukify"
+  fi
+
+  if [ -n "$ukify_bin" ]; then
+    local -a args=("$ukify_bin" build --linux="$kernel" --cmdline="$cmdline_text" --output="$out")
+    # Si el kernel Cizen usa initramfs (preset mkinitcpio), se integra en la
+    # UKI; si no existe el archivo, la UKI queda sin initrd (kernel autosuficiente).
+    initrd="/boot/initramfs-$CIZEN_UKI_PKGBASE.img"
+    if [ -s "$initrd" ]; then
+      args+=(--initrd="$initrd")
+      ok "Incluyendo initramfs: $initrd"
+    fi
+    if "${args[@]}"; then
+      return 0
+    fi
+    warn "ukify falló; intento fallback con objcopy."
+  fi
+
+  stub=""
+  for s in /usr/lib/systemd/boot/efi/linuxx64.efi.stub /usr/lib/gummiboot/linuxx64.efi.stub; do
+    if [ -s "$s" ]; then
+      stub="$s"
+      break
+    fi
+  done
+
+  if [ -n "$stub" ] && command -v objcopy >/dev/null 2>&1; then
+    local -a objargs=(
+      --add-section .cmdline="$cmdline_file"
+      --set-section-flags .cmdline=noload,readonly
+      --add-section .linux="$kernel"
+      --set-section-flags .linux=noload,readonly
+    )
+    if objcopy "${objargs[@]}" "$stub" "$out"; then
+      return 0
+    fi
+  fi
+
+  if [ "$CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK" = 1 ]; then
+    cp -f "$kernel" "$out"
+    return 0
+  fi
+
+  return 1
+}
+
+targets_are_current() {
+  local cutoff=$((START_EPOCH - 2))
+  local f mtime any=false
+  while IFS= read -r f; do
+    mtime="$("${SUDO[@]}" stat -c '%Y' "$f" 2>/dev/null || echo 0)"
+    [ "$mtime" -gt 0 ] || continue
+    any=true
+    if [ "$mtime" -lt "$cutoff" ]; then
+      return 1
+    fi
+  done < <(find_uki_targets "$CIZEN_UKI_NAME" || true)
+  [ "$any" = true ]
+}
+
+DRY_RUN=0
+if [ "${1:-}" = "--dry-run" ]; then
+  DRY_RUN=1
+fi
+
+info "cizen-uki-sync — objetivo: $CIZEN_UKI_NAME"
+info "pkgbase: $CIZEN_UKI_PKGBASE | suffix: $CIZEN_UKI_SUFFIX"
+
+kernel="$(find_cizen_installed_kernel || true)"
+if [ -z "$kernel" ] || [ ! -s "$kernel" ]; then
+  fatal "No encontré ningún kernel Cizen instalado (buscado: /usr/lib/modules/*$CIZEN_UKI_SUFFIX/vmlinuz y /boot/vmlinuz-*$CIZEN_UKI_SUFFIX)."
+fi
+ok "Kernel Cizen instalado: $kernel"
+
+cmdline_file="$(prepare_cmdline_file)" || fatal "No pude preparar la línea de comandos de arranque."
+info "cmdline: $(<"$cmdline_file")"
+
+local -a targets=()
+while IFS= read -r t; do
+  [ -n "$t" ] && targets+=("$t")
+done < <(find_uki_targets "$CIZEN_UKI_NAME" || true)
+
+if [ "${#targets[@]}" -eq 0 ]; then
+  esp="$(detect_esp_root 2>/dev/null || true)"
+  if [ -z "$esp" ]; then
+    rm -f "$cmdline_file"
+    fatal "No encontré una partición EFI montada ni $CIZEN_UKI_NAME en el ESP; no hay nada que actualizar."
+  fi
+  targets=("$esp/EFI/Linux/$CIZEN_UKI_NAME")
+fi
+
+if [ "$DRY_RUN" = 1 ]; then
+  info "Kernel:  $kernel"
+  info "Objetivos:"
+  for t in "${targets[@]}"; do
+    printf '  - %s\n' "$t"
+  done
+  info "(modo --dry-run: no se escribe nada)"
+  rm -f "$cmdline_file"
+  exit 0
+fi
+
+tmp="$(mktemp /tmp/cizen-uki.XXXXXX)" || {
+  rm -f "$cmdline_file"
+  fatal "No pude crear el temporal de la UKI."
+}
+trap 'rm -f "$tmp" "$cmdline_file"' EXIT
+
+if ! build_uki "$kernel" "$cmdline_file" "$tmp"; then
+  fatal "No pude generar la UKI ($CIZEN_UKI_NAME). Instala ukify (systemd-ukify) o binutils y verifica /usr/lib/systemd/boot/efi/linuxx64.efi.stub."
+fi
+ok "UKI generada en temporal."
+
+for t in "${targets[@]}"; do
+  log "Actualizando .efi: $t"
+  if ! "${SUDO[@]}" mkdir -p "$(dirname "$t")"; then
+    warn "No pude crear $(dirname "$t"); continúo con el siguiente."
+    continue
+  fi
+  if "${SUDO[@]}" cp -f "$tmp" "$t.cizen-tmp" && "${SUDO[@]}" mv -f "$t.cizen-tmp" "$t"; then
+    ok "UKI escrita (atómica): $t"
+  elif "${SUDO[@]}" cp -f "$tmp" "$t"; then
+    ok "UKI escrita (directa): $t"
+  else
+    warn "No se pudo actualizar $t"
+  fi
+done
+
+"${SUDO[@]}" sync
+
+if ! targets_are_current; then
+  fatal "La UKI no quedó actualizada después de escribir en el objetivo."
+fi
+ok "Sincronización de UKI completada."
