@@ -1,8 +1,22 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.24.2 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.24.3 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / systemd / KVM-libvirt / QEMU-OVMF
+#
+# CHANGELOG v27.24.3 (rollback: solo se conserva el kernel PREVIO — 2026-09-20)
+#   - Se refuerza la política de "no acumular kernels": prune_rollback_archives()
+#     conserva UNA SOLA copia de rollback (la del kernel anterior al actual).
+#     Antes: (a) si el archive de la release actual ya existía,
+#     prepare_rollback_archive() salía antes de podar, dejando potencialmente
+#     archives viejos de sesiones previstas sin limpiar; (b) se guardaba el de
+#     "mayor versión" sin excluir el kernel EN EJECUCIÓN. Ahora:
+#     - el early-return "rollback ya existe" también poda;
+#     - la prioridad es el de mayor versión que NO sea la release en ejecución
+#       (el "anterior" real); si todos coinciden con el actual, el de mayor
+#       versión. Nunca más de un archive (+ su .timestamp).
+#   - Test: /var/tmp/opencode/test-rollback-prune.sh (stubs de sudo/uname/log):
+#     poda con varios kernels deja 1 = el previo; excluye el en ejecución.
 #
 # CHANGELOG v27.24.2 (Ctrl+C ya no se reporta como error — 2026-09-20)
 #   - Al cancelar la build/descarga con Ctrl+C (SIGINT) o SIGTERM el motor
@@ -499,7 +513,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.24.2"
+SCRIPT_VERSION="27.24.3"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -3061,8 +3075,9 @@ prepare_rollback_archive() {
   rel="$(uname -r 2>/dev/null || true)"
   [ -n "$rel" ] || { warn "No se puede leer uname -r; no se guarda archive de rollback."; return 0; }
   # Nunca volver a archivar la versión que acabamos de dejar de arrancar si ya
-  # existe un archive de la misma release: no vale la pena overwrite.
-  [ -f "$ROLLBACK_DIR/$rel.tar.xz" ] && { info "Rollback ya existe para $rel; se conserva."; return 0; }
+  # existe un archive de la misma release: no vale la pena overwrite. Aún así se
+  # poda por si quedaran archives antiguos de sesiones previas.
+  [ -f "$ROLLBACK_DIR/$rel.tar.xz" ] && { info "Rollback ya existe para $rel; se conserva."; prune_rollback_archives; return 0; }
 
   modules="/usr/lib/modules/$rel"
   vmlinuz="/boot/vmlinuz-linux-cizen-v3"
@@ -3102,20 +3117,37 @@ prepare_rollback_archive() {
   return 0
 }
 
-# Conserva solo el archive MÁS RECIENTE (por versión) en el directorio.
+# Conserva SOLO un archive de rollback: el del kernel PREVIO al actual.
+# Prioridad al de mayor versión que NO sea la release en ejecución (el
+# "anterior"); si todos coincidieran con el actual, se conserva el de mayor
+# versión. Nunca acumula más de uno.
 prune_rollback_archives() {
-  local keep newest=""
+  local running="" keep="" base="" candidate=""
+  local -a archives=() keep_list=()
   shopt -s nullglob
-  local -a archives=("$ROLLBACK_DIR"/*.tar.xz)
+  archives=("$ROLLBACK_DIR"/*.tar.xz)
   shopt -u nullglob
   [ "${#archives[@]}" -le 1 ] && return 0
-  newest="$(printf '%s\n' "${archives[@]}" | sed "s#^$ROLLBACK_DIR/##; s#\.tar\.xz$##" | sort -V | tail -n1)"
-  [ -n "$newest" ] || return 0
+
+  running="$(uname -r 2>/dev/null || true)"
   for keep in "${archives[@]}"; do
     base="$(basename -- "$keep")"
     case "$base" in
-      "$newest.tar.xz") continue ;;
+      "$running.tar.xz") continue ;;
     esac
+    keep_list+=("$keep")
+  done
+
+  if [ "${#keep_list[@]}" -eq 0 ]; then
+    candidate="$(printf '%s\n' "${archives[@]}" | sort -V | tail -n1)"
+  else
+    candidate="$(printf '%s\n' "${keep_list[@]}" | sort -V | tail -n1)"
+  fi
+  [ -n "$candidate" ] || return 0
+
+  for keep in "${archives[@]}"; do
+    [ "$keep" = "$candidate" ] && continue
+    base="$(basename -- "$keep")"
     log "Pruning archive de rollback antiguo: $base"
     sudo rm -f -- "$keep" "${keep%.tar.xz}.timestamp" 2>/dev/null || true
   done
