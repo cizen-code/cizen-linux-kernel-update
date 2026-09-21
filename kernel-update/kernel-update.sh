@@ -1,8 +1,23 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.25.1 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.25.2 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / systemd / KVM-libvirt / QEMU-OVMF
+#
+# CHANGELOG v27.25.2 (modo --lite: compilar solo los módulos en uso — 2026-09-21)
+#   - Nuevo flag --lite (o CIZEN_LITE=1): ejecuta `make localmodconfig` sobre la
+#     config base con el input "/proc/modules + allowlist de podar-modulos.sh"
+#     (--keep-list: CORE_KEEP + /etc/modules-load.d + CIZEN_KEEP_MODULES). El
+#     resultado es no compilar los miles de módulos =m que la poda del paquete
+#     habría descartado: la compilación baja de ~19 min (frío) a una fracción.
+#     En el árbol 7.2.7 real la prueba pasó de 5472 a 172 módulos =m.
+#   - El perfil se aplica DESPUÉS (apply_config_requests): ENABLE/CRITICAL =y,
+#     DISABLE y la auditoría/validación continúan igual; los =y (built-in) no
+#     se tocan, el arranque sin initramfs queda garantizado.
+#   - podar-modulos.sh v1.0.1: nuevo modo --keep-list (imprime el allowlist
+#     estático un nombre por línea, sin necesidad de un árbol objetivo), usado
+#     por --lite para alimentar localmodconfig.
+#   - Resumen final: línea "Lite: sí/no".
 #
 # CHANGELOG v27.25.1 (el check ofrece absorber rebeldes automáticamente — 2026-09-21)
 #   - Auto-absorción interactiva: cuando la auditoría reporta desactivaciones
@@ -516,6 +531,8 @@
 #   ./kernel-update.sh <versión> --force
 #   ./kernel-update.sh <versión> --keep-src
 #   ./kernel-update.sh <versión> --no-prune                  # sin poda de módulos
+#   ./kernel-update.sh <versión> --lite                      # compilar solo los módulos en uso (localmodconfig)
+#   CIZEN_LITE=1 ./kernel-update.sh <versión>                # equivalente por env
 #   CIZEN_KEEP_MODULES="kvm_intel,vfio_pci" ./kernel-update.sh <versión>  # módulos extra a conservar en la poda
 #   ./kernel-update.sh <versión> --patch bore                 # framework de parches
 #   ./kernel-update.sh <versión> --bore                       # alias de --patch bore
@@ -565,7 +582,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.25.1"
+SCRIPT_VERSION="27.25.2"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -632,6 +649,14 @@ CHECK_UPDATE=false
 # 0=desactivada. La env CIZEN_PRUNE_MODULES también la controla; el flag
 # --no-prune/--prune tiene prioridad (se procesan después de esta lectura).
 PRUNE_MODULES="${CIZEN_PRUNE_MODULES:-1}"
+
+# Modo lite (v27.25.2): make localmodconfig reduce la config para NO compilar
+# los módulos que la poda descartaría, acortando el build. La env CIZEN_LITE
+# también lo activa (0/1); el flag --lite/--no-lite tiene prioridad.
+LITE_MODE=false
+if [ "${CIZEN_LITE:-0}" = "1" ]; then
+  LITE_MODE=true
+fi
 
 # ── Framework de parches, BTF, clang y utilidades (v27.24.0) ──
 # PATCH_NAMES: lista de parches de terceros solicitados (--patch / CIZEN_PATCHES
@@ -787,6 +812,10 @@ while [ $# -gt 0 ]; do
       PRUNE_MODULES=0; shift ;;
     --prune)
       PRUNE_MODULES=1; shift ;;
+    --lite)
+      LITE_MODE=true; shift ;;
+    --no-lite)
+      LITE_MODE=false; shift ;;
     --list-renames)
       DO_LIST=true; shift ;;
     --rename)
@@ -830,6 +859,10 @@ fi
 case "$PRUNE_MODULES" in
   0|1) ;;
   *) fatal "CIZEN_PRUNE_MODULES inválido: $PRUNE_MODULES (use 0 o 1)." ;;
+esac
+case "${CIZEN_LITE:-0}" in
+  0|1) ;;
+  *) fatal "CIZEN_LITE inválido: $CIZEN_LITE (use 0 o 1)." ;;
 esac
 # Ruta al podador: en la suite instalada o junto al motor (preferencia a la env).
 if [ -n "${CIZEN_PRUNE_SCRIPT:-}" ]; then
@@ -2333,6 +2366,46 @@ choose_base_config() {
   fi
 
   fatal "No existe configuración base Cizen ni configuración del kernel arrancado."
+}
+
+# ============================================================
+# MODO LITE (v27.25.2): compilar solo los módulos que de verdad se usan
+# ============================================================
+# make localmodconfig (herramienta oficial del kernel) reduce .config para que
+# el build NO compile los miles de módulos que la poda posterior borraría del
+# paquete. El input es /proc/modules + el allowlist del podador (--keep-list:
+# CORE_KEEP + /etc/modules-load.d + CIZEN_KEEP_MODULES) + vendrá de la misma
+# fuente que la poda. Los =y (built-in) ni se tocan: el arranque sin initramfs
+# sigue garantizado. No requiere haber compilado nada; solo re-usa conf/olddefconfig.
+prepare_lite_config() {
+  [ "$LITE_MODE" = true ] || return 0
+  command -v make >/dev/null || fatal "--lite requiere make (make localmodconfig)."
+  if [ ! -d "$SRC/scripts/kconfig" ]; then
+    fatal "--lite requiere el árbol del kernel (scripts/kconfig) en $SRC."
+  fi
+  [ -x "$PRUNER_SCRIPT" ] || fatal "--lite no puede generar la lista de conservación: podador no ejecutable ($PRUNER_SCRIPT)."
+
+  local keepfile keep_lines=0 _k
+  keepfile="$HOME/.cache/kernel-kbuild/.lite-keep-${TS:-$$}.$$"
+  mkdir -p "${keepfile%/*}"
+  {
+    cat /proc/modules 2>/dev/null || true
+    while IFS= read -r _k; do
+      [ -n "$_k" ] || continue
+      keep_lines=$((keep_lines + 1))
+      # Solo importa la primera columna (nombre del módulo).
+      printf '%s 0 0 0 - 0\n' "$_k"
+    done < <("$PRUNER_SCRIPT" --keep-list "${CIZEN_KEEP_MODULES:-}" || true)
+  } > "$keepfile"
+
+  log "--lite: localmodconfig (módulos cargados + $keep_lines del allowlist)..."
+  if ( cd "$SRC" && LSMOD="$keepfile" make localmodconfig ); then
+    ok "Config lite generada: solo se compilarán los módulos en uso ($keep_lines en allowlist)."
+  else
+    warn "--lite no pudo completar localmodconfig; se continúa con la config completa."
+  fi
+  rm -f -- "$keepfile"
+  unset _k keep_lines
 }
 
 # ============================================================
@@ -4048,6 +4121,11 @@ fi
 # Config Cizen primero; /proc/config.gz o /boot/config como fallback.
 choose_base_config
 
+# Modo lite: adelgazar la config para NO compilar los módulos que la poda
+# descartaría. Se hace ANTES de aplicar el perfil: los requests de ENABLE/
+# CRITICAL/DISABLE se re-fuerzan después y la auditoría valida el resultado.
+prepare_lite_config
+
 # Crear marcador justo antes de aplicar/configurar/compilar.
 touch "$BUILD_MARKER"
 
@@ -4577,6 +4655,7 @@ ${PUBLISH_REPO_MSG:+  ${PUBLISH_REPO_MSG}}
  Config base : $FINAL_CONFIG
  Build tmpfs : $TMPFS_ROOT (size=$TMPFS_SIZE)
  Podar       : $([ "${CIZEN_PRUNE_MODULES:-$PRUNE_MODULES}" = "1" ] && echo 'sí (solo módulos de este hardware)' || echo 'no')
+ Lite        : $([ "$LITE_MODE" = true ] && echo 'sí (solo se compilan los módulos en uso; localmodconfig)' || echo 'no')
 ${SNAPSHOT_DESC:+ Snapshot   : $SNAPSHOT_DESC}
 ${VERIFY_ROLLBACK_FILE:+ Rollback  : $VERIFY_ROLLBACK_FILE}
 

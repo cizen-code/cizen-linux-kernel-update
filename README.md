@@ -9,7 +9,7 @@ notificaciones de escritorio y flujos de compilación a plena prioridad.
 ```
 ├── kernel-update/                 # Flujo de compilación del kernel Cizen
 │   ├── kernel-update.sh           # Motor principal (descarga→Kconfig→build→pacman→UKI)
-│   ├── podar-modulos.sh           # Poda de módulos del paquete (v27.25.0)
+│   ├── podar-modulos.sh           # Poda de módulos del paquete (+ --keep-list para --lite) |
 │   ├── kernel-update-notify.sh    # Notificador de releases nuevas de kernel.org
 │   ├── kernel-update-menu.sh      # Menú interactivo de modos (check/build/fast)
 │   └── profiles/                  # Perfiles + config base (linux-*-cizen-v3.config)
@@ -64,6 +64,7 @@ con otras herramientas):
 | list-renames | `kernel-update.sh --list-renames` | Muestra el mapa de renombres de config |
 | absorb-rebels | `kernel-update.sh <ver> --absorb-rebels` | Mueve a `EXPECTED_REBELS` los símbolos que Kconfig conserva por dependencias, dejando el perfil limpio. Desde v27.25.1 el propio check lo ofrece interactivamente antes de compilar (si la auditoría reporta que Kconfig conserva desactivaciones), sin necesidad del flag |
 | no-prune | `kernel-update.sh <ver> --no-prune` | Desactiva la poda de módulos (default: activada) |
+| lite | `kernel-update.sh <ver> --lite` | Compila **solo** los módulos en uso (`make localmodconfig`) para acortar el build (default: desactivado, `CIZEN_LITE=1` por env) |
 
 ### Poda de módulos
 
@@ -85,6 +86,34 @@ Los símbolos `=y` (built-in: `X86_NATIVE_CPU`, `BTRFS_FS`, `DRM_I915`,
 `KVM_SMM`, ...) no tienen `.ko`: la poda nunca los toca, por lo que el arranque
 sin initramfs queda intacto. Configurable con `CIZEN_PRUNE_MODULES=0` (o
 `--no-prune`) y `CIZEN_PRUNE_SCRIPT` (ruta alternativa al podador).
+
+### Modo lite (`--lite`, v27.25.2)
+
+La poda sola no acorta la **compilación**: el `make` compila todos los módulos
+`=m` y la poda solo evita que entren al paquete. El modo `--lite` ataca el
+tiempo de build: ejecuta `make localmodconfig` sobre la config base con el
+input `/proc/modules + podar-modulos.sh --keep-list` (allowlist `CORE_KEEP` +
+`/etc/modules-load.d` + `CIZEN_KEEP_MODULES`), de modo que solo se **compilan**
+los módulos que este equipo usa y sus dependencias Kconfig. En el árbol 7.2.7
+real pasó de 5472 a 172 módulos `=m` (el build en frío pasa de ~19 min a una
+fracción). `make localmodconfig` es una herramienta oficial del kernel y no
+necesita haber compilado nada (regenera `.config` y corre `olddefconfig`).
+
+- `--lite` / `CIZEN_LITE=1`: activar; `--no-lite`/`CIZEN_LITE=0`: desactivar.
+- Se ejecuta **antes** de aplicar el perfil: los requests `ENABLE`/`CRITICAL`
+  (fuerzan `=y`), `DISABLE` y la auditoría/validación siguen intactos, y los
+  built-in (`=y`) nunca se tocan: el arranque sin initramfs queda garantizado.
+- `podar-modulos.sh --keep-list [extra,...]` imprime el allowlist estático (un
+  nombre por línea) sin necesitar un árbol de módulos; es la misma fuente que la
+  poda, así que build y paquete quedan coherentes (un módulo no compilado solo
+  puede faltar del paquete).
+- Consecuencia esperada: hardware que **no** esté cargado/declarado en el
+  allowlist durante el build no tendrá módulo compilado (p. ej. una unidad
+  NTFS solo si está montada o en `CIZEN_KEEP_MODULES`). Es el precio del kernel
+  mínimo; si luego necesitas un módulo, basta añadirlo y recompilar.
+- Nota sobre el base promovido: un `--check --lite` promueve como config base la
+  versión **delgada** (`profiles/linux-<ver>-cizen-v3.config`). Para volver a un
+  build "completo" (todos los módulos) borra ese base y lanza sin `--lite`.
 
 ### Menú interactivo
 

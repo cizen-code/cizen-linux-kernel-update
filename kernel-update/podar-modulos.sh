@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# podar-modulos.sh — Poda de módulos del kernel Cizen v1.0.0
+# podar-modulos.sh — Poda de módulos del kernel Cizen v1.0.1
 #
 # Elimina de un árbol de módulos (lib/modules/<release>) los módulos que este
 # hardware no necesita, conservando únicamente:
@@ -19,6 +19,10 @@
 # Uso:
 #   podar-modulos.sh <lib/modules/<release>> [keep-extra,separado,por,comas]
 #   CIZEN_KEEP_MODULES="kvm_intel,vfio_pci" podar-modulos.sh <moddir>
+#   podar-modulos.sh --keep-list [keep-extra,...]   # imprime el allowlist estático
+#       (CORE_KEEP + /etc/modules-load.d + extras) un nombre por línea, para
+#       generar el conjunto de módulos que --lite (localmodconfig) debe compilar.
+#       No necesita un árbol de módulos (devuelve 0).
 #
 # Fallos de seguridad: si depmod no está o el directorio no parece un árbol de
 # módulos, NO toca nada y devuelve 1 (el PKGBUILD conserva el conjunto completo).
@@ -28,28 +32,36 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 export LC_ALL=C
 
-MODDIR="${1:-}"
-if [ -z "$MODDIR" ] || [ ! -d "$MODDIR" ]; then
-  echo "Uso: podar-modulos.sh <lib/modules/<release>> [lista-extra,separada,por,comas]" >&2
-  exit 2
-fi
-MODDIR="$(cd -- "$MODDIR" && pwd -P)"
-RELEASE="${MODDIR##*/}"
-ROOT="${MODDIR%/lib/modules/*}"
-if [ "$ROOT" = "$MODDIR" ]; then
-  echo "La ruta no parece ser <root>/lib/modules/<release>: $MODDIR" >&2
-  exit 2
+KEEP_LIST_ONLY=false
+if [ "${1:-}" = "--keep-list" ]; then
+  KEEP_LIST_ONLY=true
+  shift
 fi
 
-# depmod es imprescindible para regenerar modules.dep/alias/symbols tras la
-# poda. Sin él no se toca nada (el conjunto completo es más seguro).
-if ! command -v depmod >/dev/null 2>&1; then
-  echo "AVISO: depmod no está disponible; se omite la poda y se conserva el conjunto completo." >&2
-  exit 1
-fi
-if [ ! -f "$MODDIR/modules.dep" ] || [ ! -f "$MODDIR/modules.alias" ]; then
-  echo "AVISO: $MODDIR no contiene modules.dep/modules.alias; se omite la poda." >&2
-  exit 1
+if [ "$KEEP_LIST_ONLY" = false ]; then
+  MODDIR="${1:-}"
+  if [ -z "$MODDIR" ] || [ ! -d "$MODDIR" ]; then
+    echo "Uso: podar-modulos.sh <lib/modules/<release>> [lista-extra,separada,por,comas]" >&2
+    exit 2
+  fi
+  MODDIR="$(cd -- "$MODDIR" && pwd -P)"
+  RELEASE="${MODDIR##*/}"
+  ROOT="${MODDIR%/lib/modules/*}"
+  if [ "$ROOT" = "$MODDIR" ]; then
+    echo "La ruta no parece ser <root>/lib/modules/<release>: $MODDIR" >&2
+    exit 2
+  fi
+
+  # depmod es imprescindible para regenerar modules.dep/alias/symbols tras la
+  # poda. Sin él no se toca nada (el conjunto completo es más seguro).
+  if ! command -v depmod >/dev/null 2>&1; then
+    echo "AVISO: depmod no está disponible; se omite la poda y se conserva el conjunto completo." >&2
+    exit 1
+  fi
+  if [ ! -f "$MODDIR/modules.dep" ] || [ ! -f "$MODDIR/modules.alias" ]; then
+    echo "AVISO: $MODDIR no contiene modules.dep/modules.alias; se omite la poda." >&2
+    exit 1
+  fi
 fi
 
 declare -A KEEP=()
@@ -57,7 +69,9 @@ keep_mod() { [ -n "$1" ] && KEEP["$1"]=1; }
 
 # ------------------------------------------------------------
 # 0) Inventario del árbol objetivo (nombres de módulo -> fichero .ko*)
+#    (se omite en modo --keep-list: no hay árbol que inventariar)
 # ------------------------------------------------------------
+if [ "$KEEP_LIST_ONLY" = false ]; then
 declare -A FILE_BY_NAME=()
 declare -a ALL_FILES=()
 shopt -s nullglob
@@ -75,6 +89,7 @@ shopt -u nullglob
 if [ "${#ALL_FILES[@]}" -eq 0 ]; then
   echo "AVISO: no hay módulos .ko en $MODDIR; se omite la poda." >&2
   exit 1
+fi
 fi
 
 # ------------------------------------------------------------
@@ -98,7 +113,9 @@ fi
 
 # ------------------------------------------------------------
 # 2) Hardware presente -> modalias -> modules.alias del árbol objetivo
+#    (se omite en modo --keep-list: requiere el árbol objetivo)
 # ------------------------------------------------------------
+if [ "$KEEP_LIST_ONLY" = false ]; then
 declare -a HW_ALIASES=()
 while IFS= read -r _ma; do
   [ -n "$_ma" ] && HW_ALIASES+=("$_ma")
@@ -121,6 +138,7 @@ if [ -f "$MODDIR/modules.alias" ] && [ "${#HW_ALIASES[@]}" -gt 0 ]; then
         ;;
     esac
   done < "$MODDIR/modules.alias"
+fi
 fi
 
 # ------------------------------------------------------------
@@ -178,10 +196,15 @@ CORE_KEEP=(
 for _m in "${CORE_KEEP[@]}"; do keep_mod "$_m"; done
 
 # ------------------------------------------------------------
-# 3b) Extras del usuario: 2º argumento y/o CIZEN_KEEP_MODULES
+# 3b) Extras del usuario: 2º argumento (o 1º en --keep-list) y/o CIZEN_KEEP_MODULES
 # ------------------------------------------------------------
-_EXTRA="${2:-}"
-[ -n "${CIZEN_KEEP_MODULES:-}" ] && _EXTRA="${_EXTRA},${CIZEN_KEEP_MODULES}"
+_EXTRA=""
+if [ "$KEEP_LIST_ONLY" = true ]; then
+  _EXTRA="${1:-}"
+else
+  _EXTRA="${2:-}"
+fi
+[ -n "${CIZEN_KEEP_MODULES:-}" ] && _EXTRA="${_EXTRA:+${_EXTRA},}${CIZEN_KEEP_MODULES}"
 if [ -n "$_EXTRA" ]; then
   IFS=',' read -r -a _xextra <<< "$_EXTRA"
   for _x in "${_xextra[@]:-}"; do
@@ -189,6 +212,15 @@ if [ -n "$_EXTRA" ]; then
     [ -n "$_x" ] && keep_mod "$_x"
   done
   unset _x
+fi
+
+if [ "$KEEP_LIST_ONLY" = true ]; then
+  # Un nombre por línea (todo lo que la poda conservaría sin depender de un
+  # módulo cargado ni de un árbol objetivo): allowlist + modules-load.d + extras.
+  for _k_ in "${!KEEP[@]}"; do
+    printf '%s\n' "$_k_"
+  done
+  exit 0
 fi
 
 # ------------------------------------------------------------
