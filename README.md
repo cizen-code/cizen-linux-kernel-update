@@ -62,7 +62,7 @@ con otras herramientas):
 | force | `kernel-update.sh --force` | Recompila forzando |
 | check-update | `kernel-update.sh --check-update` | Consulta la release estable sin modificar nada |
 | list-renames | `kernel-update.sh --list-renames` | Muestra el mapa de renombres de config |
-| absorb-rebels | `kernel-update.sh <ver> --absorb-rebels` | Mueve a `EXPECTED_REBELS` los símbolos que Kconfig conserva por dependencias, dejando el perfil limpio |
+| absorb-rebels | `kernel-update.sh <ver> --absorb-rebels` | Mueve a `EXPECTED_REBELS` los símbolos que Kconfig conserva por dependencias, dejando el perfil limpio. Desde v27.25.1 el propio check lo ofrece interactivamente antes de compilar (si la auditoría reporta que Kconfig conserva desactivaciones), sin necesidad del flag |
 | no-prune | `kernel-update.sh <ver> --no-prune` | Desactiva la poda de módulos (default: activada) |
 
 ### Poda de módulos

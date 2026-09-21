@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.25.0 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.25.1 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / systemd / KVM-libvirt / QEMU-OVMF
+#
+# CHANGELOG v27.25.1 (el check ofrece absorber rebeldes automáticamente — 2026-09-21)
+#   - Auto-absorción interactiva: cuando la auditoría reporta desactivaciones
+#     que Kconfig conserva (DISABLE_WARN, p. ej. BT_BCM/INTEL_SCU/MPLS...), en
+#     un run sin --strict se pregunta ANTES de confirmar la compilación si
+#     absorberlas a EXPECTED_REBELS (deja la auditoría limpia). Equivale a un
+#     --absorb-rebels confirmado en el momento; sin terminal interactiva no se
+#     aplica y el check sigue con los warnings como hasta ahora. Reutiliza la
+#     misma revalidación posterior de --absorb-rebels (backup del perfil).
 #
 # CHANGELOG v27.25.0 (poda de módulos: solo los necesarios para este hardware — 2026-09-21)
 #   - Poda automática de módulos del paquete linux-cizen-v3: tras empaquetar,
@@ -501,6 +510,9 @@
 #   ./kernel-update.sh [versión] --check
 #   ./kernel-update.sh <versión> --strict
 #   ./kernel-update.sh <versión> --absorb-rebels
+#     Si la auditoría reporta desactivaciones que Kconfig conserva, el check
+#     preguntará antes de compilar si absorberlas a EXPECTED_REBELS (v27.25.1).
+#     --absorb-rebels lo hace siempre de forma incondicional.
 #   ./kernel-update.sh <versión> --force
 #   ./kernel-update.sh <versión> --keep-src
 #   ./kernel-update.sh <versión> --no-prune                  # sin poda de módulos
@@ -553,7 +565,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.25.0"
+SCRIPT_VERSION="27.25.1"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -4069,6 +4081,54 @@ if [ "$ABSORB_REBELS" = true ] && [ "${#DISABLE_WARN[@]}" -gt 0 ]; then
     }
   else
     warn "--absorb-rebels no pudo completarse; se continúa con la validación previa."
+  fi
+fi
+
+# Absorción interactiva de rebeldes (v27.25.1): si la auditoría reportó
+# desactivaciones que Kconfig conserva y el run no es --strict (que aborta) ni
+# venimos de --absorb-rebels explícito, se ofrece absorberlas a EXPECTED_REBELS
+# antes de decidir compilar. Es una mutación persistente del perfil: requiere
+# confirmación explícita en terminal y jamás se aplica sin ella.
+confirm_absorb_rebels() {
+  local cnt="$1" answer
+
+  if ! [ -t 0 ] && ! [ -t 1 ]; then
+    warn "Sin terminal interactiva; no se absorben rebeldes automáticamente (usa --absorb-rebels)."
+    return 1
+  fi
+
+  echo
+  while true; do
+    read -r -t 300 -p "  Kconfig conserva $cnt desactivaciones del perfil. ¿Absorberlas a EXPECTED_REBELS (auditoría limpia)? [S/n] " answer < /dev/tty || answer="n"
+    case "${answer:-s}" in
+      s|S|si|SI|sí|Sí|Si|y|Y|yes|YES)
+        return 0
+        ;;
+      n|N|no|NO)
+        return 1
+        ;;
+      *)
+        warn "Respuesta no válida. Responda S, N o simplemente presione Enter."
+        ;;
+    esac
+  done
+}
+
+if [ "$ABSORB_REBELS" = false ] && [ "$STRICT" = false ] && [ "${#DISABLE_WARN[@]}" -gt 0 ]; then
+  if confirm_absorb_rebels "${#DISABLE_WARN[@]}"; then
+    if absorb_rebels_to_profile; then
+      source "$PROFILE_FILE"
+      load_profile
+      build_effective_arrays
+      check_profile_contradictions
+      log "Re-validando con el perfil actualizado (símbolos absorbidos)..."
+      validate_config || {
+        rc=$?
+        fatal "Re-validación tras absorción interactiva fallida (rc=$rc)."
+      }
+    else
+      warn "No se pudieron absorber los rebeldes; se continúa con la validación previa."
+    fi
   fi
 fi
 
