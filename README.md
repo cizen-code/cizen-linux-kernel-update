@@ -9,6 +9,7 @@ notificaciones de escritorio y flujos de compilación a plena prioridad.
 ```
 ├── kernel-update/                 # Flujo de compilación del kernel Cizen
 │   ├── kernel-update.sh           # Motor principal (descarga→Kconfig→build→pacman→UKI)
+│   ├── podar-modulos.sh           # Poda de módulos del paquete (v27.25.0)
 │   ├── kernel-update-notify.sh    # Notificador de releases nuevas de kernel.org
 │   ├── kernel-update-menu.sh      # Menú interactivo de modos (check/build/fast)
 │   └── profiles/                  # Perfiles + config base (linux-*-cizen-v3.config)
@@ -35,10 +36,14 @@ Cada suite vive en su propio subdirectorio de `/usr/local/bin/` (no mezclada
 con otras herramientas):
 
 ```
-/usr/local/bin/kernel-update/          # kernel-update.sh + notify + menu + profiles/
+/usr/local/bin/kernel-update/          # kernel-update.sh + podar-modulos.sh + notify + menu + profiles/
 /usr/local/bin/arch-update/            # los 5 scripts de la suite Arch
 /usr/local/bin/arch-open-terminal.sh   # helper compartido por ambas suites (plano)
 ```
+
+> `podar-modulos.sh` debe instalarse ejecutable junto al resto de la suite
+> (se copia igual que `kernel-update.sh`); si falta o no es ejecutable, el
+> build continúa sin poda (aviso claro, nunca falla).
 
 - Config base del kernel: `linux-<versión>-cizen-v3.config` dentro de
   `/usr/local/bin/kernel-update/profiles/` (override: `CIZEN_CONFIG_DIR`).
@@ -58,6 +63,28 @@ con otras herramientas):
 | check-update | `kernel-update.sh --check-update` | Consulta la release estable sin modificar nada |
 | list-renames | `kernel-update.sh --list-renames` | Muestra el mapa de renombres de config |
 | absorb-rebels | `kernel-update.sh <ver> --absorb-rebels` | Mueve a `EXPECTED_REBELS` los símbolos que Kconfig conserva por dependencias, dejando el perfil limpio |
+| no-prune | `kernel-update.sh <ver> --no-prune` | Desactiva la poda de módulos (default: activada) |
+
+### Poda de módulos
+
+Tras empaquetar, `podar-modulos.sh` retira del paquete `linux-cizen-v3` los
+módulos que este hardware no usa, conservando únicamente:
+
+1. Módulos **cargados ahora** (`/proc/modules`): audio HDA, red, GPU, KVM, FS.
+2. Módulos cuyo **modalias** del hardware presente (`/sys`) casa con
+   `modules.alias` del árbol compilado (resolución por patrón glob).
+3. Una allowlist explícita del perfil (`CORE_KEEP`): red (`e1000e`), audio,
+   USB/HID/BT, sistemas de archivos (`btrfs`, `isofs`, `exfat`, `vfat`, `xfs`),
+   KVM/vfio/virtio/bridge, plataforma Dell/WMI, térmica/RAPL, input/gaming
+   (`joydev`, `xpad`, ...), QoS (`sch_fq`, `tcp_bbr`), nftables y diagnóstico.
+4. `/etc/modules-load.d` y `CIZEN_KEEP_MODULES="mod_a,mod_b"`.
+5. Cierre **transitivo de dependencias** por `modules.dep`, y regeneración de
+   los índices con `depmod`.
+
+Los símbolos `=y` (built-in: `X86_NATIVE_CPU`, `BTRFS_FS`, `DRM_I915`,
+`KVM_SMM`, ...) no tienen `.ko`: la poda nunca los toca, por lo que el arranque
+sin initramfs queda intacto. Configurable con `CIZEN_PRUNE_MODULES=0` (o
+`--no-prune`) y `CIZEN_PRUNE_SCRIPT` (ruta alternativa al podador).
 
 ### Menú interactivo
 

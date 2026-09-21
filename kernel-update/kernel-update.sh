@@ -1,8 +1,30 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.24.4 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.25.0 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / systemd / KVM-libvirt / QEMU-OVMF
+#
+# CHANGELOG v27.25.0 (poda de módulos: solo los necesarios para este hardware — 2026-09-21)
+#   - Poda automática de módulos del paquete linux-cizen-v3: tras empaquetar,
+#     podar-modulos.sh conserva únicamente los módulos que este equipo usa.
+#     Criterio: (1) módulos cargados ahora (/proc/modules), (2) módulos cuyo
+#     modalias del software presente de /sys casa con modules.alias del árbol,
+#     (3) allowlist CORE_KEEP del perfil (red, audio HDA, USB/HID/BT, FS,
+#     KVM/vfio/virtio/bridge, plataforma Dell/WMI, térmica/RAPL, input/gaming,
+#     netfilter nft, diagnóstico), (4) /etc/modules-load.d y la lista extra
+#     CIZEN_KEEP_MODULES, y (5) cierre transitivo de dependencias
+#     por modules.dep. Regenera los índices con depmod. Los módulos =y (built-in:
+#     X86_NATIVE_CPU, BTRFS_FS, DRM_I915, KVM_SMM, ...) no tienen .ko y la
+#     poda nunca los toca, por lo que el arranque sin initramfs sigue garantizado.
+#   - La inyección ocurre en $SRC/scripts/package/PKGBUILD tras el
+#     "DEPMOD=true modules_install" de _package(), protegida por el respaldo
+#     .cizen-orig de prepare_package_identity_override() (restore_* la revierte
+#     igual). Guardas: [ -x pruner ], CIZEN_PRUNE_MODULES=1 y || true (una
+#     falla de la poda conserva el conjunto completo, nunca rompe el build).
+#   - Nuevo flag --no-prune (o CIZEN_PRUNE_MODULES=0) para desactivar la poda;
+#     CIZEN_KEEP_MODULES="mod_a,mod_b" permite añadir módulos a conservar.
+#   - Nuevo script kernel-update/podar-modulos.sh (v1.0.0, se instala en
+#     /usr/local/bin/kernel-update/) y línea "Podar:" en el resumen final.
 #
 # CHANGELOG v27.24.4 (deps requeridas auto-instalables + perfil 7050 v5.11.1 — 2026-09-21)
 #   - ccache y pahole pasan a dependencias REQUERIDAS del preflight: se añaden
@@ -481,6 +503,8 @@
 #   ./kernel-update.sh <versión> --absorb-rebels
 #   ./kernel-update.sh <versión> --force
 #   ./kernel-update.sh <versión> --keep-src
+#   ./kernel-update.sh <versión> --no-prune                  # sin poda de módulos
+#   CIZEN_KEEP_MODULES="kvm_intel,vfio_pci" ./kernel-update.sh <versión>  # módulos extra a conservar en la poda
 #   ./kernel-update.sh <versión> --patch bore                 # framework de parches
 #   ./kernel-update.sh <versión> --bore                       # alias de --patch bore
 #   CIZEN_PATCHES="bore" ./kernel-update.sh <versión>         # parches por env
@@ -590,6 +614,12 @@ DO_RENAME=false
 RENAME_PAIR=""
 DO_LIST=false
 CHECK_UPDATE=false
+
+# Poda de módulos (v27.25.0): tras empaquetar, se conservan únicamente los
+# módulos que este hardware usa (ver podar-modulos.sh). 1=activada (default),
+# 0=desactivada. La env CIZEN_PRUNE_MODULES también la controla; el flag
+# --no-prune/--prune tiene prioridad (se procesan después de esta lectura).
+PRUNE_MODULES="${CIZEN_PRUNE_MODULES:-1}"
 
 # ── Framework de parches, BTF, clang y utilidades (v27.24.0) ──
 # PATCH_NAMES: lista de parches de terceros solicitados (--patch / CIZEN_PATCHES
@@ -741,6 +771,10 @@ while [ $# -gt 0 ]; do
       DO_CHANGELOG=true; shift ;;
     --keep-src)
       KEEP_SRC=true; shift ;;
+    --no-prune)
+      PRUNE_MODULES=0; shift ;;
+    --prune)
+      PRUNE_MODULES=1; shift ;;
     --list-renames)
       DO_LIST=true; shift ;;
     --rename)
@@ -781,6 +815,16 @@ if [ -n "${CIZEN_PATCHES:-}" ]; then
 fi
 [ "${CIZEN_BTF:-0}" = "1" ] && BTF_REQUESTED=true
 [ "${CIZEN_CLANG:-0}" = "1" ] && CLANG_REQUESTED=true
+case "$PRUNE_MODULES" in
+  0|1) ;;
+  *) fatal "CIZEN_PRUNE_MODULES inválido: $PRUNE_MODULES (use 0 o 1)." ;;
+esac
+# Ruta al podador: en la suite instalada o junto al motor (preferencia a la env).
+if [ -n "${CIZEN_PRUNE_SCRIPT:-}" ]; then
+  PRUNER_SCRIPT="$CIZEN_PRUNE_SCRIPT"
+else
+  PRUNER_SCRIPT="$SCRIPT_DIR/podar-modulos.sh"
+fi
 [ -n "${CIZEN_PUBLISH_REPO:-}" ] && PUBLISH_REPO=true
 PUBLISH_REPO_DIR="${CIZEN_PUBLISH_REPO:-/var/lib/kernel-update/repo}"
 
@@ -2915,6 +2959,61 @@ restore_package_revision_override() {
   fi
 }
 
+prepare_package_pruning_override() {
+  local pkgbuilder="$SRC/scripts/package/PKGBUILD"
+
+  [ -f "$pkgbuilder" ] || fatal "No existe $pkgbuilder; no se puede activar la poda de módulos."
+
+  # La poda es opt-in robusta: sin podador ejecutable no se falla, se omite.
+  if [ ! -x "$PRUNER_SCRIPT" ]; then
+    if [ "$PRUNE_MODULES" = "1" ]; then
+      warn "Podador de módulos no encontrado/ejecutable ($PRUNER_SCRIPT); se compila SIN poda."
+      PRUNE_MODULES=0
+    fi
+    return 0
+  fi
+  [ "$PRUNE_MODULES" = "1" ] || return 0
+
+  # Añadimos la invocación SOLO dentro de _package(): tras el modules_install
+  # (que deja el árbol completo en ${modulesdir}). Depende de variables de
+  # entorno exportadas por este motor antes de `make pacman-pkg`; makepkg las
+  # hereda al fakeroot que ejecuta package(). Guardas: si el podador falla o
+  # no está, `|| true` conserva el conjunto completo (nunca rompe la build).
+  # restore_package_identity_override() revierte esta modificación con el
+  # respaldo .cizen-orig; no necesita backup propio.
+  if ! grep -Fq 'modules_install' "$pkgbuilder"; then
+    fatal "El PKGBUILD no contiene modules_install; no se puede inyectar la poda de módulos."
+  fi
+  if ! grep -Fq 'CIZEN_PRUNE_MODULES' "$pkgbuilder"; then
+    local pkgtmp
+    pkgtmp="${pkgbuilder}.cizen-prune-${TS}"
+    awk '
+      BEGIN { inserted=0 }
+      /modules_install/ && !inserted {
+        print
+        printf "\tif [ \"${CIZEN_PRUNE_MODULES:-0}\" = \"1\" ] && [ -n \"${CIZEN_PRUNE_SCRIPT:-}\" ] && [ -x \"${CIZEN_PRUNE_SCRIPT}\" ]; then\n"
+        printf "\t\t\"${CIZEN_PRUNE_SCRIPT}\" \"${modulesdir}\" \"${CIZEN_KEEP_MODULES:-}\" || true\n"
+        printf "\tfi\n"
+        inserted=1
+        next
+      }
+      { print }
+    ' "$pkgbuilder" > "$pkgtmp" || { rm -f -- "$pkgtmp"; fatal "No se pudo inyectar la poda de módulos en el PKGBUILD."; }
+    chmod --reference="$pkgbuilder" "$pkgtmp" 2>/dev/null || true
+    mv -f -- "$pkgtmp" "$pkgbuilder" || { rm -f -- "$pkgtmp"; fatal "No se pudo activar el PKGBUILD con poda de módulos."; }
+  fi
+
+  ok "Poda de módulos activa: $PRUNER_SCRIPT (CIZEN_KEEP_MODULES=${CIZEN_KEEP_MODULES:--})"
+}
+
+restore_package_pruning_override() {
+  # La poda vive dentro del PKGBUILD parcheado por prepare_package_identity_override;
+  # restaurarlo también la elimina. Sin embargo, si una ejecución previa dejó el
+  # backup sin alcanzar EXIT (SIGKILL/catástrofe), el flujo normal de
+  # restore_package_identity_override lo recupera igual; nada que hacer aquí.
+  :
+}
+
 determine_pkgrel() {
   local pattern file base rel max_rel=0 installed_ver installed_rel
 
@@ -4098,6 +4197,7 @@ BUILD_TIMEOUT="${BUILD_TIMEOUT:-3600}"
 determine_pkgrel
 prepare_package_identity_override
 prepare_package_revision_override
+prepare_package_pruning_override
 
 log "Compilando con $JOBS hilos (pkgrel=$PKGREL)..."
 START="$(date +%s)"
@@ -4107,6 +4207,10 @@ export KBUILD_REVISION="$PKGREL"
 # El PKGBUILD oficial de kbuild soporta PACMAN_PKGBASE y lo utiliza para formar
 # pkgname/pkgbase y el identificador que termina en /usr/lib/modules/<release>/pkgbase.
 export PACMAN_PKGBASE="$CIZEN_PKGBASE"
+# Poda de módulos: estas variables llegan a package() bajo fakeroot vía makepkg.
+export CIZEN_PRUNE_MODULES="${CIZEN_PRUNE_MODULES:-$PRUNE_MODULES}"
+export CIZEN_PRUNE_SCRIPT="${CIZEN_PRUNE_SCRIPT:-$PRUNER_SCRIPT}"
+export CIZEN_KEEP_MODULES="${CIZEN_KEEP_MODULES:-}"
 sudo_keepalive_start
 build_rc=0
 # --foreground: hace que make corra en el MISMO grupo de procesos de la
@@ -4412,6 +4516,7 @@ ${PUBLISH_REPO_MSG:+  ${PUBLISH_REPO_MSG}}
  Paquete     : $(basename "$PKG")
  Config base : $FINAL_CONFIG
  Build tmpfs : $TMPFS_ROOT (size=$TMPFS_SIZE)
+ Podar       : $([ "${CIZEN_PRUNE_MODULES:-$PRUNE_MODULES}" = "1" ] && echo 'sí (solo módulos de este hardware)' || echo 'no')
 ${SNAPSHOT_DESC:+ Snapshot   : $SNAPSHOT_DESC}
 ${VERIFY_ROLLBACK_FILE:+ Rollback  : $VERIFY_ROLLBACK_FILE}
 
