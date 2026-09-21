@@ -1,8 +1,43 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.25.2 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.25.5 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / systemd / KVM-libvirt / QEMU-OVMF
+#
+# CHANGELOG v27.25.5 (purga automática del enlace + BTF off por defecto — 2026-09-21)
+#   - Al reutilizar el árbol en tmpfs, si el espacio libre queda por debajo del
+#     mínimo se purgan automáticamente los artefactos re-generables del enlace
+#     final (vmlinux, vmlinux.o, vmlinux.unstripped, System.map, .tmp_vmlinux*)
+#     antes de abortar, conservando .o/.a y paquetes generados.
+#   - Por defecto se desactiva DEBUG_INFO_BTF (los picos de RAM del enlace final
+#     causaron OOM y tmpfs lleno): paquete más pequeño y enlace más ligero.
+#     Sigue disponible con --btf / CIZEN_BTF=1 (los fuerza a =y de nuevo).
+#   - Antes de `make pacman-pkg` se retiran los .pkg.tar.zst obsoletos del árbol:
+#     makepkg aborta si ya existe el mismo pkgver/pkgrel compilado
+#     ("El grupo de paquetes ya se ha compilado").
+#
+# CHANGELOG v27.25.4 (modo lite = ÚNICO modo de compilación — 2026-09-21)
+#   - Fix identificación de paquete: copy_packages_from_build exigía *cizen_v3*
+#     en el nombre, pero la plantilla genera pkgver sin sufijo (7.2.7-1). Se
+#     acepta ahora la nomenclatura actual (v27.25.4b, no publicado).
+#   - Esta suite solo compila de una forma: con make localmodconfig (los módulos
+#     cargados + allowlist de podar-modulos.sh), siempre, sin excepción. Se
+#     eliminan --lite, --no-lite y CIZEN_LITE: no existe el build "completo".
+#     El 100% de los builds son del kernel mínimo; la poda del paquete sigue
+#     activa y el arranque sin initramfs sigue garantizado (=y intactos).
+#   - Fix no-interactivo: la receta oficial terminaba con `conf --oldconfig`
+#     (interactivo), que con símbolos nuevos (p. ej. SCHED_BORE del parche BORE)
+#     pedía respuestas en medio del flujo "automático". Ahora se replica la
+#     receta (streamline_config.pl + conf) reemplazando ese paso por
+#     `make olddefconfig` (no interactivo; los símbolos (NEW) toman su default
+#     y el perfil los re-fuerza después). Requiere exportar ARCH/SRCARCH al
+#     invocar streamline_config.pl fuera de make.
+#
+# CHANGELOG v27.25.3 (modo --lite ACTIVADO POR DEFECTO — 2026-09-21)
+#   - El objetivo de este host es un kernel mínimo y builds cortos: desde esta
+#     versión --lite es el comportamiento por defecto (CIZEN_LITE=1). Un build
+#     "completo" (todos los módulos) se pide explícitamente con --no-lite o
+#     CIZEN_LITE=0. Igual que antes, la poda del paquete sigue activa siempre.
 #
 # CHANGELOG v27.25.2 (modo --lite: compilar solo los módulos en uso — 2026-09-21)
 #   - Nuevo flag --lite (o CIZEN_LITE=1): ejecuta `make localmodconfig` sobre la
@@ -531,8 +566,9 @@
 #   ./kernel-update.sh <versión> --force
 #   ./kernel-update.sh <versión> --keep-src
 #   ./kernel-update.sh <versión> --no-prune                  # sin poda de módulos
-#   ./kernel-update.sh <versión> --lite                      # compilar solo los módulos en uso (localmodconfig)
-#   CIZEN_LITE=1 ./kernel-update.sh <versión>                # equivalente por env
+#   El modo lite es el ÚNICO modo de compilación (v27.25.4): la config siempre
+#   se adelgaza con make localmodconfig (módulos cargados + allowlist del podador);
+#   no existe --no-lite ni CIZEN_LITE. El paquete se poda igual siempre.
 #   CIZEN_KEEP_MODULES="kvm_intel,vfio_pci" ./kernel-update.sh <versión>  # módulos extra a conservar en la poda
 #   ./kernel-update.sh <versión> --patch bore                 # framework de parches
 #   ./kernel-update.sh <versión> --bore                       # alias de --patch bore
@@ -582,7 +618,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.25.2"
+SCRIPT_VERSION="27.25.5"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -650,13 +686,9 @@ CHECK_UPDATE=false
 # --no-prune/--prune tiene prioridad (se procesan después de esta lectura).
 PRUNE_MODULES="${CIZEN_PRUNE_MODULES:-1}"
 
-# Modo lite (v27.25.2): make localmodconfig reduce la config para NO compilar
-# los módulos que la poda descartaría, acortando el build. La env CIZEN_LITE
-# también lo activa (0/1); el flag --lite/--no-lite tiene prioridad.
-LITE_MODE=false
-if [ "${CIZEN_LITE:-0}" = "1" ]; then
-  LITE_MODE=true
-fi
+# Modo lite (v27.25.2): desde v27.25.4 es el ÚNICO modo de compilación de esta
+# suite. make localmodconfig reduce la config para NO compilar los módulos que
+# la poda descartaría, acortando el build. No hay toggle ni escape hatch.
 
 # ── Framework de parches, BTF, clang y utilidades (v27.24.0) ──
 # PATCH_NAMES: lista de parches de terceros solicitados (--patch / CIZEN_PATCHES
@@ -812,10 +844,6 @@ while [ $# -gt 0 ]; do
       PRUNE_MODULES=0; shift ;;
     --prune)
       PRUNE_MODULES=1; shift ;;
-    --lite)
-      LITE_MODE=true; shift ;;
-    --no-lite)
-      LITE_MODE=false; shift ;;
     --list-renames)
       DO_LIST=true; shift ;;
     --rename)
@@ -859,10 +887,6 @@ fi
 case "$PRUNE_MODULES" in
   0|1) ;;
   *) fatal "CIZEN_PRUNE_MODULES inválido: $PRUNE_MODULES (use 0 o 1)." ;;
-esac
-case "${CIZEN_LITE:-0}" in
-  0|1) ;;
-  *) fatal "CIZEN_LITE inválido: $CIZEN_LITE (use 0 o 1)." ;;
 esac
 # Ruta al podador: en la suite instalada o junto al motor (preferencia a la env).
 if [ -n "${CIZEN_PRUNE_SCRIPT:-}" ]; then
@@ -1426,6 +1450,11 @@ build_effective_arrays() {
     EXPECTED_REBEL_SET["DEBUG_INFO_BTF"]=1
     PATCH_KCONFIG_FILTER[DEBUG_INFO]=1
     PATCH_KCONFIG_FILTER[DEBUG_INFO_BTF]=1
+  else
+    # v27.25.5 (decisión del usuario): por defecto NO se genera BTF (aunque la
+    # config base lo traiga =y): solo los módulos lite, menos RAM/pico en el
+    # enlace final y paquete más pequeño. Sigue disponible con --btf / CIZEN_BTF.
+    add_unique disable "DEBUG_INFO_BTF"
   fi
 }
 
@@ -1689,7 +1718,27 @@ prepare_tmpfs_build() {
     min_required="$TMPFS_EXISTING_SRC_MIN_FREE_MB"
   fi
   if [ "$avail_mb" -lt "$min_required" ]; then
-    fatal "El tmpfs deja solo ${avail_mb} MB libres; mínimo operativo requerido: ${min_required} MB. Ajusta KERNEL_TMPFS_MIN_FREE_MB/KERNEL_TMPFS_EXISTING_SRC_MIN_FREE_MB o reduce JOBS."
+    # v27.25.5: al reutilizar el árbol, los artefactos re-generables del enlace
+    # final (vmlinux*, .tmp_vmlinux*, System.map) suelen llenar el tmpfs tras un
+    # build reciente. Se purgan ANTES de declarar falta de espacio: se vuelven a
+    # enlazar en minutos, y se conservan .o/.a (la inversión grande) y paquetes.
+    if [ -d "$SRC" ]; then
+      local __purged=0 __art
+      while IFS= read -r -d '' __art; do
+        rm -f -- "$__art"
+        __purged=1
+      done < <(find "$SRC" -maxdepth 1 -type f \( -name 'vmlinux' -o -name 'vmlinux.o' -o \
+          -name 'vmlinux.unstripped' -o -name 'System.map' -o -name '.tmp_vmlinux*' \) -print0)
+      unset __art
+      if [ "$__purged" = 1 ]; then
+        log "Artefactos del enlace purgados (se regenerarán durante el build)."
+        avail_mb="$(get_avail_mb "$TMPFS_ROOT")"
+      fi
+      unset __purged
+    fi
+    if [ "$avail_mb" -lt "$min_required" ]; then
+      fatal "El tmpfs deja solo ${avail_mb} MB libres; mínimo operativo requerido: ${min_required} MB. Ajusta KERNEL_TMPFS_MIN_FREE_MB/KERNEL_TMPFS_EXISTING_SRC_MIN_FREE_MB o reduce JOBS."
+    fi
   fi
 }
 
@@ -2369,7 +2418,7 @@ choose_base_config() {
 }
 
 # ============================================================
-# MODO LITE (v27.25.2): compilar solo los módulos que de verdad se usan
+# MODO LITE (v27.25.2): ÚNICO modo de compilación de esta suite (v27.25.4)
 # ============================================================
 # make localmodconfig (herramienta oficial del kernel) reduce .config para que
 # el build NO compile los miles de módulos que la poda posterior borraría del
@@ -2378,7 +2427,6 @@ choose_base_config() {
 # fuente que la poda. Los =y (built-in) ni se tocan: el arranque sin initramfs
 # sigue garantizado. No requiere haber compilado nada; solo re-usa conf/olddefconfig.
 prepare_lite_config() {
-  [ "$LITE_MODE" = true ] || return 0
   command -v make >/dev/null || fatal "--lite requiere make (make localmodconfig)."
   if [ ! -d "$SRC/scripts/kconfig" ]; then
     fatal "--lite requiere el árbol del kernel (scripts/kconfig) en $SRC."
@@ -2399,11 +2447,36 @@ prepare_lite_config() {
   } > "$keepfile"
 
   log "--lite: localmodconfig (módulos cargados + $keep_lines del allowlist)..."
-  if ( cd "$SRC" && LSMOD="$keepfile" make localmodconfig ); then
+  # Replicamos la receta de scripts/kconfig/Makefile (streamline_config.pl +
+  # conf) pero reemplazando el `--oldconfig` final —que es INTERACTIVO y con
+  # símbolos nuevos (p. ej. SCHED_BORE del parche BORE) pide respuestas— por
+  # `make olddefconfig` (no interactivo: los símbolos (NEW) toman su default y
+  # el perfil/auditoría los re-fuerzan después).
+  local rc karch ksrcarch
+  # make inyecta ARCH/SRCARCH por defecto; ejecutado a mano, streamline_config.pl
+  # los necesita en el entorno para resolver "arch/$(SRCARCH)/Kconfig".
+  case "$(uname -m)" in
+    x86_64|amd64)  karch=x86_64 ksrcarch=x86 ;;
+    i?86)          karch=i386    ksrcarch=i386 ;;
+    aarch64)       karch=arm64   ksrcarch=arm64 ;;
+    armv7l|armv6l) karch=arm     ksrcarch=arm ;;
+    ppc64le)       karch=powerpc ksrcarch=powerpc ;;
+    *)             karch="$(uname -m)" ksrcarch="$karch" ;;
+  esac
+  export ARCH="$karch" SRCARCH="$ksrcarch"
+  if ( cd "$SRC" \
+      && LSMOD="$keepfile" perl scripts/kconfig/streamline_config.pl --localmodconfig "$SRC" Kconfig > .config.cizen-lite \
+      && mv -f .config .config.cizen-lite.old \
+      && mv -f .config.cizen-lite .config \
+      && make ARCH="$karch" olddefconfig \
+      && rm -f .config.cizen-lite.old ); then
     ok "Config lite generada: solo se compilarán los módulos en uso ($keep_lines en allowlist)."
   else
-    warn "--lite no pudo completar localmodconfig; se continúa con la config completa."
+    rc=$?
+    rm -f -- "$SRC/.config.cizen-lite"
+    fatal "make localmodconfig falló (rc=$rc). El modo lite es el ÚNICO modo de compilación: se aborta en lugar de compilar la config completa."
   fi
+  unset rc karch ksrcarch ARCH SRCARCH
   rm -f -- "$keepfile"
   unset _k keep_lines
 }
@@ -3154,7 +3227,7 @@ copy_packages_from_build() {
       *debug*|*headers*) continue ;;
     esac
     case "$(basename "$pkg")" in
-      ${CIZEN_PKGBASE}-*[cC]izen_v3-*.pkg.tar.zst) pkgs+=("$pkg") ;;
+      ${CIZEN_PKGBASE}-*[cC]izen_v3-*.pkg.tar.zst|${CIZEN_PKGBASE}-[0-9]*.pkg.tar.zst) pkgs+=("$pkg") ;;
     esac
   done
 
@@ -4121,9 +4194,10 @@ fi
 # Config Cizen primero; /proc/config.gz o /boot/config como fallback.
 choose_base_config
 
-# Modo lite: adelgazar la config para NO compilar los módulos que la poda
-# descartaría. Se hace ANTES de aplicar el perfil: los requests de ENABLE/
-# CRITICAL/DISABLE se re-fuerzan después y la auditoría valida el resultado.
+# Modo lite (único modo de compilación): adelgazar la config para NO compilar
+# los módulos que la poda descartaría. Se hace ANTES de aplicar el perfil: los
+# requests de ENABLE/CRITICAL/DISABLE se re-fuerzan después y la auditoría
+# valida el resultado.
 prepare_lite_config
 
 # Crear marcador justo antes de aplicar/configurar/compilar.
@@ -4349,6 +4423,13 @@ export PACMAN_PKGBASE="$CIZEN_PKGBASE"
 export CIZEN_PRUNE_MODULES="${CIZEN_PRUNE_MODULES:-$PRUNE_MODULES}"
 export CIZEN_PRUNE_SCRIPT="${CIZEN_PRUNE_SCRIPT:-$PRUNER_SCRIPT}"
 export CIZEN_KEEP_MODULES="${CIZEN_KEEP_MODULES:-}"
+# v27.25.5: makepkg aborta con "El grupo de paquetes ya se ha compilado" si en el
+# árbol quedan .pkg.tar.zst del mismo pkgver/pkgrel de una build previa. Se
+# retiran los obsoletos antes de empaquetar; esta ejecución los regenera.
+while IFS= read -r -d '' __oldpkg; do
+  rm -f -- "$__oldpkg"
+done < <(find "$SRC" -maxdepth 1 -type f -name "$CIZEN_PKGBASE-*.pkg.tar.zst" -print0)
+unset __oldpkg
 sudo_keepalive_start
 build_rc=0
 # --foreground: hace que make corra en el MISMO grupo de procesos de la
@@ -4655,7 +4736,7 @@ ${PUBLISH_REPO_MSG:+  ${PUBLISH_REPO_MSG}}
  Config base : $FINAL_CONFIG
  Build tmpfs : $TMPFS_ROOT (size=$TMPFS_SIZE)
  Podar       : $([ "${CIZEN_PRUNE_MODULES:-$PRUNE_MODULES}" = "1" ] && echo 'sí (solo módulos de este hardware)' || echo 'no')
- Lite        : $([ "$LITE_MODE" = true ] && echo 'sí (solo se compilan los módulos en uso; localmodconfig)' || echo 'no')
+ Lite        : sí (único modo: solo se compilan los módulos en uso; localmodconfig)
 ${SNAPSHOT_DESC:+ Snapshot   : $SNAPSHOT_DESC}
 ${VERIFY_ROLLBACK_FILE:+ Rollback  : $VERIFY_ROLLBACK_FILE}
 

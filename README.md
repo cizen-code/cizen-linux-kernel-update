@@ -64,7 +64,10 @@ con otras herramientas):
 | list-renames | `kernel-update.sh --list-renames` | Muestra el mapa de renombres de config |
 | absorb-rebels | `kernel-update.sh <ver> --absorb-rebels` | Mueve a `EXPECTED_REBELS` los símbolos que Kconfig conserva por dependencias, dejando el perfil limpio. Desde v27.25.1 el propio check lo ofrece interactivamente antes de compilar (si la auditoría reporta que Kconfig conserva desactivaciones), sin necesidad del flag |
 | no-prune | `kernel-update.sh <ver> --no-prune` | Desactiva la poda de módulos (default: activada) |
-| lite | `kernel-update.sh <ver> --lite` | Compila **solo** los módulos en uso (`make localmodconfig`) para acortar el build (default: desactivado, `CIZEN_LITE=1` por env) |
+
+El **modo lite es el ÚNICO modo de compilación** de esta suite (v27.25.4): la
+config siempre se adelgaza con `make localmodconfig` antes de compilar. No
+existe build "completo" ni toggle (`--no-lite`/`CIZEN_LITE` fueron eliminados).
 
 ### Poda de módulos
 
@@ -87,10 +90,10 @@ Los símbolos `=y` (built-in: `X86_NATIVE_CPU`, `BTRFS_FS`, `DRM_I915`,
 sin initramfs queda intacto. Configurable con `CIZEN_PRUNE_MODULES=0` (o
 `--no-prune`) y `CIZEN_PRUNE_SCRIPT` (ruta alternativa al podador).
 
-### Modo lite (`--lite`, v27.25.2)
+### Modo lite (único modo de compilación, v27.25.2 y ss.)
 
 La poda sola no acorta la **compilación**: el `make` compila todos los módulos
-`=m` y la poda solo evita que entren al paquete. El modo `--lite` ataca el
+`=m` y la poda solo evita que entren al paquete. El modo lite ataca el
 tiempo de build: ejecuta `make localmodconfig` sobre la config base con el
 input `/proc/modules + podar-modulos.sh --keep-list` (allowlist `CORE_KEEP` +
 `/etc/modules-load.d` + `CIZEN_KEEP_MODULES`), de modo que solo se **compilan**
@@ -99,7 +102,8 @@ real pasó de 5472 a 172 módulos `=m` (el build en frío pasa de ~19 min a una
 fracción). `make localmodconfig` es una herramienta oficial del kernel y no
 necesita haber compilado nada (regenera `.config` y corre `olddefconfig`).
 
-- `--lite` / `CIZEN_LITE=1`: activar; `--no-lite`/`CIZEN_LITE=0`: desactivar.
+- **Único modo** (v27.25.4): no hay toggle; todos los builds son del kernel
+  mínimo. La poda del paquete sigue activa siempre.
 - Se ejecuta **antes** de aplicar el perfil: los requests `ENABLE`/`CRITICAL`
   (fuerzan `=y`), `DISABLE` y la auditoría/validación siguen intactos, y los
   built-in (`=y`) nunca se tocan: el arranque sin initramfs queda garantizado.
@@ -111,9 +115,8 @@ necesita haber compilado nada (regenera `.config` y corre `olddefconfig`).
   allowlist durante el build no tendrá módulo compilado (p. ej. una unidad
   NTFS solo si está montada o en `CIZEN_KEEP_MODULES`). Es el precio del kernel
   mínimo; si luego necesitas un módulo, basta añadirlo y recompilar.
-- Nota sobre el base promovido: un `--check --lite` promueve como config base la
-  versión **delgada** (`profiles/linux-<ver>-cizen-v3.config`). Para volver a un
-  build "completo" (todos los módulos) borra ese base y lanza sin `--lite`.
+- El base promovido tras un `check` es la versión **delgada**
+  (`profiles/linux-<ver>-cizen-v3.config`), que es la que siempre se usa.
 
 ### Menú interactivo
 
