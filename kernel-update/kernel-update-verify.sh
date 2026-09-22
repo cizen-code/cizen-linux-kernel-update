@@ -278,6 +278,19 @@ for opt in "${OPTS_ENABLE[@]:-}"; do
       fi
       unset btf_run
     fi
+    # El perfil con el que se firmó el último build (last-build: profile_sha) debe
+    # coincidir con el que se valida ahora; si cambió, el build no refleja el
+    # perfil vigente y conviene reconstruir. Compatible con firmas antiguas que
+    # no traen profile_sha (campo vacío → se omite).
+    if [ -n "${profile_sha:-}" ]; then
+      local cur_sha=""
+      cur_sha="$(sha256sum "$profile" | cut -d' ' -f1 2>/dev/null || true)"
+      if [ -n "$cur_sha" ] && [ "$cur_sha" != "$profile_sha" ]; then
+        pc_warn "El perfil ($profile) cambió desde el último build (sha actual $cur_sha ≠ registrado $profile_sha): reconstruye el kernel para que refleje el perfil vigente."
+        issues=$((issues + 1))
+      fi
+      unset cur_sha
+    fi
   fi
   printf '%s\n' "${issues:-0}"
   return 0
@@ -294,7 +307,6 @@ boot_times() {
   [[ "$line" =~ ([0-9.]+)s\ \(loader\) ]] && load="${BASH_REMATCH[1]}"
   [[ "$line" =~ ([0-9.]+)s\ \(kernel\) ]] && ke="${BASH_REMATCH[1]}"
   [[ "$line" =~ ([0-9.]+)s\ \(userspace\) ]] && us="${BASH_REMATCH[1]}"
-  [[ "$line" =~ "=\ "[0-9.]+s$ ]] && tot="${BASH_REMATCH[1]}"
   line="${line%"${line##*[![:space:]]}"}" # sin espacios finales (el formato trae 's ')
   [[ "$line" =~ ([0-9.]+)s$ ]] && tot="${BASH_REMATCH[1]}"
   printf '%s %s %s %s %s\n' "$fw" "$load" "$ke" "$us" "$tot"

@@ -1,8 +1,22 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.25.8 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.25.9 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / XFS / systemd / KVM-libvirt / QEMU-OVMF
+#
+# CHANGELOG v27.25.9 (mantenimiento: prereq perl + fail-fast de CONFIG_DIR — 2026-09-22)
+#   - check_prerequisites: perl (lo exige streamline_config.pl del modo lite, el
+#     ÚNICO modo de compilación) entra al array tools y a TOOL_PKG ([perl]=perl)
+#     con auto-instalación igual que ccache/pahole.
+#   - Chequeo temprano ensure_config_dir_writable(): si CONFIG_DIR no existe y
+#     no puede crearse, o no es escribible, se aborta con mensaje claro ANTES de
+#     descargar/compilar. La promoción de la config base (promote_base_config) lo
+#     exige por diseño (CHANGELOG v27.21.17); sin este chequeo el fallo solo
+#     aparecía al final del check/build.
+#   - kernel-update-verify.sh: verifica que el perfil validado coincide con el que
+#     firmó el último build (profile_sha de last-build); si cambió, avisa y suma
+#     una incidencia (reconstrucción recomendada). Se elimina además una línea
+#     muerta del total de boot (regex que nunca matcheaba; el fallback la cubre).
 #
 # CHANGELOG v27.25.8 (tmpfs desmontado tras éxito — 2026-09-22)
 #   - Tras el flujo completo exitoso (compilación + instalación + UKI
@@ -648,7 +662,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.25.8"
+SCRIPT_VERSION="27.25.9"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -1541,7 +1555,7 @@ declare -A TOOL_PKG=(
   [gcc]=gcc           [gpg]=gnupg          [grep]=grep
   [head]=coreutils    [id]=coreutils       [ls]=coreutils
   [make]=make         [mktemp]=coreutils   [mount]=util-linux
-  [nproc]=coreutils   [pahole]=pahole     [rm]=coreutils
+  [nproc]=coreutils   [pahole]=pahole     [perl]=perl        [rm]=coreutils
   [sed]=sed
   [sleep]=coreutils   [sort]=coreutils     [stat]=coreutils
   [tar]=tar           [timeout]=coreutils  [tr]=coreutils
@@ -1587,7 +1601,7 @@ install_dependency_packages() {
 
 check_prerequisites() {
   local cmd pkg rc
-  local -a tools=(awk bash bc bison cat ccache cmp cp date df du find findmnt flex flock fuser grep gcc gpg head id ls make mktemp mount nproc pacman pahole rm sed sleep sort stat tar tr umount wget xargs xz timeout cizen-uki-sync)
+  local -a tools=(awk bash bc bison cat ccache cmp cp date df du find findmnt flex flock fuser grep gcc gpg head id ls make mktemp mount nproc pacman pahole perl rm sed sleep sort stat tar tr umount wget xargs xz timeout cizen-uki-sync)
   local -a missing_cmds=() missing_pkgs=()
 
   for cmd in "${tools[@]}"; do
@@ -1693,6 +1707,21 @@ get_avail_mb() {
 
 prepare_dirs() {
   mkdir -p "$KERNEL_BUILD_ROOT" "$TMPFS_ROOT" "$(dirname "$LOCK_FILE")"
+}
+
+# La promoción de la config base (promote_base_config) exige que CONFIG_DIR sea
+# escribible por el usuario que compila (CHANGELOG v27.21.17). Se verifica al
+# arrancar la operación para fallar rápido y con mensaje claro, ANTES de
+# descargar/compilar. Crea el directorio si no existía (equivale a prepare_dirs).
+ensure_config_dir_writable() {
+  if [ ! -e "$CONFIG_DIR" ]; then
+    mkdir -p -- "$CONFIG_DIR" 2>/dev/null || {
+      fatal "CONFIG_DIR no existe y no puede crearse: $CONFIG_DIR (apunta CIZEN_CONFIG_DIR a un directorio creable)."
+    }
+  fi
+  if [ ! -d "$CONFIG_DIR" ] || [ ! -w "$CONFIG_DIR" ]; then
+    fatal "CONFIG_DIR no es escribible por $(id -un): $CONFIG_DIR. La promoción de la config base la exige; dale ownership (chown) o apunta CIZEN_CONFIG_DIR a un directorio propio."
+  fi
 }
 
 tmpfs_is_mounted() {
@@ -4099,6 +4128,7 @@ if [ "$DO_CHANGELOG" = true ]; then
 fi
 
 prepare_dirs
+ensure_config_dir_writable
 check_prerequisites
 
 # BTF (opcional): necesita pahole para el .BTF. Si no se consigue se degrada a
