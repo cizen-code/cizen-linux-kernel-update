@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.25.7 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.25.8 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / systemd / KVM-libvirt / QEMU-OVMF
+#
+# CHANGELOG v27.25.8 (tmpfs desmontado tras éxito — 2026-09-22)
+#   - Tras el flujo completo exitoso (compilación + instalación + UKI
+#     sincronizada) ya no hay motivo para conservar el tmpfs de compilación:
+#     ahora se desmonta (sudo umount $TMPFS_ROOT) en cleanup_success.
+#   - Override: CIZEN_KEEP_TMPFS=1 conserva el comportamiento anterior
+#     (reutilización del árbol/ccache entre ejecuciones y diagnóstico).
+#   - Los flujos parciales (solo check) NO desmontan: kcheck prepara el
+#     entorno y kbuild lo reutiliza. En error/interrupción tampoco (diagnóstico).
 #
 # CHANGELOG v27.25.7 (cizen-uki-sync: sin initramfs residuo — 2026-09-22)
 #   - Tras integrar /boot/initramfs-<pkgbase>.img como sección .initrd de la UKI
@@ -590,6 +599,7 @@
 #   se adelgaza con make localmodconfig (módulos cargados + allowlist del podador);
 #   no existe --no-lite ni CIZEN_LITE. El paquete se poda igual siempre.
 #   CIZEN_KEEP_MODULES="kvm_intel,vfio_pci" ./kernel-update.sh <versión>  # módulos extra a conservar en la poda
+#   CIZEN_KEEP_TMPFS=1 ./kernel-update.sh <versión>        # conservar el tmpfs tras éxito (defecto: se desmonta)
 #   ./kernel-update.sh <versión> --patch bore                 # framework de parches
 #   ./kernel-update.sh <versión> --bore                       # alias de --patch bore
 #   CIZEN_PATCHES="bore" ./kernel-update.sh <versión>         # parches por env
@@ -638,7 +648,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.25.7"
+SCRIPT_VERSION="27.25.8"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -681,6 +691,13 @@ TMPFS_EXISTING_SRC_MIN_FREE_MB="${KERNEL_TMPFS_EXISTING_SRC_MIN_FREE_MB:-2048}"
 TMPFS_ROOT="${KERNEL_TMPFS_ROOT:-/tmp/cizen-kernel-build}"
 TMPFS_MOUNTED=false
 TMPFS_CREATED_BY_SCRIPT=false
+# Tras el flujo completo exitoso (compilación + instalación + UKI) el tmpfs ya
+# no tiene motivo de existir y se desmonta. CIZEN_KEEP_TMPFS=1 conserva el
+# comportamiento anterior (reutilización del árbol entre ejecuciones).
+CIZEN_KEEP_TMPFS="${CIZEN_KEEP_TMPFS:-0}"
+# Se marca solo al terminar el pipeline completo con éxito (instalación + UKI
+# sincronizada); los flujos parciales (p. ej. solo check) no desmontan.
+FULL_PIPELINE_OK=false
 # Deliberadamente NO derivado de $KERNEL_BUILD_ROOT: el lock es global a
 # propósito, porque solo puede instalarse un kernel a la vez en este
 # sistema sin importar con qué KERNEL_BUILD_ROOT se lance cada ejecución.
@@ -1765,13 +1782,31 @@ prepare_tmpfs_build() {
 unmount_tmpfs_build() {
   [ "$TMPFS_MOUNTED" = true ] || return 0
 
-  # El tmpfs dedicado se conserva montado deliberadamente entre ejecuciones.
-  # Esto permite que un `kcheck` prepare el entorno y que el `kbuild` siguiente
+  # Tras un flujo completo exitoso el tmpfs ya no hace falta: se desmonta.
+  # CIZEN_KEEP_TMPFS=1 lo conserva (reutilización del árbol, diagnóstico).
+  # Los flujos parciales (p. ej. solo check) nunca desmontan, para que un
+  # kcheck prepare el entorno y el kbuild siguiente lo reutilice.
+  if [ "$FULL_PIPELINE_OK" = true ] && [ "$CIZEN_KEEP_TMPFS" != "1" ]; then
+    if tmpfs_is_mounted; then
+      log "Desmontando tmpfs de compilación (flujo completo exitoso): $TMPFS_ROOT"
+      if sudo umount "$TMPFS_ROOT"; then
+        ok "tmpfs desmontado: $TMPFS_ROOT"
+        TMPFS_MOUNTED=false
+        TMPFS_CREATED_BY_SCRIPT=false
+        return 0
+      else
+        warn "No se pudo desmontar $TMPFS_ROOT (¿proceso usándolo?); queda conservado. Para desmontarlo: sudo umount $TMPFS_ROOT"
+      fi
+    fi
+  fi
+
+  # Por defecto el tmpfs dedicado se conserva montado deliberadamente entre
+  # ejecuciones, para que un kcheck prepare el entorno y el kbuild siguiente
   # lo reutilice sin desmontar/recrear el filesystem temporal.
   if ! tmpfs_is_mounted; then
     TMPFS_MOUNTED=false
     TMPFS_CREATED_BY_SCRIPT=false
-fi
+  fi
 }
 
 cleanup_kernel_cache() {
@@ -4692,6 +4727,7 @@ log "Sincronizando UKI..."
 sudo cizen-uki-sync
 ensure_cizen_efi_updated
 ok "UKI sincronizado"
+FULL_PIPELINE_OK=true
 
 prune_stale_packages
 
