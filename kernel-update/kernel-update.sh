@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.26.0 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.27.0 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / XFS / systemd / KVM-libvirt / QEMU-OVMF
 #
@@ -99,7 +99,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.26.0"
+SCRIPT_VERSION="27.27.0"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo

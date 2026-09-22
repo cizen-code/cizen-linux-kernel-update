@@ -5,6 +5,26 @@ changelog vive en este archivo (no en la cabecera del motor);
 `kernel-update.sh --changelog` añade aquí el borrador del siguiente
 release. Formato inspirado en [Keep a Changelog](https://keepachangelog.com/es/1.1.0/).
 
+## [27.27.0] - 2026-09-22
+
+poda: la poda física de módulos pasa a ser efectiva + recorte del allowlist
+
+- `podar-modulos.sh` v1.1.0: si el árbol aún no tiene `modules.dep`/
+  `modules.alias` (p.ej. dentro de `package()` del PKGBUILD, justo tras
+  `modules_install` y antes del `depmod` de la receta), el podador los genera
+  con `depmod` antes de podar. Antes el guard abortaba y `|| true` conservaba
+  el conjunto compilado completo: la poda física era un no-op. Ahora el
+  paquete se adelgaza también en ficheros (verificable en el árbol instalado).
+- Allowlist (`CORE_KEEP`) recortada tras auditoría del árbol instalado:
+  fuera térmica Intel no cargada (`processor_thermal_*`,
+  `int340x_thermal_zone`, `acpi_thermal_rel`), `md_mod` + `lz4hc_compress`
+  (sin RAID ni uso), `btmtk`/`rfcomm` (el BT presente es CSR via btusb) e
+  `i2c_hid`/`i2c_mux` (sin HID I2C en este desktop; el bus sigue con
+  `i2c_i801`/`i2c_smbus`/`i2c_dev`/`i2c_algo_bit`).
+- Aplicado en caliente sobre el kernel 7.2.7 instalado (59 de 177 módulos
+  retirados, ~2.9 MB; `depmod` regenerado): se conserva cargado + hardware
+  presente + allowlist + dependencias.
+
 ## [27.26.0] - 2026-09-22
 
 reestructuración: el changelog pasa a un archivo dedicado

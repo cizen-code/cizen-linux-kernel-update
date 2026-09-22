@@ -16,7 +16,7 @@ el borrador del siguiente release y bumpea banner + `SCRIPT_VERSION`.
 ├── CHANGELOG.md                  # Historial de versiones (v27.26.0+)
 ├── kernel-update/                 # Flujo de compilación del kernel Cizen
 │   ├── kernel-update.sh           # Motor principal (descarga→Kconfig→build→pacman→UKI)
-│   ├── podar-modulos.sh           # Poda de módulos del paquete (+ --keep-list para --lite) |
+│   ├── podar-modulos.sh           # Poda de módulos del paquete (+ --keep-list para --lite)
 │   ├── kernel-update-notify.sh    # Notificador de releases nuevas de kernel.org
 │   ├── kernel-update-menu.sh      # Menú interactivo de modos (check/build/fast)
 │   └── profiles/                  # Perfiles + config base (linux-*-cizen-v3.config)
@@ -50,7 +50,9 @@ con otras herramientas):
 
 > `podar-modulos.sh` debe instalarse ejecutable junto al resto de la suite
 > (se copia igual que `kernel-update.sh`); si falta o no es ejecutable, el
-> build continúa sin poda (aviso claro, nunca falla).
+> build continúa sin poda (aviso claro, nunca falla). Desde v27.27.0 la poda
+> física retira también del paquete los módulos compilados pero sin uso
+> (si falta `modules.dep`/`modules.alias` en `package()` los genera: v1.1.0).
 
 - Config base del kernel: `linux-<versión>-cizen-v3.config` dentro de
   `/usr/local/bin/kernel-update/profiles/` (override: `CIZEN_CONFIG_DIR`).

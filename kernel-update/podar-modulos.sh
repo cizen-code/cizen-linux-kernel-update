@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# podar-modulos.sh — Poda de módulos del kernel Cizen v1.0.1
+# podar-modulos.sh — Poda de módulos del kernel Cizen v1.1.0
 #
 # Elimina de un árbol de módulos (lib/modules/<release>) los módulos que este
 # hardware no necesita, conservando únicamente:
@@ -15,6 +15,16 @@
 #   conservado y regenera los índices con depmod. Los módulos =y (built-in)
 #   no tienen archivo .ko: la poda nunca los afecta - el arranque sin UKI
 #   initramfs depende de ellos y el perfil los fija como boot_critical.
+#
+# v1.1.0 (2026-09-22): si el árbol no tiene aún modules.dep/modules.alias
+# (p.ej. dentro de package() del PKGBUILD, justo tras modules_install y antes
+# del depmod de la receta), se generan aquí con depmod antes de podar — antes
+# el guard abortaba y `|| true` conservaba el conjunto compilado completo
+# (la poda física era inefectiva). Allowlist recortada (CORE_KEEP): fuera
+# térmica Intel no cargada (processor_thermal_*, int340x_thermal_zone,
+# acpi_thermal_rel), md_mod + lz4hc_compress (sin RAID ni uso), btmtk/rfcomm
+# (solo BT CSR presente usa btusb) e i2c_hid/i2c_mux (sin HID I2C en este
+# desktop y el I2C bus sigue con i2c_i801/smbus/dev/algo_bit).
 #
 # Uso:
 #   podar-modulos.sh <lib/modules/<release>> [keep-extra,separado,por,comas]
@@ -57,6 +67,17 @@ if [ "$KEEP_LIST_ONLY" = false ]; then
   if ! command -v depmod >/dev/null 2>&1; then
     echo "AVISO: depmod no está disponible; se omite la poda y se conserva el conjunto completo." >&2
     exit 1
+  fi
+  # v1.1.0: si el árbol aún no tiene índices (package() tras modules_install,
+  # antes del depmod de la receta), generarlos aquí; la poda los refresca en el
+  # paso final de todas formas.
+  if [ ! -f "$MODDIR/modules.dep" ] || [ ! -f "$MODDIR/modules.alias" ]; then
+    if depmod -b "$ROOT" "$RELEASE" >/dev/null 2>&1; then
+      echo "Índices generados por depmod para $RELEASE (no existían)." >&2
+    else
+      echo "AVISO: depmod falló al generar los índices de $RELEASE; se omite la poda." >&2
+      exit 1
+    fi
   fi
   if [ ! -f "$MODDIR/modules.dep" ] || [ ! -f "$MODDIR/modules.alias" ]; then
     echo "AVISO: $MODDIR no contiene modules.dep/modules.alias; se omite la poda." >&2
@@ -161,11 +182,11 @@ CORE_KEEP=(
   # USB / almacenamiento (Ventoy, HID, BT)
   xhci_pci xhci_hcd usbcore usb_common usb_storage uas usbhid hid hid_generic
   ehci_hcd ehci_pci ohci_hcd ohci_pci uhci_hcd
-  bluetooth btusb btbcm btrtl btmtk btintel bnep rfcomm rfkill
+  bluetooth btusb btbcm btrtl btintel bnep rfkill
   # FS y bloques (btrfs es =y; los de USB/Particiones como módulo)
-  btrfs isofs exfat vfat fat xfs zram zsmalloc loop md_mod
+  btrfs isofs exfat vfat fat xfs zram zsmalloc loop
   # Integridad / crypto usados por los FS y el arranque
-  crc32c_intel zstd_compress lz4_compress lz4hc_compress
+  crc32c_intel zstd_compress lz4_compress
   ghash_clmulni_intel aesni_intel polyval_clmulni polyval_generic
   # Virtualización KVM/QEMU (aunque KVM_SMM es =y, kvm/kvm_intel van como m)
   kvm kvm_intel irqbypass vfio vfio_iommu_type1 vfio_pci
@@ -173,15 +194,15 @@ CORE_KEEP=(
   # Plataforma Dell / WMI
   dell_wmi dell_smbios dell_wmi_aio dell_wmi_descriptor dell_smm_hwmon
   dcdbas wmi wmi_bmof
-  # Térmica / power / RAPL
+  # Térmica / power / RAPL (se conservan las cargadas: RAPL, coretemp,
+  # x86_pkg_temp_thermal; fuera la térmica int340x/processor_thermal no usada)
   intel_rapl_msr intel_rapl_common intel_rapl_uncore rapl
-  processor_thermal_device_pci processor_thermal_device int340x_thermal_zone
   intel_hid intel_vbtn x86_pkg_temp_thermal intel_tcc_cooling coretemp
   iTCO_wdt iTCO_vendor_support intel_pmc_core intel_pmc_bxt intel_vsec
   intel_uncore intel_cstate intel_oc_wdt intel_lpss_pci intel_lpss idma64
-  acpi_pad acpi_thermal_rel
+  acpi_pad
   # I2C / otros buses que lsmod pueda perder entre reinicios
-  i2c_i801 i2c_smbus i2c_mux i2c_dev i2c_algo_bit i2c_hid
+  i2c_i801 i2c_smbus i2c_dev i2c_algo_bit
   # Input / gaming (perfil)
   joydev xpad hid_sony hid_playstation hid_nintendo hid_steam uhid hidp
   mac_hid mousedev pcspkr sparse_keymap
