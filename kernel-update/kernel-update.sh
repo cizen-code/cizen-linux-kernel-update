@@ -1,8 +1,20 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.25.5 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.25.6 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / systemd / KVM-libvirt / QEMU-OVMF
+#
+# CHANGELOG v27.25.6 (fix verificación del paquete generado + cizen-uki-sync — 2026-09-21)
+#   - La validación exigía que el nombre coincidiera con PKGVER_BASE (con
+#     sufijo _cizen_v3), pero la plantilla genera el pkgver desde KERNELRELEASE
+#     (7.2.7, sin sufijo): el build (25 min) terminaba con la identificación
+#     fallida y sin instalar. Ahora se valida contra la metadata interna real
+#     (.PKGINFO: pkgname + pkgver 7.2.7-1) y su pkgrel, y se instala.
+#   - cizen-uki-sync usaba `local -a targets=()` en el cuerpo principal (fuera de
+#     cualquier función): bash aborta con "local: can only be used in a function"
+#     y, con set -e, el flujo de instalación moría dejando el tmpfs montado. Ahora
+#     targets es variable global del cuerpo principal; la UKI se genera y escribe
+#     de forma atómica en el ESP.
 #
 # CHANGELOG v27.25.5 (purga automática del enlace + BTF off por defecto — 2026-09-21)
 #   - Al reutilizar el árbol en tmpfs, si el espacio libre queda por debajo del
@@ -618,7 +630,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.25.5"
+SCRIPT_VERSION="27.25.6"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -3274,13 +3286,16 @@ copy_packages_from_build() {
     return 1
   fi
 
-  if [[ "$(basename "$PKG")" != "${CIZEN_PKGBASE}-${PKGVER_BASE}-${PKGREL}-x86_64.pkg.tar.zst" ]]; then
-    err "El nombre del paquete ($(basename "$PKG")) no coincide con el pkgrel esperado ($PKGREL)."
+  # PKG_VERSION del .PKGINFO trae el pkgver real con su pkgrel (p. ej. 7.2.7-1,
+  # NO "7.2.7_cizen_v3": esa derivación está en PKGVER_BASE pero la plantilla
+  # genera el pkgver desde KERNELRELEASE sin el sufijo). Se valida contra la
+  # metadata interna (fuente de verdad), no contra el nombre derivado por el motor.
+  if [[ "$(basename "$PKG")" != "${CIZEN_PKGBASE}-${PKG_VERSION}-x86_64.pkg.tar.zst" ]]; then
+    err "El nombre del paquete ($(basename "$PKG")) no coincide con pkgname+pkgver del .PKGINFO."
     return 1
   fi
-
-  if [[ "$PKG_VERSION" != "$PKGVER_BASE-$PKGREL" ]]; then
-    err "La versión interna del paquete ($PKG_VERSION) no coincide con la esperada ($PKGVER_BASE-$PKGREL)."
+  if [[ "${PKG_VERSION##*-}" != "$PKGREL" ]]; then
+    err "El pkgrel interno del paquete ($PKG_VERSION) no coincide con el esperado ($PKGREL)."
     return 1
   fi
 

@@ -220,7 +220,7 @@ ok "Kernel Cizen instalado: $kernel"
 cmdline_file="$(prepare_cmdline_file)" || fatal "No pude preparar la línea de comandos de arranque."
 info "cmdline: $(<"$cmdline_file")"
 
-local -a targets=()
+targets=()
 while IFS= read -r t; do
   [ -n "$t" ] && targets+=("$t")
 done < <(find_uki_targets "$CIZEN_UKI_NAME" || true)
