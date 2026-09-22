@@ -2,7 +2,7 @@
 # ============================================================
 # kernel-update.sh — Cizen v27.25.8 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
-# 12 GiB DDR4 / Btrfs / systemd / KVM-libvirt / QEMU-OVMF
+# 12 GiB DDR4 / Btrfs / XFS / systemd / KVM-libvirt / QEMU-OVMF
 #
 # CHANGELOG v27.25.8 (tmpfs desmontado tras éxito — 2026-09-22)
 #   - Tras el flujo completo exitoso (compilación + instalación + UKI
