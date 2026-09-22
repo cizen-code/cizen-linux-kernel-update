@@ -23,6 +23,10 @@ poda: la poda física de módulos pasa a ser efectiva + recorte del allowlist
   bus sigue con `i2c_i801`/`i2c_smbus`/`i2c_dev`/`i2c_algo_bit`). `btintel`
   se mantiene explícito en `CORE_KEEP` para no perder BT si arrancas sin él
   cargado.
+- Poda aplicada en caliente sobre el kernel 7.2.7 instalado: 1 módulo
+  retirado (`failover.ko.zst`, ~5 KB), 68 conservados, árbol final de 20 MB;
+  `depmod` regenerado. Se conserva lo cargado + hardware presente + allowlist
+  + dependencias (BT, audio, red, nftables intactos).
 
 ## [27.26.0] - 2026-09-22
 
