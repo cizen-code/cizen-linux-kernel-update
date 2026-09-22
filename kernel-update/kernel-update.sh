@@ -60,7 +60,7 @@
 #   ./kernel-update.sh [versión] --publish-repo               # publicar pkg a repo pacman local
 #   CIZEN_PUBLISH_REPO=/srv/repo ./kernel-update.sh <versión> # dónde publicar (default /var/lib/kernel-update/repo)
 #   ./kernel-update.sh --selftest                             # autoevaluación interna
-#   ./kernel-update.sh --changelog                            # bump versión + borrador de changelog
+#   ./kernel-update.sh --changelog                            # bump versión + borrador en CHANGELOG.md
 #   JOBS=3 ./kernel-update.sh <versión>
 #   CIZEN_DOWNLOAD_PARALLEL=8 ./kernel-update.sh <versión>   # conexiones paralelas (aria2c)
 #   CIZEN_DOWNLOADER=wget ./kernel-update.sh <versión>       # fuerza el wget clásico

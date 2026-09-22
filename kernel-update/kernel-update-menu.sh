@@ -51,13 +51,13 @@ echo "    ${G}4${N}) buildfast   compilar e instalar a plena prioridad"
 echo "    ${G}5${N}) force       recompilar forzado (--force)"
 echo
 echo "  ${C}BORE / parches (v27.24.0, framework de parches):${N}"
-echo "    ${G}7${N}) build bore  compilar con BORE (prioridad baja)"
-echo "    ${G}8${N}) boresfast   compilar con BORE a plena prioridad"
+echo "    ${G}7${N}) buildbore     compilar con BORE (prioridad baja)"
+echo "    ${G}8${N}) buildborefast compilar con BORE a plena prioridad"
 echo
 echo "  ${C}Configuración y mantenimiento:${N}"
 echo "    ${G}10${N}) kcfg       editar la config validada con menuconfig (--menuconfig)"
 echo "    ${G}11${N}) selftest   autoevaluación del motor (--selftest)"
-echo "    ${G}12${N}) changelog  bumpear versión + borrador de changelog (--changelog)"
+echo "    ${G}12${N}) changelog  bumpear versión + borrador en CHANGELOG.md (--changelog)"
 echo
 echo "  ${C}Consulta:${N}"
 echo "    ${G}6${N}) check-update consultar última release estable (sin modificar nada)"
