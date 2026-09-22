@@ -50,7 +50,12 @@ con otras herramientas):
 
 > `podar-modulos.sh` debe instalarse ejecutable junto al resto de la suite
 > (se copia igual que `kernel-update.sh`); si falta o no es ejecutable, el
-> build continúa sin poda (aviso claro, nunca falla). Desde v27.27.0 la poda
+> build continúa sin poda (aviso claro, nunca falla). Si el árbol aún no
+> tiene `modules.dep`/`modules.alias` (p. ej. dentro de `package()` justo
+> tras `modules_install` y antes del `depmod` de la receta), desde v27.27.0
+> el podador los genera con `depmod` y poda igual; la poda final los
+> regenera. Para podar en caliente un árbol ya instalado:
+> `sudo /usr/local/bin/kernel-update/podar-modulos.sh /usr/lib/modules/<rel>` Desde v27.27.0 la poda
 > física retira también del paquete los módulos compilados pero sin uso
 > (si falta `modules.dep`/`modules.alias` en `package()` los genera: v1.1.0).
 
