@@ -3132,9 +3132,26 @@ done < <(find_cizen_uki_targets "$CIZEN_UKI_NAME" || true)
 
 build_cizen_uki() {
     local kernel="$1" cmdline_file="$2" out="$3"
-    local cmdline_text ukify_bin="" stub s
+    local cmdline_text ukify_bin="" stub s osrel_file rel
 
     cmdline_text="$(<"$cmdline_file")"
+
+    # os-release propio embebido en la UKI (.osrel) para que systemd-boot
+    # muestre "Linux 7.2.7-cizen-v3" en el menú. Sin --os-release, ukify
+    # incrusta /etc/os-release por defecto y el menú mostraría el nombre del
+    # sistema ("Arch Linux (rolling)").
+    rel="${VERSION}${LOCALVERSION_SUFFIX}"
+    osrel_file="$(mktemp /tmp/cizen-osrel.XXXXXX)" || {
+        err "No pude crear el os-release temporal."
+        return 1
+    }
+    {
+        printf 'NAME="Linux"\n'
+        printf 'ID=linux\n'
+        printf 'VERSION="%s"\n' "$rel"
+        printf 'VERSION_ID="%s"\n' "$rel"
+        printf 'PRETTY_NAME="Linux %s"\n' "$rel"
+    } > "$osrel_file"
 
     ukify_bin="$(command -v ukify 2>/dev/null || true)"
     if [ -z "$ukify_bin" ] && [ -x /usr/lib/systemd/ukify ]; then
@@ -3142,8 +3159,15 @@ build_cizen_uki() {
     fi
 
     if [ -n "$ukify_bin" ]; then
-        local -a args=("$ukify_bin" build --linux="$kernel" --cmdline="$cmdline_text" --output="$out")
+        local -a args=(
+            "$ukify_bin" build
+            --linux="$kernel"
+            --cmdline="$cmdline_text"
+            --os-release=@"$osrel_file"
+            --output="$out"
+        )
         if "${args[@]}"; then
+            rm -f "$osrel_file"
             return 0
         fi
         warn "ukify falló; intento fallback con objcopy."
@@ -3161,13 +3185,17 @@ build_cizen_uki() {
         local -a objargs=(
             --add-section .cmdline="$cmdline_file"
             --set-section-flags .cmdline=noload,readonly
+            --add-section .osrel="$osrel_file"
+            --set-section-flags .osrel=noload,readonly
             --add-section .linux="$kernel"
             --set-section-flags .linux=noload,readonly
         )
         if objcopy "${objargs[@]}" "$stub" "$out"; then
+            rm -f "$osrel_file"
             return 0
         fi
     fi
+    [ -n "$osrel_file" ] && rm -f "$osrel_file"
 
     if [ "${CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK}" = 1 ]; then
         cp -f "$kernel" "$out"
