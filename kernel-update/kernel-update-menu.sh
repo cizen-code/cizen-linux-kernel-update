@@ -1,76 +1,116 @@
 #!/usr/bin/env bash
 # ============================================================
 # kernel-update-menu.sh — Menú interactivo para kernel-update.sh
-# Abre un menú con los modos del script: validación, compilación,
-# consulta. Llamado por kernel-update-notify.sh vía arch-open-terminal.sh,
-# o directamente desde una terminal.
+# Validación, compilación, BORE, consulta y mantenimiento del motor.
 #
 # Uso: ./kernel-update-menu.sh [remote]
-#   remote = versión estable de kernel.org a mostrar en el encabezado
+#   remote = versión estable a mostrar (p. ej. la que pasa
+#            kernel-update-notify.sh). Sin argumento y con terminal
+#            interactiva, el menú consulta kernel.org (máx. 6 s) y
+#            muestra la stable; sin conexión indica la opción 6.
 # Opciones: 1-5 validación/build (check/checkfast/build/buildfast/force),
-# 6 check-update, 7/8 BORE (--patch bore), 9 rollback, 10 kcfg, 11 selftest,
-# 12 changelog, 0 salir.
+# 6 check-update, 7/8 BORE (--patch bore), 9 rollback, 10 kcfg,
+# 11 selftest, 12 changelog, 0 salir.
 # ============================================================
 set -uo pipefail
 
 SCRIPT="${CIZEN_KERNEL_SCRIPT:-/usr/local/bin/kernel-update/kernel-update.sh}"
-REMOTE="${1:-}"
+URL="${KERNEL_RELEASES_JSON_URL:-https://www.kernel.org/releases.json}"
 
 if [ ! -x "$SCRIPT" ]; then
   echo "Error: $SCRIPT no encontrado o no ejecutable." >&2
   exit 1
 fi
 
-# Colores (solo en terminal interactiva)
+# ── Colores (solo terminal interactiva) ───────────────────────
 if [ -t 1 ]; then
-  G=$'\033[0;32m'; Y=$'\033[1;33m'; C=$'\033[0;36m'; R=$'\033[0;31m'; N=$'\033[0m'
+  B=$'\033[1;36m'   # borde
+  C=$'\033[1;36m'   # números / secciones
+  G=$'\033[0;32m'   # instalado
+  Y=$'\033[1;33m'   # stable
+  H=$'\033[1m'      # negrita
+  N=$'\033[0m'
 else
-  G=""; Y=""; C=""; R=""; N=""
+  B=""; C=""; G=""; Y=""; H=""; N=""
+fi
+R=$'\033[0;31m'     # error (se muestra tras una opción inválida)
+
+# ── Auto-descubrimiento de la última stable ───────────────────
+discover_remote() {
+  local latest=""
+  if command -v curl >/dev/null 2>&1; then
+    latest="$(curl -fsS --max-time 6 "$URL" 2>/dev/null | tr '\n' ' ' | sed -n 's/.*"latest_stable"[[:space:]]*:[[:space:]]*{[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^" ]*\)"[[:space:]]*}.*/\1/p')"
+  fi
+  if [ -z "$latest" ] && command -v wget >/dev/null 2>&1; then
+    latest="$(wget -qO- --timeout=6 --tries=1 "$URL" 2>/dev/null | tr '\n' ' ' | sed -n 's/.*"latest_stable"[[:space:]]*:[[:space:]]*{[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^" ]*\)"[[:space:]]*}.*/\1/p')"
+  fi
+  [ -n "$latest" ] || return 1
+  [[ "$latest" =~ ^[0-9]+\.[0-9]+ ]] || return 1
+  printf '%s\n' "$latest"
+}
+
+REMOTE="${1:-}"
+OFFLINE=false
+if [ -z "$REMOTE" ] && [ -t 0 ]; then
+  REMOTE="$(discover_remote 2>/dev/null || true)"
+  [ -z "$REMOTE" ] && OFFLINE=true
 fi
 
 LOCAL="$(uname -r)"
+MOTOR_VER="$(awk -F'"' '/^SCRIPT_VERSION=/{print $2; exit}' "$SCRIPT" 2>/dev/null || true)"
+[ -n "$MOTOR_VER" ] && MOTOR_VER=" v$MOTOR_VER"
 
-echo "${C}═══════════════════════════════════════════════════${N}"
-echo "${C}  kernel-update.sh — Menú de compilación${N}"
-echo "${C}═══════════════════════════════════════════════════${N}"
-echo
-printf "  Instalado:  %b%s%b\n" "$G" "$LOCAL" "$N"
+# ── Cabecera ──────────────────────────────────────────────────
+W=46
+LINE="$(printf '%*s' "$W" '' | sed 's/ /─/g')"
+top()   { printf '%b┌%s┐%b\n' "$B" "$LINE" "$N"; }
+mid()   { printf '%b├%s┤%b\n' "$B" "$LINE" "$N"; }
+bot()   { printf '%b└%s┘%b\n' "$B" "$LINE" "$N"; }
+boxrow(){ # $1 = texto ya coloreado; completa el ancho interior W
+  local vis pad
+  vis="$(printf '%s' "$1" | sed 's/\x1b\[[0-9;]*m//g')"
+  pad=$(( W - ${#vis} ))
+  printf '%b│%b%s%b%*s%b│%b\n' "$B" "$N" "$1" "$N" "$pad" '' "$B" "$N"
+}
+
+top
+boxrow "  ${C}●${N}${H}  Kernel Update · Cizen${N}      ${G}motor${N}${MOTOR_VER}"
+mid
 if [ -n "$REMOTE" ]; then
-  printf "  Stable:     %b%s%b\n" "$Y" "$REMOTE" "$N"
+  boxrow "  ${G}instalado${N}  $LOCAL     ${Y}stable${N}   $REMOTE"
 else
-  echo "  Stable:     (desconocida — opción 6 para consultar)"
+  boxrow "  ${G}instalado${N}  $LOCAL     ${Y}stable${N}   desconocida"
+  boxrow "  ($([ "$OFFLINE" = true ] && printf 'sin conexión — ' )opción 6 para consultar)"
 fi
+bot
 echo
-echo "  ${C}Validación:${N}"
-echo "    ${G}1${N}) check       validar config, ofrecer compilar después (prioridad baja)"
-echo "    ${G}2${N}) checkfast   validar config a plena prioridad (sin nice/ionice)"
+
+opt() { # $1=número $2=nombre $3=descripción
+  printf '%b%5s%b)  %-13s %s\n' "$C" "$1" "$N" "$2" "$3"
+}
+
+echo "  ${H}Validación${N}"
+opt 1 "check"       "validar config (ofrece compilar · baja)"
+opt 2 "checkfast"   "validar config · alta prioridad"
 echo
-echo "  ${C}Compilación:${N}"
-echo "    ${G}3${N}) build       compilar e instalar directamente (prioridad baja)"
-echo "    ${G}4${N}) buildfast   compilar e instalar a plena prioridad"
-echo "    ${G}5${N}) force       recompilar forzado (--force)"
+echo "  ${H}Compilación${N}"
+opt 3 "build"       "compilar + instalar · baja"
+opt 4 "buildfast"   "compilar + instalar · alta"
+opt 5 "force"       "recompilar forzado (--force)"
+opt 7 "buildbore"   "compilar con BORE · baja"
+opt 8 "buildborefast" "compilar con BORE · alta"
 echo
-echo "  ${C}BORE / parches (v27.24.0, framework de parches):${N}"
-echo "    ${G}7${N}) buildbore     compilar con BORE (prioridad baja)"
-echo "    ${G}8${N}) buildborefast compilar con BORE a plena prioridad"
+echo "  ${H}Mantenimiento${N}"
+opt 10 "kcfg"       "editar config con menuconfig"
+opt 11 "selftest"   "autoevaluación del motor"
+opt 12 "changelog"  "bump versión + borrador → CHANGELOG.md"
 echo
-echo "  ${C}Configuración y mantenimiento:${N}"
-echo "    ${G}10${N}) kcfg       editar la config validada con menuconfig (--menuconfig)"
-echo "    ${G}11${N}) selftest   autoevaluación del motor (--selftest)"
-echo "    ${G}12${N}) changelog  bumpear versión + borrador en CHANGELOG.md (--changelog)"
-echo
-echo "  ${C}Consulta:${N}"
-echo "    ${G}6${N}) check-update consultar última release estable (sin modificar nada)"
-echo
-echo "  ${C}Post-instalación:${N}"
-echo "    ${G}9${N}) rollback   restaurar el kernel previo archivado por la última instalación"
-echo "          (la verificación post-boot corre sola tras el arranque: kernel-update-verify)"
-echo
-echo "    ${G}0${N}) salir"
-echo
+echo "  ${H}Consulta y sistema${N}"
+opt 6 "check-update" "última stable de kernel.org (sin cambios)"
+opt 9 "rollback"    "restaurar kernel previo"
 
 while true; do
-  read -r -p "  Selección [0-12]: " choice
+  read -r -p "  [0-12] > " choice
   case "$choice" in
     1) exec "$SCRIPT" --absorb-rebels --check ;;
     2) CIZEN_BUILD_PRIORITY=normal exec "$SCRIPT" --absorb-rebels --check ;;
@@ -85,6 +125,6 @@ while true; do
     11) exec "$SCRIPT" --selftest ;;
     12) exec "$SCRIPT" --changelog ;;
     0) echo "  Saliendo."; exit 0 ;;
-    *) printf "  %bOpción no válida.%b\n" "$R" "$N" ;;
+    *) printf '  %bOpción no válida: %s%b\n' "$R" "$choice" "$N" ;;
   esac
 done

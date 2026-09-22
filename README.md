@@ -133,6 +133,10 @@ necesita haber compilado nada (regenera `.config` y corre `olddefconfig`).
 /usr/local/bin/kernel-update/kernel-update-menu.sh <remote> # con versión remota en el encabezado
 ```
 
+Sin argumento y en terminal interactiva, el menú consulta `latest_stable` de
+kernel.org (máx. 6 s); sin conexión muestra `desconocida` y remite a la opción 6
+(`--check-update`).
+
 Variables de entorno para override:
 
 - `CIZEN_KERNEL_SCRIPT` — ruta de `kernel-update.sh`
