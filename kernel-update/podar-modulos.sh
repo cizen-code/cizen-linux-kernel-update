@@ -23,8 +23,9 @@
 # (la poda física era inefectiva). Allowlist recortada (CORE_KEEP): fuera
 # térmica Intel no cargada (processor_thermal_*, int340x_thermal_zone,
 # acpi_thermal_rel), md_mod + lz4hc_compress (sin RAID ni uso), btmtk/rfcomm
-# (solo BT CSR presente usa btusb) e i2c_hid/i2c_mux (sin HID I2C en este
-# desktop y el I2C bus sigue con i2c_i801/smbus/dev/algo_bit).
+# (el BT real es Intel vía btusb+btintel; fuera las pilas de otros vendors) e
+# i2c_hid/i2c_mux (sin HID I2C en este desktop y el I2C bus sigue con
+# i2c_i801/smbus/dev/algo_bit).
 #
 # Uso:
 #   podar-modulos.sh <lib/modules/<release>> [keep-extra,separado,por,comas]
@@ -181,7 +182,7 @@ CORE_KEEP=(
   snd_hwdep snd_compress snd_ctl_led soundcore snd
   # USB / almacenamiento (Ventoy, HID, BT)
   xhci_pci xhci_hcd usbcore usb_common usb_storage uas usbhid hid hid_generic
-  bluetooth btusb bnep rfkill
+  bluetooth btusb btintel bnep rfkill
   # FS y bloques (btrfs es =y; los de USB/Particiones como módulo)
   btrfs isofs exfat vfat fat xfs zram zsmalloc loop
   # Integridad / crypto usados por los FS y el arranque
