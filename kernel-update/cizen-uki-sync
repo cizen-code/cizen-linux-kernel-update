@@ -18,6 +18,8 @@
 #   CIZEN_UKI_PKGBASE           pkgbase Cizen (default linux-cizen-v3)
 #   CIZEN_UKI_SUFFIX            LOCALVERSION_SUFFIX (default -cizen-v3)
 #   CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK  copiar el vmlinuz pelado (default 0)
+#   CIZEN_UKI_KEEP_INITRAMFS             conservar /boot/initramfs-*.img tras
+#                                         integrarlo en la UKI (default 0)
 # ============================================================
 
 set -Eeuo pipefail
@@ -28,6 +30,7 @@ CIZEN_UKI_NAME="${CIZEN_UKI_NAME:-arch-linux-cizen-v3.efi}"
 CIZEN_UKI_PKGBASE="${CIZEN_UKI_PKGBASE:-linux-cizen-v3}"
 CIZEN_UKI_SUFFIX="${CIZEN_UKI_SUFFIX:--cizen-v3}"
 CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK="${CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK:-0}"
+CIZEN_UKI_KEEP_INITRAMFS="${CIZEN_UKI_KEEP_INITRAMFS:-0}"
 
 # ── Colores ─────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -137,7 +140,7 @@ find_uki_targets() {
 
 build_uki() {
   local kernel="$1" cmdline_file="$2" out="$3"
-  local cmdline_text ukify_bin stub s initrd
+  local cmdline_text ukify_bin stub s initrd used_initrd
 
   cmdline_text="$(<"$cmdline_file")"
 
@@ -153,9 +156,11 @@ build_uki() {
     initrd="/boot/initramfs-$CIZEN_UKI_PKGBASE.img"
     if [ -s "$initrd" ]; then
       args+=(--initrd="$initrd")
+      used_initrd="$initrd"
       ok "Incluyendo initramfs: $initrd"
     fi
     if "${args[@]}"; then
+      embedded_initrd="$used_initrd"
       return 0
     fi
     warn "ukify falló; intento fallback con objcopy."
@@ -251,6 +256,13 @@ tmp="$(mktemp /tmp/cizen-uki.XXXXXX)" || {
 }
 trap 'rm -f "$tmp" "$cmdline_file"' EXIT
 
+# Ruta del initramfs que ukify integra como sección .initrd. Tras una UKI
+# escrita y verificada, el archivo suelto sobra (systemd-boot solo usa el .efi)
+# y se elimina salvo CIZEN_UKI_KEEP_INITRAMFS=1 (override, p.ej. para arranque
+# directo del vmlinuz). Solo se borra si realmente quedó embebido (ukify), nunca
+# con el fallback objcopy ni en --dry-run.
+embedded_initrd=""
+
 if ! build_uki "$kernel" "$cmdline_file" "$tmp"; then
   fatal "No pude generar la UKI ($CIZEN_UKI_NAME). Instala ukify (systemd-ukify) o binutils y verifica /usr/lib/systemd/boot/efi/linuxx64.efi.stub."
 fi
@@ -276,4 +288,13 @@ done
 if ! targets_are_current; then
   fatal "La UKI no quedó actualizada después de escribir en el objetivo."
 fi
+
+if [ -n "$embedded_initrd" ] && [ "$CIZEN_UKI_KEEP_INITRAMFS" != "1" ] && [ -f "$embedded_initrd" ]; then
+  if "${SUDO[@]}" rm -f "$embedded_initrd"; then
+    ok "Initramfs integrado en la UKI; residuo eliminado: $embedded_initrd"
+  else
+    warn "Initramfs integrado, pero no pude eliminarlo: $embedded_initrd"
+  fi
+fi
+
 ok "Sincronización de UKI completada."

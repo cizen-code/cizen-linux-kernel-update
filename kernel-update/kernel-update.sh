@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.25.6 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.25.7 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / systemd / KVM-libvirt / QEMU-OVMF
+#
+# CHANGELOG v27.25.7 (cizen-uki-sync: sin initramfs residuo — 2026-09-22)
+#   - Tras integrar /boot/initramfs-<pkgbase>.img como sección .initrd de la UKI
+#     (ukify) y verificar la escritura en el ESP, el archivo suelto se elimina:
+#     systemd-boot solo necesita el .efi (lo carga systemd-stub). Override
+#     CIZEN_UKI_KEEP_INITRAMFS=1 para conservarlo (arranque directo del vmlinuz).
+#   - Guardas: solo se borra si el initrd quedó realmente embebido (nunca con el
+#     fallback objcopy), no en --dry-run y no si la verificación final falla.
 #
 # CHANGELOG v27.25.6 (fix verificación del paquete generado + cizen-uki-sync — 2026-09-21)
 #   - La validación exigía que el nombre coincidiera con PKGVER_BASE (con
@@ -630,7 +638,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.25.6"
+SCRIPT_VERSION="27.25.7"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
