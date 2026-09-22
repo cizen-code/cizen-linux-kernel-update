@@ -18,12 +18,11 @@ poda: la poda física de módulos pasa a ser efectiva + recorte del allowlist
 - Allowlist (`CORE_KEEP`) recortada tras auditoría del árbol instalado:
   fuera térmica Intel no cargada (`processor_thermal_*`,
   `int340x_thermal_zone`, `acpi_thermal_rel`), `md_mod` + `lz4hc_compress`
-  (sin RAID ni uso), `btmtk`/`rfcomm` (el BT presente es CSR via btusb) e
-  `i2c_hid`/`i2c_mux` (sin HID I2C en este desktop; el bus sigue con
-  `i2c_i801`/`i2c_smbus`/`i2c_dev`/`i2c_algo_bit`).
-- Aplicado en caliente sobre el kernel 7.2.7 instalado (59 de 177 módulos
-  retirados, ~2.9 MB; `depmod` regenerado): se conserva cargado + hardware
-  presente + allowlist + dependencias.
+  `btmtk`/`btrtl`/`btbcm`/`rfcomm` (el BT real es de Intel y entra vía
+  `btusb`+`btintel`) e `i2c_hid`/`i2c_mux` (sin HID I2C en este desktop; el
+  bus sigue con `i2c_i801`/`i2c_smbus`/`i2c_dev`/`i2c_algo_bit`). `btintel`
+  se mantiene explícito en `CORE_KEEP` para no perder BT si arrancas sin él
+  cargado.
 
 ## [27.26.0] - 2026-09-22
 
