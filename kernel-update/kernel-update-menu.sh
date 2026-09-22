@@ -24,14 +24,13 @@ fi
 
 # ── Colores (solo terminal interactiva) ───────────────────────
 if [ -t 1 ]; then
-  B=$'\033[1;36m'   # borde
-  C=$'\033[1;36m'   # números / secciones
-  G=$'\033[0;32m'   # instalado
+  C=$'\033[1;36m'   # números / acentos / separador de columnas
+  G=$'\033[0;32m'   # instalado / motor
   Y=$'\033[1;33m'   # stable
   H=$'\033[1m'      # negrita
   N=$'\033[0m'
 else
-  B=""; C=""; G=""; Y=""; H=""; N=""
+  C=""; G=""; Y=""; H=""; N=""
 fi
 R=$'\033[0;31m'     # error (se muestra tras una opción inválida)
 
@@ -50,64 +49,59 @@ discover_remote() {
 }
 
 REMOTE="${1:-}"
-OFFLINE=false
 if [ -z "$REMOTE" ] && [ -t 0 ]; then
   REMOTE="$(discover_remote 2>/dev/null || true)"
-  [ -z "$REMOTE" ] && OFFLINE=true
 fi
 
 LOCAL="$(uname -r)"
 MOTOR_VER="$(awk -F'"' '/^SCRIPT_VERSION=/{print $2; exit}' "$SCRIPT" 2>/dev/null || true)"
-[ -n "$MOTOR_VER" ] && MOTOR_VER=" v$MOTOR_VER"
+[ -n "$MOTOR_VER" ] && MOTOR_VER="v$MOTOR_VER"
 
-# ── Cabecera ──────────────────────────────────────────────────
-W=46
-LINE="$(printf '%*s' "$W" '' | sed 's/ /─/g')"
-top()   { printf '%b┌%s┐%b\n' "$B" "$LINE" "$N"; }
-mid()   { printf '%b├%s┤%b\n' "$B" "$LINE" "$N"; }
-bot()   { printf '%b└%s┘%b\n' "$B" "$LINE" "$N"; }
-boxrow(){ # $1 = texto ya coloreado; completa el ancho interior W
-  local vis pad
-  vis="$(printf '%s' "$1" | sed 's/\x1b\[[0-9;]*m//g')"
-  pad=$(( W - ${#vis} ))
-  printf '%b│%b%s%b%*s%b│%b\n' "$B" "$N" "$1" "$N" "$pad" '' "$B" "$N"
+# ── Regla separadora (ASCII) y fila de columnas del encabezado ─
+RULE="$(printf '%*s' 55 '' | tr ' ' '-')"
+rule() { printf '%s\n' "$RULE"; }
+hrow() { # $1=columna izquierda (coloreada), $2=derecha (coloreada)
+  local left_vis pad
+  left_vis="$(printf '%s' "$1" | sed 's/\x1b\[[0-9;]*m//g')"
+  pad=$(( 24 - ${#left_vis} )); [ "$pad" -lt 0 ] && pad=0
+  printf '    %s%b%*s%b   |   %s\n' "$1" "$N" "$pad" '' "$N" "$2"
 }
 
-top
-boxrow "  ${C}●${N}${H}  Kernel Update · Cizen${N}      ${G}motor${N}${MOTOR_VER}"
-mid
+rule
+hrow "${C}●${N}${H}  Kernel Update · Cizen${N}" "${G}Motor${N} ${MOTOR_VER}"
+rule
 if [ -n "$REMOTE" ]; then
-  boxrow "  ${G}instalado${N}  $LOCAL     ${Y}stable${N}   $REMOTE"
+  hrow "${G}Instalado${N}  $LOCAL" "${Y}Stable${N}   $REMOTE"
 else
-  boxrow "  ${G}instalado${N}  $LOCAL     ${Y}stable${N}   desconocida"
-  boxrow "  ($([ "$OFFLINE" = true ] && printf 'sin conexión — ' )opción 6 para consultar)"
+  hrow "${G}Instalado${N}  $LOCAL" "${Y}Stable${N}   desconocida"
 fi
-bot
-echo
+rule
+rule
 
 opt() { # $1=número $2=nombre $3=descripción
   printf '%b%5s%b)  %-13s %s\n' "$C" "$1" "$N" "$2" "$3"
 }
 
-echo "  ${H}Validación${N}"
-opt 1 "check"       "validar config (ofrece compilar · baja)"
-opt 2 "checkfast"   "validar config · alta prioridad"
-echo
-echo "  ${H}Compilación${N}"
+echo "  Validación"
+opt 1 "check"       "validar config · baja"
+opt 2 "checkfast"   "validar config · alta"
+rule
+echo "  Compilación"
 opt 3 "build"       "compilar + instalar · baja"
 opt 4 "buildfast"   "compilar + instalar · alta"
-opt 5 "force"       "recompilar forzado (--force)"
+opt 5 "force"       "recompilar con (--force)"
 opt 7 "buildbore"   "compilar con BORE · baja"
 opt 8 "buildborefast" "compilar con BORE · alta"
-echo
-echo "  ${H}Mantenimiento${N}"
+rule
+echo "  Mantenimiento"
 opt 10 "kcfg"       "editar config con menuconfig"
 opt 11 "selftest"   "autoevaluación del motor"
-opt 12 "changelog"  "bump versión + borrador → CHANGELOG.md"
-echo
-echo "  ${H}Consulta y sistema${N}"
-opt 6 "check-update" "última stable de kernel.org (sin cambios)"
+opt 12 "changelog"  "bump + borrador → CHANGELOG.md"
+rule
+echo "  Consulta y sistema"
+opt 6 "check-update" "última stable de kernel.org"
 opt 9 "rollback"    "restaurar kernel previo"
+rule
 
 while true; do
   read -r -p "  [0-12] > " choice
