@@ -4,9 +4,16 @@ Conjunto de scripts para mantener el kernel de Arch Linux actualizado y
 automatizar la suite de actualización del sistema, con soporte de
 notificaciones de escritorio y flujos de compilación a plena prioridad.
 
+## Changelog
+
+El historial de versiones vive en [CHANGELOG.md](CHANGELOG.md), no en la
+cabecera del motor (desde v27.26.0). `kernel-update.sh --changelog` añade allí
+el borrador del siguiente release y bumpea banner + `SCRIPT_VERSION`.
+
 ## Estructura
 
 ```
+├── CHANGELOG.md                  # Historial de versiones (v27.26.0+)
 ├── kernel-update/                 # Flujo de compilación del kernel Cizen
 │   ├── kernel-update.sh           # Motor principal (descarga→Kconfig→build→pacman→UKI)
 │   ├── podar-modulos.sh           # Poda de módulos del paquete (+ --keep-list para --lite) |
@@ -64,6 +71,7 @@ con otras herramientas):
 | list-renames | `kernel-update.sh --list-renames` | Muestra el mapa de renombres de config |
 | absorb-rebels | `kernel-update.sh <ver> --absorb-rebels` | Mueve a `EXPECTED_REBELS` los símbolos que Kconfig conserva por dependencias, dejando el perfil limpio. Desde v27.25.1 el propio check lo ofrece interactivamente antes de compilar (si la auditoría reporta que Kconfig conserva desactivaciones), sin necesidad del flag |
 | no-prune | `kernel-update.sh <ver> --no-prune` | Desactiva la poda de módulos (default: activada) |
+| changelog | `kernel-update.sh --changelog` | Bumpea banner + `SCRIPT_VERSION` y añade el borrador del siguiente release a `CHANGELOG.md` |
 
 El **modo lite es el ÚNICO modo de compilación** de esta suite (v27.25.4): la
 config siempre se adelgaza con `make localmodconfig` antes de compilar. No
