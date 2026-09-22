@@ -5,6 +5,23 @@ changelog vive en este archivo (no en la cabecera del motor);
 `kernel-update.sh --changelog` añade aquí el borrador del siguiente
 release. Formato inspirado en [Keep a Changelog](https://keepachangelog.com/es/1.1.0/).
 
+## [27.27.1] - 2026-09-22
+
+kernel: sufijo `-cizen-v3` de verdad + título correcto en systemd-boot
+
+- El perfil `linux-7.2.7-cizen-v3.config` tenía `CONFIG_LOCALVERSION=""`, así
+  que `uname -r` daba `7.2.7` en lugar de `7.2.7-cizen-v3` (el motor ya asume
+  ese sufijo en `LOCALVERSION_SUFFIX`, `PKGVER_BASE`, firmas y
+  `find_cizen_installed_kernel`). Se fija `CONFIG_LOCALVERSION="-cizen-v3"`.
+- `build_cizen_uki` ahora embebe un os-release propio (`.osrel`) en la UKI via
+  `ukify --os-release=@<tmp>` (y `objcopy --add-section .osrel` como fallback)
+  con `PRETTY_NAME="Linux 7.2.7-cizen-v3"`. Sin esto, ukify incrusta
+  `/etc/os-release` y sd-boot 261.3 mostraba `Arch Linux (rolling)` en el menú;
+  con `PRETTY_NAME` el título correcto es "Linux 7.2.7-cizen-v3".
+- `cizen-uki-sync` aplica el mismo os-release; `release_from_kernel()` deriva el
+  release desde la ruta del kernel, el marker `pkgbase` de
+  `/usr/lib/modules/<rel>` o `strings` del binario.
+
 ## [27.27.0] - 2026-09-22
 
 poda: la poda física de módulos pasa a ser efectiva + recorte del allowlist
