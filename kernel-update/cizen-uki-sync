@@ -145,7 +145,7 @@ find_uki_targets() {
 
 build_uki() {
   local kernel="$1" cmdline_file="$2" out="$3"
-  local cmdline_text ukify_bin stub s initrd used_initrd
+  local cmdline_text ukify_bin stub s initrd used_initrd=""
 
   cmdline_text="$(<"$cmdline_file")"
 
