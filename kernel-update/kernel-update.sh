@@ -38,6 +38,9 @@
 #   kbuild [versión]              # alias/enlace al mismo script; sin versión usa autodetección
 #   ./kernel-update.sh --check-update
 #   ./kernel-update.sh [versión] --check
+#     Tras validar y confirmar la compilación, pregunta la variante del
+#     scheduler: 1) Vanilla (EEVDF estándar) o 2) BORE (Burst-Oriented
+#     Response Enhancer). Aplica igual en check/checkfast del menú.
 #   ./kernel-update.sh <versión> --strict
 #   ./kernel-update.sh <versión> --absorb-rebels
 #     Si la auditoría reporta desactivaciones que Kconfig conserva, el check
@@ -1770,9 +1773,9 @@ extract_tarball() {
 # La lógica común (v27.22.2 y v27.22.4 heredadas de BORE):
 #   - Detección de árbol conservado ya-parcheado por marcadores: no se vuelve a
 #     descargar ni a aplicar (evita el "Reversed patch detected" del dry-run).
-#   - Cada intento de descarga BORRA el destino antes (download_file usa aria2c
-#     con --allow-overwrite=false + --continue; sin borrar un fichero existente
-#     se daría por completo o se renombraría a .1, dejando huérfano el bueno).
+#   - El intento principal se baja a un TEMPORAL y solo se promueve al nombre
+#     definitivo si valida (aplica limpio): un intento fallido no pisa el
+#     destino, no deja .1 huérfanos y no muestra dos descargas idénticas.
 #   - Degrade automático principal -> upstream si no aplica limpio sobre X.Y.Z.
 #   - Cualquier fallo es fatal suave: warning y build vanilla (nunca rompe).
 #   - Al aplicar, los símbolos se registran (apply_patch_register) para que
@@ -1836,6 +1839,7 @@ apply_patch_register() {
 apply_patch_plugin() {
   local name="$1"
   local patch_file main_url fallback_url
+  local main_tmp _mreason=
 
   # Carga el descriptor del parche (función patch_desc_<nombre> global).
   if ! declare -F "patch_desc_$name" >/dev/null 2>&1; then
@@ -1864,27 +1868,44 @@ apply_patch_plugin() {
 
   patch_file="$KERNEL_BUILD_ROOT/${PATCH_CACHE_NAME}-${PATCH_BRANCH}.patch"
 
-  # Intento 1: fichero principal (forward-port del repo; p. ej. CachyOS lo
-  # regenera contra una RC y a veces no aplica sobre la release final X.Y.Z).
+  # Intento 1: parche principal (forward-port; p. ej. CachyOS lo regenera contra
+  # su propio árbol, que lleva cambios extra de scheduler, así que a veces no
+  # aplica limpio sobre la release vanilla final X.Y.Z). Se descarga a un
+  # temporal y solo se promueve al nombre definitivo si valida (aplica limpio):
+  # así un intento fallido no pisa el destino ni muestra dos descargas idénticas
+  # al mismo fichero, y se anuncia la razón real del retroceso.
   main_url="${PATCH_URL_PREFIX}/${PATCH_BRANCH}/${PATCH_CDN_SUBDIR}/${PATCH_MAIN_FILE}"
-  rm -f -- "$patch_file"
-  if download_file "$main_url" "$patch_file" \
-     && [ -s "$patch_file" ] \
-     && grep -Fq "$PATCH_MAGIC" "$patch_file" \
-     && patch -p1 --dry-run -d "$SRC" < "$patch_file" >/dev/null 2>&1; then
-    :
+  main_tmp="${patch_file}.intento1"
+  rm -f -- "$patch_file" "$main_tmp"
+  if download_file "$main_url" "$main_tmp"; then
+    if [ ! -s "$main_tmp" ]; then
+      _mreason="descarga vacía"
+    elif ! grep -Fq "$PATCH_MAGIC" "$main_tmp"; then
+      _mreason="sin marcador ${PATCH_MAGIC}"
+    elif ! patch -p1 --dry-run -d "$SRC" < "$main_tmp" >/dev/null 2>&1; then
+      _mreason="no aplica limpio sobre $VERSION (contexto Kconfig del árbol vanilla difiere del forward-port)"
+    else
+      ok "${PATCH_DISP_NAME:-$name}: ${PATCH_MAIN_FILE} válido para $VERSION."
+      mv -f -- "$main_tmp" "$patch_file"
+    fi
   else
-    warn "${PATCH_DISP_NAME:-$name}: ${PATCH_MAIN_FILE} no disponible/no aplica sobre $VERSION; probando upstream (${PATCH_FALLBACK_FILE}) ..."
-    rm -f -- "$patch_file"
+    _mreason="no disponible (error al descargar $PATCH_MAIN_FILE; comprueba red/repositorio)"
+  fi
+  if [ -n "$_mreason" ]; then
+    rm -f -- "$main_tmp"
+    warn "${PATCH_DISP_NAME:-$name}: ${PATCH_MAIN_FILE} $_mreason; probando upstream (${PATCH_FALLBACK_FILE}) ..."
     fallback_url="${PATCH_URL_PREFIX}/${PATCH_BRANCH}/${PATCH_CDN_SUBDIR}/${PATCH_FALLBACK_FILE}"
     if ! download_file "$fallback_url" "$patch_file" \
        || [ ! -s "$patch_file" ] \
        || ! grep -Fq "$PATCH_MAGIC" "$patch_file" \
        || ! patch -p1 --dry-run -d "$SRC" < "$patch_file" >/dev/null 2>&1; then
-      warn "Ningún parche ${PATCH_DISP_NAME:-$name} disponible para la rama ${PATCH_BRANCH:-?} / $VERSION; se continúa vanilla."
+      rm -f -- "$patch_file"
+      warn "Ningún parche ${PATCH_DISP_NAME:-$name} disponible que aplique para la rama ${PATCH_BRANCH:-?} / $VERSION; se continúa vanilla."
       return 1
     fi
+    ok "${PATCH_DISP_NAME:-$name}: usando upstream ${PATCH_FALLBACK_FILE} (válido para $VERSION)."
   fi
+  unset _mreason main_tmp
 
   if ! patch -p1 -d "$SRC" < "$patch_file" >/dev/null 2>&1; then
     warn "Aplicación real del parche ${PATCH_DISP_NAME:-$name} falló inesperadamente; se continúa vanilla."
@@ -1952,6 +1973,69 @@ choose_base_config() {
 # CORE_KEEP + /etc/modules-load.d + CIZEN_KEEP_MODULES) + vendrá de la misma
 # fuente que la poda. Los =y (built-in) ni se tocan: el arranque sin initramfs
 # sigue garantizado. No requiere haber compilado nada; solo re-usa conf/olddefconfig.
+# ------------------------------------------------------------
+# lite_missing_check <log>: dado el stderr capturado de streamline_config.pl
+# ("X config not found!", "module X did not have configs CONFIG_*...",
+# "WARNING: CONFIG_X is required,..."), determina qué módulos CARGADOS no
+# quedarían compilados en la config lite recién generada. Devuelve por stdout
+# la lista de nombres perdidos (vacío = ningún módulo en riesgo). Un aviso NO
+# es una pérdida: solo significa que streamline no validó el vínculo módulo↔
+# CONFIG y el símbolo hereda la config base. Se silencian: módulos no cargados
+# (allowlist conservador, ausencia = estado actual), símbolos que quedan =y/o=m,
+# desactivados a propósito (OPTS_DISABLE/REBELS) y símbolos que ya no existen
+# en este Kconfig (renombrados/legacy).
+# ------------------------------------------------------------
+lite_missing_check() {
+  local _log="${1:-}" _line _m _tok _sym _n _in _gap="" _s
+  local _pm="${CIZEN_PROC_MODULES:-/proc/modules}"
+  [ -s "$_log" ] || return 0
+  declare -A _ctx=()
+  while IFS= read -r _line; do
+    case "$_line" in
+      *" config not found!")
+        _m="${_line%% *}"
+        _ctx["CONFIG_$(printf '%s' "$_m" | tr '[:lower:]' '[:upper:]')"]="$_m"
+        ;;
+      "module "*" did not have configs "*)
+        _m="${_line#module }"; _m="${_m%% did not have configs*}"
+        for _tok in ${_line#*configs }; do
+          case "$_tok" in CONFIG_*) _ctx["${_tok%%=*}"]="$_m" ;; esac
+        done
+        ;;
+      WARNING:*)
+        _tok="${_line#WARNING: }"; _tok="${_tok%% *}"
+        case "$_tok" in CONFIG_*) _ctx["${_tok%%=*}"]="${_ctx[${_tok%%=*}]:-}" ;; esac
+        ;;
+    esac
+  done < "$_log"
+  for _s in "${!_ctx[@]}"; do
+    _m="${_ctx[$_s]}"
+    # Módulo asociado no cargado → no es pérdida real (el allowlist conserva
+    # módulos que el kernel funcionando nunca compiló; su ausencia es el estado
+    # actual). Sin módulo asociado ("WARNING: CONFIG_X is required") se evalúa.
+    if [ -n "$_m" ] && ! grep -qE "^${_m}( |$)" "$_pm" 2>/dev/null; then
+      continue
+    fi
+    # Símbolo heredado =y/=m de la config base → se compila igual
+    if grep -qE "^${_s}=(y|m)$" "$SRC/.config" 2>/dev/null; then
+      continue
+    fi
+    _n="${_s#CONFIG_}"
+    _in=0
+    # Desactivado a propósito (OPTS_DISABLE / REBELS) → decisión del usuario
+    for _e in "${EFF_DISABLE[@]}"; do [ "$_e" = "$_n" ] && _in=1 && break; done
+    if [ "$_in" = 0 ] && [ -z "${EXPECTED_REBEL_SET[$_n]:-}" ]; then
+      # Símbolo ausente de este Kconfig (renombrado/legacy) → no aplicable
+      if ! grep -rq '^[[:space:]]*\(config\|menuconfig\) '"$_n"'$' --include='Kconfig*' "$SRC" 2>/dev/null; then
+        _in=1
+      fi
+    fi
+    [ "$_in" = 1 ] && continue
+    _gap="$_gap ${_m:-$_n}"
+  done
+  printf '%s' "${_gap# }"
+}
+
 prepare_lite_config() {
   command -v make >/dev/null || fatal "--lite requiere make (make localmodconfig)."
   if [ ! -d "$SRC/scripts/kconfig" ]; then
@@ -1978,7 +2062,8 @@ prepare_lite_config() {
   # símbolos nuevos (p. ej. SCHED_BORE del parche BORE) pide respuestas— por
   # `make olddefconfig` (no interactivo: los símbolos (NEW) toman su default y
   # el perfil/auditoría los re-fuerzan después).
-  local rc karch ksrcarch
+  local rc karch ksrcarch lite_log lite_gap=
+  lite_log="$SRC/.config.cizen-lite.err"
   # make inyecta ARCH/SRCARCH por defecto; ejecutado a mano, streamline_config.pl
   # los necesita en el entorno para resolver "arch/$(SRCARCH)/Kconfig".
   case "$(uname -m)" in
@@ -1990,19 +2075,34 @@ prepare_lite_config() {
     *)             karch="$(uname -m)" ksrcarch="$karch" ;;
   esac
   export ARCH="$karch" SRCARCH="$ksrcarch"
+  # El stderr de streamline_config.pl (módulos cargados sin vínculo módulo↔
+  # CONFIG validado: "config not found!", "WARNING ... did not have configs /
+  # is required") y el banner de conf ("configuration written to .config") son
+  # ruido técnico del modo lite, no errores: el símbolo hereda la config base.
+  # Se capturan a un log: en éxito se verifica que ningún módulo citado quede
+  # FUERA de la build (lite_missing_check) y en fallo se vuelcan para diagnóstico.
   if ( cd "$SRC" \
-      && LSMOD="$keepfile" perl scripts/kconfig/streamline_config.pl --localmodconfig "$SRC" Kconfig > .config.cizen-lite \
+      && LSMOD="$keepfile" perl scripts/kconfig/streamline_config.pl --localmodconfig "$SRC" Kconfig > .config.cizen-lite 2> "$lite_log" \
       && mv -f .config .config.cizen-lite.old \
       && mv -f .config.cizen-lite .config \
-      && make ARCH="$karch" olddefconfig \
+      && make ARCH="$karch" olddefconfig >> "$lite_log" 2>&1 \
       && rm -f .config.cizen-lite.old ); then
     ok "Config lite generada: solo se compilarán los módulos en uso ($keep_lines en allowlist)."
+    lite_gap="$(lite_missing_check "$lite_log" 2>/dev/null || true)"
+    if [ -n "$lite_gap" ]; then
+      warn "El modo lite NO compilaría estos módulos (cargados o en allowlist) y su símbolo no está en OPTS_ENABLE: $lite_gap."
+    fi
+    rm -f -- "$lite_log"
   else
     rc=$?
-    rm -f -- "$SRC/.config.cizen-lite"
+    if [ -s "${lite_log:-}" ]; then
+      err "Detalle de localmodconfig (motivo del fallo):"
+      sed 's/^/    /' "$lite_log" | tail -40 >&2 || true
+    fi
+    rm -f -- "$SRC/.config.cizen-lite" "$lite_log"
     fatal "make localmodconfig falló (rc=$rc). El modo lite es el ÚNICO modo de compilación: se aborta en lugar de compilar la config completa."
   fi
-  unset rc karch ksrcarch ARCH SRCARCH
+  unset rc karch ksrcarch lite_gap lite_log ARCH SRCARCH
   rm -f -- "$keepfile"
   unset _k keep_lines
 }
@@ -3590,7 +3690,7 @@ confirm_recompile_current() {
   fi
 
   printf '\n'
-  printf '  No hay una release estable nueva para compilar (instalada: %s).\n' "$version"
+  printf '  No hay una release estable nueva para compilar.\n'
   read -r -p "  ¿Quieres continuar con la recompilación del kernel $version? [S/n] " answer < /dev/tty || answer="n"
   case "${answer:-s}" in
     s|S|si|SI|Sí|sí|y|Y|yes|YES)
@@ -3669,7 +3769,7 @@ if [ -z "$VERSION" ]; then
     if [ "$CHECK_ONLY" = false ] && [ -n "$LOCAL_KERNEL_VERSION" ] && ! version_gt "$VERSION" "$LOCAL_KERNEL_VERSION"; then
       if confirm_recompile_current "$LOCAL_KERNEL_VERSION"; then
         VERSION="$LOCAL_KERNEL_VERSION"
-        ok "Se continúa con la recompilación de la versión instalada: $VERSION"
+        ok "Se continúa con la recompilación de la versión instalada"
       else
         ok "Recompilación cancelada: no hay una release estable nueva para compilar."
         exit 0
@@ -3911,8 +4011,73 @@ confirm_build_after_check() {
   done
 }
 
+# Variante de compilación en modo check (v27.28.0): tras confirmar que se desea
+# compilar, si no se pidió ningún parche explícito (--patch bore, --bore,
+# CIZEN_PATCHES, CIZEN_ENABLE_BORE) se ofrece elegir entre Vanilla (scheduler
+# EEVDF estándar) y BORE (Burst-Oriented Response Enhancer). Elegir BORE aplica
+# el parche en este punto y re-valida la config (olddefconfig + perfil +
+# auditoría + validación) para que la compilación arranque con una configuración
+# coherente; la base promovida tras el check queda alineada con la variante.
+choose_build_variant_after_check() {
+  local choice
+
+  if [ "${#PATCH_NAMES[@]}" -gt 0 ]; then
+    log "Variante ya solicitada explícitamente (${PATCH_NAMES[*]}); se omite la pregunta."
+    return 0
+  fi
+
+  if ! [ -t 0 ] && ! [ -t 1 ]; then
+    warn "Sin terminal interactiva; se continúa con la variante Vanilla."
+    return 0
+  fi
+
+  echo
+  printf '  1) Vanilla\n  2) Bore\n'
+  while true; do
+    read -r -t 300 -p "  Elija la variante de compilación [1] > " choice < /dev/tty || choice=""
+    case "${choice:-1}" in
+      1|vanilla|Vanilla|v|V)
+        ok "Variante Vanilla (scheduler EEVDF estándar)."
+        return 0
+        ;;
+      2|bore|Bore|b|B)
+        break
+        ;;
+      *)
+        warn "Respuesta no válida. Responda 1 (Vanilla), 2 (Bore) o Enter (Vanilla)."
+        ;;
+    esac
+  done
+
+  # BORE elegido aquí: aplicar el parche sobre el árbol ya validado y volver a
+  # pasar la cadena perfil+auditoría+validación. Los símbolos nuevos
+  # (SCHED_BORE/MIN_BASE_SLICE_NS) se materializan en olddefconfig; PATCH_*_ALL
+  # (via build_effective_arrays) los fuerza a =y y los registra como esperados.
+  PATCH_NAMES+=(bore)
+  if apply_patch_plugin bore; then
+    build_effective_arrays
+    check_profile_contradictions
+    log "Reconfigurando con BORE aplicado (olddefconfig + perfil + auditoría + validación)..."
+    if ! make olddefconfig; then
+      err "olddefconfig falló tras aplicar BORE."
+      fatal "No se puede continuar: la configuración no es coherente con el parche BORE."
+    fi
+    apply_config_requests || fatal "Falló scripts/config al re-aplicar el perfil con BORE."
+    run_kconfig_audit || fatal "Auditoría Kconfig tras aplicar BORE fallida."
+    validate_config || {
+      rc=$?
+      fatal "Re-validación tras aplicar BORE fallida (rc=$rc)."
+    }
+    ok "BORE aplicado y configuración re-validada; se compilará con el scheduler BORE."
+  else
+    warn "No se pudo aplicar el parche BORE; se continúa compilando Vanilla."
+  fi
+  return 0
+}
+
 if [ "$CHECK_ONLY" = true ]; then
   if confirm_build_after_check; then
+    choose_build_variant_after_check
     ok "Perfecto. La configuración está validada; continuamos con la compilación de $VERSION."
     CHECK_ONLY=false
   else

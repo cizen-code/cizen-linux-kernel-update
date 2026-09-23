@@ -69,8 +69,8 @@ con otras herramientas):
 
 | Modo | Comando | Descripción |
 |------|---------|-------------|
-| check | `kernel-update.sh --check` | Valida la configuración; ofrece compilar después |
-| checkfast | `CIZEN_BUILD_PRIORITY=normal kernel-update.sh --check` | Ídem a plena prioridad |
+| check | `kernel-update.sh --check` | Valida la configuración; ofrece compilar después y elige la variante Vanilla/BORE al confirmar |
+| checkfast | `CIZEN_BUILD_PRIORITY=normal kernel-update.sh --check` | Ídem a plena prioridad (misma interactividad Vanilla/BORE) |
 | build | `kernel-update.sh` | Compila e instala |
 | buildfast | `CIZEN_BUILD_PRIORITY=normal kernel-update.sh` | Compila a plena prioridad |
 | force | `kernel-update.sh --force` | Recompila forzando |
