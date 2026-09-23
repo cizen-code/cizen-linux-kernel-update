@@ -5,6 +5,22 @@ changelog vive en este archivo (no en la cabecera del motor);
 `kernel-update.sh --changelog` añade aquí el borrador del siguiente
 release. Formato inspirado en [Keep a Changelog](https://keepachangelog.com/es/1.1.0/).
 
+## [27.27.2] - 2026-09-22
+
+poda: nombres canónicos de módulo (corrige el kernel sin sonido HDMI/analógico)
+
+- `podar-modulos.sh` v1.1.1: el inventario, el cierre de dependencias y la
+  poda física comparan ahora SIEMPRE el nombre canónico de módulo (el de
+  modprobe/depmod, con guiones bajos). Hasta v1.1.0 la poda física comparaba
+  el basename del `.ko` (que en ALSA lleva guiones: `snd-hda-intel.ko`
+  ⇔ canónico `snd_hda_intel`), por lo que se retiraban los módulos de audio
+  HDA/HDMI aunque el allowlist los conservara. El kernel se compilaba con
+  `CONFIG_SND_HDA_INTEL=m` (visible en `/proc/config.gz`) pero el árbol
+  instalado acababa sin `snd-hda-intel.ko` ni códecs → PipeWire solo veía
+  "Dummy Output" y no había sonido por HDMI ni de 3,5 mm.
+- Se revisa que `CORE_KEEP` y el perfil ya traen el audio HDA (`snd_hda_intel`,
+  `snd_hda_codec_*`, códecs HDMI/ALC269); con el fix la poda ya no los borra.
+
 ## [27.27.1] - 2026-09-22
 
 kernel: sufijo `-cizen-v3` de verdad + título correcto en systemd-boot

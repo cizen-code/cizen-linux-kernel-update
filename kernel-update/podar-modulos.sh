@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# podar-modulos.sh — Poda de módulos del kernel Cizen v1.1.0
+# podar-modulos.sh — Poda de módulos del kernel Cizen v1.1.1
 #
 # Elimina de un árbol de módulos (lib/modules/<release>) los módulos que este
 # hardware no necesita, conservando únicamente:
@@ -15,6 +15,15 @@
 #   conservado y regenera los índices con depmod. Los módulos =y (built-in)
 #   no tienen archivo .ko: la poda nunca los afecta - el arranque sin UKI
 #   initramfs depende de ellos y el perfil los fija como boot_critical.
+#
+# v1.1.1 (2026-09-22): TODAS las comparaciones claves del podador se hacen por
+# NOMBRE CANÓNICO de módulo (el de modprobe/depmod, guiones bajos). Antes el
+# inventario, el cierre de dependencias y la poda física comparaban el basename
+# del .ko (que lleva guiones en ALSA, p.ej. snd-hda-intel.ko frente al canónico
+# snd_hda_intel), así que la poda soltaba los módulos de audio HDA por no
+# encontrar su archivo en el allowlist aunque sí estuviera conservado: el kit
+# compilaba los .ko (CONFIG_SND_HDA_INTEL=m en el config.gz del kernel) pero el
+# paquete/árbol instalado quedaba sin sonido.
 #
 # v1.1.0 (2026-09-22): si el árbol no tiene aún modules.dep/modules.alias
 # (p.ej. dentro de package() del PKGBUILD, justo tras modules_install y antes
@@ -87,7 +96,11 @@ if [ "$KEEP_LIST_ONLY" = false ]; then
 fi
 
 declare -A KEEP=()
-keep_mod() { [ -n "$1" ] && KEEP["$1"]=1; }
+# v1.1.1: kmod normaliza '-'<->'_' (un módulo se identifica por su nombre
+# canónico: el .ko del disco se llama snd-hda-intel.ko pero modprobe/depmod lo
+# llaman snd_hda_intel). Todos los KEEP se almacenan canónico para que la
+# comparación de la poda física (mismo esquema) no pierda módulos.
+keep_mod() { [ -n "$1" ] && KEEP["${1//-/_}"]=1; }
 
 # ------------------------------------------------------------
 # 0) Inventario del árbol objetivo (nombres de módulo -> fichero .ko*)
@@ -102,6 +115,10 @@ while IFS= read -r _f; do
   ALL_FILES+=("$_f")
   _b="$(basename -- "$_f")"
   _n="${_b%.ko*}"
+  # v1.1.1: índice por nombre canónico (igual que depmod/modprobe) para que la
+  # poda física y el cierre de dependencias no pierdan módulos cuyo .ko en
+  # disco usa guiones (p.ej. snd-hda-intel.ko <-> snd_hda_intel).
+  _n="${_n//-/_}"
   if [ -n "$_n" ]; then
     FILE_BY_NAME["$_n"]="$_f"
   fi
@@ -250,11 +267,11 @@ while IFS= read -r _l || [ -n "$_l" ]; do
   _f="${_l%%:*}"
   _rest="${_l#*: }"
   [ "$_rest" = "$_l" ] && _rest=""
-  _n="${_f##*/}"; _n="${_n%.ko*}"
+  _n="${_f##*/}"; _n="${_n%.ko*}"; _n="${_n//-/_}"
   [ -n "$_n" ] || continue
   _rl=""
   for _d in $_rest; do
-    _dn="${_d##*/}"; _dn="${_dn%.ko*}"
+    _dn="${_d##*/}"; _dn="${_dn%.ko*}"; _dn="${_dn//-/_}"
     [ -n "$_dn" ] && _rl="$_rl $_dn"
   done
   DEPS["$_n"]="${_rl# }"
@@ -288,7 +305,7 @@ _kept=0
 _pruned=0
 for _f in "${ALL_FILES[@]}"; do
   _b="$(basename -- "$_f")"
-  _n="${_b%.ko*}"
+  _n="${_b%.ko*}"; _n="${_n//-/_}"
   if [ -n "${KEEP[$_n]:-}" ]; then
     _kept=$((_kept + 1))
   else
