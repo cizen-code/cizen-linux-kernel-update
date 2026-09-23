@@ -54,7 +54,7 @@
 #   ./kernel-update.sh <versión> --patch bore                 # framework de parches
 #   ./kernel-update.sh <versión> --bore                       # alias de --patch bore
 #   CIZEN_PATCHES="bore" ./kernel-update.sh <versión>         # parches por env
-#   ./kernel-update.sh <versión> --btf                        # CONFIG_DEBUG_INFO_BTF=y
+#   ./kernel-update.sh <versión> --no-btf                     # sin CONFIG_DEBUG_INFO_BTF (opt-out; default: BTF=y)
 #   ./kernel-update.sh <versión> --clang                      # build LLVM/clang (opt-in)
 #   ./kernel-update.sh <versión> --menuconfig                 # editar config con menuconfig
 #   ./kernel-update.sh [versión] --publish-repo               # publicar pkg a repo pacman local
@@ -188,7 +188,9 @@ declare -a PATCHES_APPLIED=()
 # se reconocen como rebeldes esperados (no ensucian la auditoría ni --strict).
 declare -a PATCH_ENABLE_ALL=() PATCH_REBEL_ALL=()
 declare -A PATCH_KCONFIG_FILTER=()   # símbolos nuevos esperados de parches/BTF
-BTF_REQUESTED=false
+# BTF por defecto activo (el perfil lo trae =y): systemd/bpf-restrict-fs lo
+# necesita. Se desactiva con --no-btf / CIZEN_NO_BTF=1.
+BTF_REQUESTED=true
 CLANG_REQUESTED=false
 MENUCONFIG_REQUESTED=false
 SELFTEST=false
@@ -316,6 +318,8 @@ while [ $# -gt 0 ]; do
       shift ;;
     --btf)
       BTF_REQUESTED=true; shift ;;
+    --no-btf)
+      BTF_REQUESTED=false; shift ;;
     --clang)
       CLANG_REQUESTED=true; shift ;;
     --menuconfig)
@@ -371,6 +375,7 @@ if [ -n "${CIZEN_PATCHES:-}" ]; then
   unset __patchs __patchn
 fi
 [ "${CIZEN_BTF:-0}" = "1" ] && BTF_REQUESTED=true
+[ "${CIZEN_NO_BTF:-0}" = "1" ] && BTF_REQUESTED=false
 [ "${CIZEN_CLANG:-0}" = "1" ] && CLANG_REQUESTED=true
 case "$PRUNE_MODULES" in
   0|1) ;;
@@ -930,7 +935,8 @@ build_effective_arrays() {
   done
   unset __ps
 
-  # BTF (opcional): DEBUG_INFO + DEBUG_INFO_BTF =y, marcados como esperados.
+  # BTF (obligatorio por defecto): DEBUG_INFO + DEBUG_INFO_BTF =y, marcados como
+  # esperados. El perfil base lo trae =y y systemd/bpf-restrict-fs lo necesita.
   if [ "$BTF_REQUESTED" = true ]; then
     add_unique enable "DEBUG_INFO"
     add_unique enable "DEBUG_INFO_BTF"
@@ -939,9 +945,8 @@ build_effective_arrays() {
     PATCH_KCONFIG_FILTER[DEBUG_INFO]=1
     PATCH_KCONFIG_FILTER[DEBUG_INFO_BTF]=1
   else
-    # v27.25.5 (decisión del usuario): por defecto NO se genera BTF (aunque la
-    # config base lo traiga =y): solo los módulos lite, menos RAM/pico en el
-    # enlace final y paquete más pequeño. Sigue disponible con --btf / CIZEN_BTF.
+    # Opt-out explícito (--no-btf / CIZEN_NO_BTF=1): sin BTF, paquete más pequeño.
+    # DEBUG_INFO_BTF_MODULES cae solo (depende de DEBUG_INFO_BTF).
     add_unique disable "DEBUG_INFO_BTF"
   fi
 }
@@ -3284,8 +3289,9 @@ ensure_cizen_efi_updated() {
 # MENUCONFIG / PAHOLE / SELFTEST / REPO / CHANGELOG  (v27.24.0)
 # ============================================================
 
-# BTF (opcional): pahole genera el .BTF en la compilación. Solo se pide/instala
-# cuando --btf está activo; si no se puede, BTF_REQUESTED=false (fatal suave).
+# BTF (obligatorio por defecto): pahole genera el .BTF en la compilación. Solo
+# se requiere cuando no hay opt-out (--no-btf / CIZEN_NO_BTF); si no se puede,
+# BTF_REQUESTED=false (fatal suave).
 ensure_optional_pahole() {
   [ "$BTF_REQUESTED" = true ] || return 0
   command -v pahole >/dev/null 2>&1 && { ok "pahole disponible (BTF habilitado)."; return 0; }
@@ -3618,8 +3624,9 @@ prepare_dirs
 ensure_config_dir_writable
 check_prerequisites
 
-# BTF (opcional): necesita pahole para el .BTF. Si no se consigue se degrada a
-# sin-BTF; se reconstruyen los arrays efectivos por si el BTF se desactivó.
+# BTF (por defecto activo): necesita pahole para el .BTF. Si no se consigue se
+# degrada a sin-BTF; se reconstruyen los arrays efectivos por si el BTF se
+# desactivó.
 if [ "$BTF_REQUESTED" = true ]; then
   ensure_optional_pahole
   build_effective_arrays
