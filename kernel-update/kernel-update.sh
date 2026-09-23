@@ -262,9 +262,10 @@ fatal(){ err "$*"; exit 1; }
 # alargan el build (~20-40%) sin beneficio si la máquina está seca.
 # CIZEN_BUILD_PRIORITY lo define el usuario ANTES de ejecutar (export).
 BUILD_PRIORITY="${CIZEN_BUILD_PRIORITY:-low}"
+case "$BUILD_PRIORITY" in normal) BUILD_PRIORITY_LABEL="máxima" ;; *) BUILD_PRIORITY_LABEL="$BUILD_PRIORITY" ;; esac
 if [ "$BUILD_PRIORITY" = "normal" ]; then
   declare -a BUILD_PRIORITY_WRAP=()
-  info "Compilación a plena prioridad (sin nice/ionice)"
+  info "Compilación a plena prioridad (máxima velocidad; sin nice/ionice)"
 else
   declare -a BUILD_PRIORITY_WRAP=()
   if command -v nice >/dev/null 2>&1; then
@@ -3790,7 +3791,7 @@ if ! flock -n 9; then
 fi
 
 log "Kernel Cizen v$SCRIPT_VERSION — perfil $PROFILE"
-log "Objetivo  : $VERSION (check=$CHECK_ONLY force=$FORCE strict=$STRICT jobs=$JOBS prio=$BUILD_PRIORITY)"
+log "Objetivo  : $VERSION (check=$CHECK_ONLY force=$FORCE strict=$STRICT jobs=$JOBS prio=$BUILD_PRIORITY_LABEL)"
 log "Cache/build: $KERNEL_BUILD_ROOT | $TMPFS_ROOT (${TMPFS_SIZE}, mín. ${TMPFS_MIN_FREE_MB} MB)"
 
 if [ "$KEEP_SRC" = true ]; then
@@ -4479,7 +4480,7 @@ Perfil      : $PROFILE
   CC          : $([ "$CLANG_BUILD" = true ] && echo 'LLVM/Clang' || echo 'GCC')
 ${PUBLISH_REPO_MSG:+  ${PUBLISH_REPO_MSG}}
   Hilos       : $JOBS
- Build prio  : $BUILD_PRIORITY (CIZEN_BUILD_PRIORITY=normal para máxima velocidad)
+ Build prio  : $BUILD_PRIORITY_LABEL (CIZEN_BUILD_PRIORITY=normal para máxima velocidad)
  Paquete     : $(basename "$PKG")
  Config base : $FINAL_CONFIG
  Build tmpfs : $TMPFS_ROOT (size=$TMPFS_SIZE)
