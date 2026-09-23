@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.27.0 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.28.0 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / XFS / systemd / KVM-libvirt / QEMU-OVMF
 #
@@ -63,7 +63,10 @@
 #   ./kernel-update.sh [versión] --publish-repo               # publicar pkg a repo pacman local
 #   CIZEN_PUBLISH_REPO=/srv/repo ./kernel-update.sh <versión> # dónde publicar (default /var/lib/kernel-update/repo)
 #   ./kernel-update.sh --selftest                             # autoevaluación interna
+#   ./kernel-update.sh --hardened                             # auditoría hardening del kernel en ejecución
 #   ./kernel-update.sh --changelog                            # bump versión + borrador en CHANGELOG.md
+#   CIZEN_BOOT_TRIES=3 ./kernel-update.sh <versión>           # boot counting sd-boot (0 = UKI plana)
+#   CIZEN_PATCH_SHA256_VERIFY=0 ./kernel-update.sh <versión>  # desactivar pin SHA256 de los parches
 #   JOBS=3 ./kernel-update.sh <versión>
 #   CIZEN_DOWNLOAD_PARALLEL=8 ./kernel-update.sh <versión>   # conexiones paralelas (aria2c)
 #   CIZEN_DOWNLOADER=wget ./kernel-update.sh <versión>       # fuerza el wget clásico
@@ -102,7 +105,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.27.0"
+SCRIPT_VERSION="27.28.0"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -198,6 +201,7 @@ CLANG_REQUESTED=false
 MENUCONFIG_REQUESTED=false
 SELFTEST=false
 DO_CHANGELOG=false
+HARDENED_AUDIT=false
 PUBLISH_REPO=false
 PUBLISH_REPO_DIR=""
 PUBLISH_REPO_MSG=""
@@ -276,6 +280,37 @@ else
   fi
 fi
 
+# Guarda OOM pre-build: aborta pronto y con mensaje claro si no hay memoria
+# suficiente (el enlace con BTF es el punto más hambriento, ver historial de
+# OOM al compilar con DEBUG_INFO_BTF) o si el tmpfs de compilación no tiene
+# espacio libre para el árbol. Umbrales superables por env.
+CIZEN_BUILD_MIN_MEM_MB="${CIZEN_BUILD_MIN_MEM_MB:-8192}"
+CIZEN_BUILD_MIN_TMPFS_MB="${CIZEN_BUILD_MIN_TMPFS_MB:-6144}"
+CIZEN_BUILD_MIN_MEM_BTF_MB="${CIZEN_BUILD_MIN_MEM_BTF_MB:-12288}"
+CIZEN_BUILD_MIN_TMPFS_BTF_MB="${CIZEN_BUILD_MIN_TMPFS_BTF_MB:-8192}"
+check_build_memory() {
+  local min_mem min_tmp avail swapfree mem free_mb
+  if [ "$BTF_REQUESTED" = true ]; then
+    min_mem="${CIZEN_BUILD_MIN_MEM_BTF_MB}"; min_tmp="${CIZEN_BUILD_MIN_TMPFS_BTF_MB}"
+  else
+    min_mem="${CIZEN_BUILD_MIN_MEM_MB}"; min_tmp="${CIZEN_BUILD_MIN_TMPFS_MB}"
+  fi
+  avail="$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)"
+  swapfree="$(awk '/^SwapFree:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)"
+  mem=$(( (avail + swapfree) / 1024 ))
+  if [ "$mem" -lt "$min_mem" ]; then
+    fatal "Memoria insuficiente para el build (BTF=$BTF_REQUESTED): MemAvailable+SwapFree=${mem} MB < ${min_mem} MB. Cierra aplicaciones o ajusta CIZEN_BUILD_MIN_MEM_MB (o _BTF_MB)."
+  fi
+  free_mb="$(df -Pk "$TMPFS_ROOT" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
+  if [ -n "$free_mb" ]; then
+    free_mb=$((free_mb / 1024))
+    if [ "$free_mb" -lt "$min_tmp" ]; then
+      fatal "Espacio libre insuficiente en el tmpfs de build ($TMPFS_ROOT): ${free_mb} MB < ${min_tmp} MB. Libera el árbol anterior o ajusta CIZEN_BUILD_MIN_TMPFS_MB (o _BTF_MB)."
+    fi
+  fi
+  ok "Build memory ok (BTF=$BTF_REQUESTED): MemAvailable+SwapFree=${mem} MB (mín ${min_mem} MB), tmpfs libre=${free_mb:-?} MB (mín ${min_tmp} MB)."
+}
+
 on_err() {
   local rc=$?
   err "Error $rc en línea ${BASH_LINENO[0]}: ${BASH_COMMAND}"
@@ -330,6 +365,8 @@ while [ $# -gt 0 ]; do
       MENUCONFIG_REQUESTED=true; shift ;;
     --selftest)
       SELFTEST=true; shift ;;
+    --hardened)
+      HARDENED_AUDIT=true; shift ;;
     --publish-repo)
       PUBLISH_REPO=true; shift ;;
     --changelog)
@@ -1766,6 +1803,8 @@ extract_tarball() {
 #   PATCH_CDN_SUBDIR     subdirectorio bajo la rama (sched/)
 #   PATCH_MAIN_FILE      fichero principal (forward-port del mantenedor del repo)
 #   PATCH_FALLBACK_FILE  respaldo del autor upstream (se sincroniza por release)
+#   PATCH_SHA256_MAIN    hash SHA256 de confianza del fichero principal (pin)
+#   PATCH_SHA256_FALLBACK  hash SHA256 de confianza del respaldo upstream (pin)
 #   PATCH_CACHE_NAME     prefijo del fichero en KERNEL_BUILD_ROOT (-> name-$br.patch)
 #   PATCH_SYMBOLS        símbolos Kconfig que el parche introduce (=y + rebelde)
 #   PATCH_MAGIC          cadena que debe aparecer en un parche válido
@@ -1778,6 +1817,11 @@ extract_tarball() {
 #     definitivo si valida (aplica limpio): un intento fallido no pisa el
 #     destino, no deja .1 huérfanos y no muestra dos descargas idénticas.
 #   - Degrade automático principal -> upstream si no aplica limpio sobre X.Y.Z.
+#   - ANCLAJE SHA256 (pin): el fichero que se va a aplicar debe coincidir con el
+#     hash de confianza del descriptor; si no, se descarta y se degrada a vanilla
+#     (nunca se aplica un parche cuya procedencia no casa con el pin). Overrides:
+#     CIZEN_PATCH_SHA256_MAIN / CIZEN_PATCH_SHA256_FALLBACK para otro hash bueno
+#     conocido, y CIZEN_PATCH_SHA256_VERIFY=0 para desactivar (último recurso).
 #   - Cualquier fallo es fatal suave: warning y build vanilla (nunca rompe).
 #   - Al aplicar, los símbolos se registran (apply_patch_register) para que
 #     build_effective_arrays los fuerce a =y y los marque como esperados.
@@ -1799,6 +1843,8 @@ patch_desc_bore() {
   PATCH_CDN_SUBDIR="sched"
   PATCH_MAIN_FILE="0001-bore-cachy.patch"
   PATCH_FALLBACK_FILE="0001-bore.patch"
+  PATCH_SHA256_MAIN="1809a4d4d6508a2a3f92cd8b3b385640583f90bd6cee46584f4bf105affd24a0"
+  PATCH_SHA256_FALLBACK="61b9543e400d6fb38a68ee2276538ae14834bec75d7b06d3e1ac9977174ff619"
   PATCH_CACHE_NAME="bore"
   PATCH_SYMBOLS=(SCHED_BORE MIN_BASE_SLICE_NS)
   PATCH_MAGIC="config SCHED_BORE"
@@ -1869,6 +1915,22 @@ apply_patch_plugin() {
 
   patch_file="$KERNEL_BUILD_ROOT/${PATCH_CACHE_NAME}-${PATCH_BRANCH}.patch"
 
+  PATCH_SHA256_MAIN="${CIZEN_PATCH_SHA256_MAIN:-$PATCH_SHA256_MAIN}"
+  PATCH_SHA256_FALLBACK="${CIZEN_PATCH_SHA256_FALLBACK:-$PATCH_SHA256_FALLBACK}"
+  PATCH_SHA256_VERIFY="${CIZEN_PATCH_SHA256_VERIFY:-1}"
+  # Imprime el motivo si $1 difiere del pin $2 (vacío si pin válido/desactivado).
+  verify_patch_sha() {
+    local f="$1" pin="$2" got
+    if [ "$PATCH_SHA256_VERIFY" != 1 ] || [ -z "$pin" ]; then printf ''; return 0; fi
+    got="$(sha256sum "$f" | cut -d' ' -f1 2>/dev/null || true)"
+    if [ -n "$got" ] && [ "$got" != "$pin" ]; then
+      printf 'hash SHA256 %s… no coincide con el anclado %s… (¿el repo regeneró el parche?)' "${got:0:12}" "${pin:0:12}"
+    else
+      printf ''
+    fi
+    return 0
+  }
+
   # Intento 1: parche principal (forward-port; p. ej. CachyOS lo regenera contra
   # su propio árbol, que lleva cambios extra de scheduler, así que a veces no
   # aplica limpio sobre la release vanilla final X.Y.Z). Se descarga a un
@@ -1888,6 +1950,11 @@ apply_patch_plugin() {
     else
       ok "${PATCH_DISP_NAME:-$name}: ${PATCH_MAIN_FILE} válido para $VERSION."
       mv -f -- "$main_tmp" "$patch_file"
+      _pin_reason="$(verify_patch_sha "$patch_file" "$PATCH_SHA256_MAIN")"
+      if [ -n "$_pin_reason" ]; then
+        rm -f -- "$patch_file"
+        _mreason="$_pin_reason"
+      fi
     fi
   else
     _mreason="no disponible (error al descargar $PATCH_MAIN_FILE; comprueba red/repositorio)"
@@ -1905,8 +1972,14 @@ apply_patch_plugin() {
       return 1
     fi
     ok "${PATCH_DISP_NAME:-$name}: usando upstream ${PATCH_FALLBACK_FILE} (válido para $VERSION)."
+    _pin_reason="$(verify_patch_sha "$patch_file" "$PATCH_SHA256_FALLBACK")"
+    if [ -n "$_pin_reason" ]; then
+      rm -f -- "$patch_file"
+      warn "Parche ${PATCH_DISP_NAME:-$name}: $_pin_reason; se continúa vanilla. Si el hash es legítimo, actualiza el pin (CIZEN_PATCH_SHA256_MAIN / _FALLBACK) o usa CIZEN_PATCH_SHA256_VERIFY=0."
+      return 1
+    fi
   fi
-  unset _mreason main_tmp
+  unset _mreason main_tmp _pin_reason
 
   if ! patch -p1 -d "$SRC" < "$patch_file" >/dev/null 2>&1; then
     warn "Aplicación real del parche ${PATCH_DISP_NAME:-$name} falló inesperadamente; se continúa vanilla."
@@ -2996,10 +3069,14 @@ prepare_rollback_archive() {
 
   tmp="$ROLLBACK_DIR/.archive-$$.tmp"
   sudo rm -f -- "$tmp" 2>/dev/null
+  local -a uki_paths=()
+  while IFS= read -r f; do
+    [ -n "$f" ] && uki_paths+=("${f#/}")
+  done < <(sudo find /efi /boot/efi /boot -maxdepth 5 -type f -name 'arch-linux-cizen-v3*.efi' 2>/dev/null || true)
   if sudo tar --xz -cf "$tmp" -C / \
        "usr/lib/modules/$rel" \
        "boot/vmlinuz-linux-cizen-v3" \
-       "boot/EFI/Linux/arch-linux-cizen-v3.efi" 2>/dev/null; then
+       "${uki_paths[@]}" 2>/dev/null; then
     if [ -s "$tmp" ]; then
       sudo mv -f -- "$tmp" "$ROLLBACK_DIR/$rel.tar.xz" 2>/dev/null || {
         sudo rm -f -- "$tmp" 2>/dev/null
@@ -3132,6 +3209,12 @@ CIZEN_UKI_NAME="${CIZEN_UKI_NAME:-arch-${CIZEN_PKGBASE}.efi}"
 CIZEN_UKI_REQUIRED="${CIZEN_UKI_REQUIRED:-0}"
 CIZEN_UKI_FORCE_DIRECT="${CIZEN_UKI_FORCE_DIRECT:-0}"
 CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK="${CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK:-0}"
+# Boot counting de systemd-boot: si CIZEN_BOOT_TRIES>0 la UKI se escribe con un
+# contador de intentos (arch-linux-cizen-v3+N.efi). Cada boot SIN completar
+# boot-complete.target resta 1; al llegar a 0 la entrada pasa a "bad" y
+# systemd-boot arranca otra (p.ej. el LTS). Cuando el arranque completa,
+# systemd-bless-boot renombra la UKI a nombre plano (sin contador). 0 desactiva.
+CIZEN_BOOT_TRIES="${CIZEN_BOOT_TRIES:-3}"
 
 cizen_uki_fail() {
     if [ "${CIZEN_UKI_REQUIRED}" = 1 ]; then
@@ -3140,6 +3223,33 @@ cizen_uki_fail() {
         warn "$*"
         return 0
     fi
+}
+
+# Nombre EFI real de la UKI: con contador si CIZEN_BOOT_TRIES>0, si no plano.
+cizen_uki_efi_name() {
+    local base="${CIZEN_UKI_NAME%.efi}"
+    if [ "${CIZEN_BOOT_TRIES:-0}" -gt 0 ]; then
+        printf '%s+%s.efi\n' "$base" "${CIZEN_BOOT_TRIES}"
+    else
+        printf '%s\n' "$CIZEN_UKI_NAME"
+    fi
+}
+
+# Limpia variantes antiguas de la UKI (nombre plano bendecido por
+# systemd-bless-boot y contadores pendientes de boots previos) para que tras
+# cada build solo quede la del kernel actual.
+cizen_uki_cleanup_variants() {
+    local base current r f
+    base="${CIZEN_UKI_NAME%.efi}"
+    current="$(cizen_uki_efi_name)"
+    for r in /efi /boot/efi /boot; do
+        [ -d "$r" ] || continue
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            [ "$(basename -- "$f")" = "$current" ] && continue
+            sudo rm -f -- "$f" 2>/dev/null || true
+        done < <(sudo find "$r" -maxdepth 5 -type f \( -name "${base}.efi" -o -name "${base}+*.efi" \) 2>/dev/null || true)
+    done
 }
 
 find_cizen_installed_kernel() {
@@ -3232,7 +3342,7 @@ any=true
 if [ "$mtime" -lt "$cutoff" ]; then
 return 1
 fi
-done < <(find_cizen_uki_targets "$CIZEN_UKI_NAME" || true)
+done < <(find_cizen_uki_targets "$(cizen_uki_efi_name)" || true)
 [ "$any" = true ]
 }
 
@@ -3328,17 +3438,17 @@ sync_cizen_efi() {
     local -a targets=()
     while IFS= read -r out; do
         [ -n "$out" ] && targets+=("$out")
-    done < <(find_cizen_uki_targets "$CIZEN_UKI_NAME" || true)
+    done < <(find_cizen_uki_targets "$(cizen_uki_efi_name)" || true)
 
     if [ "${#targets[@]}" -eq 0 ]; then
         local esp
         esp="$(detect_cizen_esp_root)" || true
         if [ -z "$esp" ]; then
             rm -f "$cmdline_file"
-            cizen_uki_fail "No encontré una partición EFI montada ni ${CIZEN_UKI_NAME}; no actualizo el .efi."
+            cizen_uki_fail "No encontré una partición EFI montada ni $(cizen_uki_efi_name); no actualizo el .efi."
             return 0
         fi
-        targets=("$esp/EFI/Linux/$CIZEN_UKI_NAME")
+        targets=("$esp/EFI/Linux/$(cizen_uki_efi_name)")
     fi
 
     tmp="$(mktemp /tmp/cizen-uki.XXXXXX)" || {
@@ -3349,9 +3459,11 @@ sync_cizen_efi() {
 
     if ! build_cizen_uki "$kernel" "$cmdline_file" "$tmp"; then
         rm -f "$tmp" "$cmdline_file"
-        cizen_uki_fail "No pude generar la UKI (${CIZEN_UKI_NAME}). Instala ukify (systemd) o binutils y verifica /usr/lib/systemd/boot/efi/linuxx64.efi.stub."
+        cizen_uki_fail "No pude generar la UKI ($(cizen_uki_efi_name)). Instala ukify (systemd) o binutils y verifica /usr/lib/systemd/boot/efi/linuxx64.efi.stub."
         return 0
     fi
+
+    cizen_uki_cleanup_variants
 
     for out in "${targets[@]}"; do
         log "Actualizando .efi: $out"
@@ -3492,6 +3604,90 @@ menuconfig_edit() {
   return 0
 }
 
+# --hardened: auditoría de endurecimiento del kernel EN EJECUCIÓN. Lee /proc/config.gz
+# (postura real de la configuración: stack protección, fortify, usercopy, ASLR, ...)
+# y los knobs sysctl vivos (randomize_va_space, dmesg_restrict, kptr_restrict...).
+# Sin efectos laterales: imprime tabla con ✓/✗ y resumen, y sale sin modificar nada.
+run_hardened_audit() {
+  local line sym exp desc kw val nok=0 nbad=0
+  local -a cfg_lines=()
+  mapfile -t cfg_lines < <(zcat /proc/config.gz 2>/dev/null || true)
+  if [ "${#cfg_lines[@]}" -eq 0 ]; then
+    warn "No se pudo leer /proc/config.gz (CONFIG_IKCONFIG_PROC necesario)."
+    return 1
+  fi
+  declare -A CFG=()
+  local ln re='^CONFIG_([A-Za-z0-9_]+)=("[^"]*"|[ym])$'
+  for ln in "${cfg_lines[@]}"; do
+    if [[ "$ln" =~ $re ]]; then
+      CFG["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+    elif [[ "$ln" =~ ^#\ CONFIG_([A-Za-z0-9_]+)\ is\ not\ set$ ]]; then
+      CFG["${BASH_REMATCH[1]}"]="n"
+    fi
+  done
+
+  local -a CHECKS=(
+    "STACKPROTECTOR_STRONG:y:Stack fortalecido (canarios en todas las cajas)"
+    "FORTIFY_SOURCE:y:Memcpy/memset fortificados (límites en tiempo de compilación y exec)"
+    "HARDENED_USERCOPY:y:Usercopy validada (mitigan overflows copy_from/to_user)"
+    "SLAB_FREELIST_RANDOM:y:Freelist de slab aleatorizada"
+    "SLAB_FREELIST_HARDENED:y:Freelist de slab endurecida (obliteración de metadatos)"
+    "REFCOUNT_FULL:y:Contadores de ref con wrap protegido a 32 bits"
+    "VMAP_STACK:y:Pilas de kernel en mem. vmalloc (metadatos anónimos)"
+    "STRICT_KERNEL_RWX:y:Regiones de kernel RO+X (no writable+executable)"
+    "STRICT_MODULE_RWX:y:Regiones de módulos RO+X"
+    "RANDOMIZE_BASE:y:ASLR del kernel (KASLR)"
+    "MODULE_SIG_FORCE:y:Solo se cargan módulos firmados"
+    "BPF_UNPRIV_DEFAULT_OFF:y:bpf sin privilegios desactivado por defecto"
+  )
+
+  echo
+  info "Auditoría hardening — kernel en ejecución $(uname -r)"
+  for line in "${CHECKS[@]}"; do
+    IFS=: read -r sym exp desc <<< "$line"
+    val="${CFG[$sym]:-}"
+    [ -n "$val" ] || val="no configurado"
+    case "$val" in
+      "$exp") ok "  $sym  ($desc) → $val" ; nok=$((nok + 1)) ;;
+      "n")    warn "$sym = n  (esperado $exp): $desc" ; nbad=$((nbad + 1)) ;;
+      "m")    warn "$sym = m  (esperado $exp): $desc" ; nbad=$((nbad + 1)) ;;
+      *)      warn "$sym = $val (esperado $exp): $desc" ; nbad=$((nbad + 1)) ;;
+    esac
+  done
+
+  local -a KNOBS=(
+    "kernel.randomize_va_space:2:ASLR del espacio de usuario (2 = completo)"
+    "kernel.dmesg_restrict:1:Acceso a dmesg restringido"
+    "kernel.kptr_restrict:1:Ocultar punteros de /proc"
+    "kernel.unprivileged_bpf_disabled:2:bpf sin privilegios desactivado"
+    "fs.protected_hardlinks:1:Links duros restringidos"
+    "fs.protected_symlinks:1:Enlaces simbólicos restringidos"
+    "fs.suid_dumpable:0:Resumen de proceso con suid sin core dump"
+  )
+  echo "  ----- knobs sysctl vivos -----"
+  for knobs in "${KNOBS[@]}"; do
+    IFS=: read -r kw exp desc <<< "$knobs"
+    val="$(sysctl -n "$kw" 2>/dev/null || true)"
+    if [ -z "$val" ]; then
+      info "  $kw: no disponible"
+    elif [ "$val" = "$exp" ]; then
+      ok "  $kw = $val ($desc)"
+      nok=$((nok + 1))
+    else
+      warn "  $kw = $val (esperado $exp): $desc"
+      nbad=$((nbad + 1))
+    fi
+  done
+
+  echo
+  if [ "$nbad" -gt 0 ]; then
+    warn "Hardening: $nok OK, $nbad recomendaciones pendientes."
+  else
+    ok "Hardening: $nok OK, sin recomendaciones pendientes."
+  fi
+  [ "$nbad" -eq 0 ]
+}
+
 # --selftest: autoevaluación del motor (sintaxis, perfil, herramientas) + el
 # harness funcional de la suite cuando existe.
 run_selftest() {
@@ -3528,9 +3724,10 @@ run_selftest() {
   done
 
   local harness="$SCRIPT_DIR/tests/selftest.sh"
-  # Si aún no está instalado en la suite (crear tests/ exige sudo), se cae al
-  # espejo del repo git local (no compromete la suite de producción).
+  # Si aún no está instalado en la suite (crear tests/ exige sudo), se cae a
+  # los espejos del repo git local (no compromete la suite de producción).
   [ -f "$harness" ] || harness="$HOME/cizen-linux-kernel-update/kernel-update/tests/selftest.sh"
+  [ -f "$harness" ] || harness="$HOME/Proyectos/cizen-linux-kernel-update/kernel-update/tests/selftest.sh"
   if [ -f "$harness" ]; then
     info "Ejecutando harness funcional: $harness"
     if bash "$harness" "$0"; then
@@ -3712,6 +3909,10 @@ PKG_NAME=""
 PKG_VERSION=""
 
 # Modos de mantenimiento sin sudo/red/descarga: se ejecutan pronto y salen.
+if [ "$HARDENED_AUDIT" = true ]; then
+  run_hardened_audit || exit 1
+  exit 0
+fi
 if [ "$SELFTEST" = true ]; then
   run_selftest || exit 1
   exit 0
@@ -3804,6 +4005,8 @@ sudo -v
 # pacman, escritura en el ESP, etc.) están permitidas por sudo, antes de
 # gastar minutos en descarga/compilación.
 check_sudo_capabilities
+
+check_build_memory
 
 # Solo se valida el punto de montaje dedicado de compilación. El /tmp global
 # no participa en la lógica de validación ni se modifica.
@@ -4180,13 +4383,40 @@ done < <(find "$SRC" -maxdepth 1 -type f -name "$CIZEN_PKGBASE-*.pkg.tar.zst" -p
 unset __oldpkg
 sudo_keepalive_start
 build_rc=0
+# Cgroup dedicado para la compilación: systemd-run --scope coloca make en un
+# scope propio con CPUWeight/IOWeight según la prioridad configurada (normal =
+# peso 100/100; low = 30/1, dando la CPU a ~todo el sistema). Si systemd-run
+# no existe o el probe de delegación cgroup falla, se degrada a nice/ionice.
+SCOPE_RUNNER=()
+if command -v systemd-run >/dev/null 2>&1 && [ -d /sys/fs/cgroup ]; then
+  case "$BUILD_PRIORITY" in
+    normal) cpu_w=100; io_w=100 ;;
+    *)      cpu_w=30;  io_w=1 ;;
+  esac
+  if systemd-run --scope --quiet --unit="cizen-probe-$$.scope" \
+       --property="CPUWeight=$cpu_w" --property="IOWeight=$io_w" true 2>/dev/null; then
+    SCOPE_RUNNER=(systemd-run --scope --quiet --unit="k-update-${TS}-build.scope" \
+      --property="CPUWeight=$cpu_w" --property="IOWeight=$io_w")
+    info "Compilación en scope cgroup dedicado (CPUWeight=$cpu_w, IOWeight=$io_w)."
+  else
+    warn "systemd-run --scope no puede delegar el cgroup; se usan nice/ionice clásicos (${BUILD_PRIORITY_WRAP[*]:-sin limitación})."
+  fi
+fi
+# Notificación de escritorio al terminar (build ok / build rota). Obvia si el
+# binario no existe o si CIZEN_NOTIFY=0.
+notify_desktop() {
+  [ "${CIZEN_NOTIFY:-1}" = "1" ] || return 0
+  command -v "${CIZEN_NOTIFY_BIN:-notify-send}" >/dev/null 2>&1 || return 0
+  DISPLAY="${DISPLAY:-:0}" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
+    "${CIZEN_NOTIFY_BIN:-notify-send}" -a 'Kernel Updater' -u normal -t 15000 "$1" "$2" >/dev/null 2>&1 || true
+}
 # --foreground: hace que make corra en el MISMO grupo de procesos de la
 # terminal. Sin él, timeout(1) crea un grupo propio para make, aislado del
 # foreground de la terminal, de modo que Ctrl+C (SIGINT al grupo foreground)
 # solo llegaba al script y NO cancelaba la compilación. Con --foreground,
 # Ctrl+C llega directo a make (que ya tiene traps INT/TERM y remata sus .o y
 # sub-makes), permitiendo cancelar la build en cualquier momento.
-if time "${BUILD_PRIORITY_WRAP[@]}" timeout --foreground --signal=TERM --kill-after=60s "$BUILD_TIMEOUT" \
+if time "${SCOPE_RUNNER[@]:-}" timeout --foreground --signal=TERM --kill-after=60s "$BUILD_TIMEOUT" \
     make -j"$JOBS" "${MAKE_CC_OPTS[@]}" KBUILD_REVISION="$PKGREL" pacman-pkg; then
   :
 else
@@ -4200,12 +4430,14 @@ else
     err "Compilación falló (rc=$build_rc)."
   fi
   err "Fuentes conservadas en: $SRC"
+  notify_desktop "Kernel Cizen: compilación FALLÓ" "$VERSION-cizen-v3 (rc=$build_rc); fuentes en $SRC"
   exit 1
 fi
 
 END="$(date +%s)"
 DUR=$((END - START))
 ok "Compilación completada en $((DUR/60))m $((DUR%60))s"
+notify_desktop "Kernel Cizen: compilación terminada" "$VERSION-cizen-v3 ($((DUR/60))m $((DUR%60))s, $JOBS hilos; ahora instala/Uki)"
 restore_package_revision_override
 restore_package_identity_override
 

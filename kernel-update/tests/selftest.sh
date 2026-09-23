@@ -124,6 +124,10 @@ PATCH_ENABLE_ALL=()
 PATCH_REBEL_ALL=()
 BORE_ENABLED=false
 DL_CALLED=0
+# Anclaje SHA256 activo: los parches de prueba son sintéticos, así que se fija
+# el pin a su hash para que el flujo completo se valide por el camino "hash OK".
+export CIZEN_PATCH_SHA256_MAIN="$(sha256sum "$ROOT/patch-cachy.patch" | cut -d' ' -f1)"
+export CIZEN_PATCH_SHA256_FALLBACK="$(sha256sum "$ROOT/patch-upstream.patch" | cut -d' ' -f1)"
 # destino sucio previo: el motor DEBE borrarlo antes de cada descarga
 printf 'BASURA-STALE\n' > "$KERNEL_BUILD_ROOT/bore-7.2.patch"
 if apply_patch_plugin bore; then
@@ -145,6 +149,19 @@ if apply_patch_plugin bore; then
 else
   rec fail "el flujo completo debía aplicar (upstream aplicable)"
 fi
+
+printf '%s\n' "== apply_patch_plugin: pin SHA256 rechaza hash no anclado =="
+rm -rf "$SRC/kernel/sched" "$KERNEL_BUILD_ROOT"/*
+mkdir -p "$SRC"
+PATCHES_APPLIED=(); PATCH_ENABLE_ALL=(); PATCH_REBEL_ALL=(); BORE_ENABLED=false
+export CIZEN_PATCH_SHA256_FALLBACK="0000000000000000000000000000000000000000000000000000000000000000"
+if apply_patch_plugin bore; then
+  rec fail "el pin SHA256 incorrecto debía rechazar el parche"
+else
+  rec ok "pin SHA256 incorrecto -> rechaza el parche (fatal suave, degrada vanilla)"
+fi
+[ "${PATCHES_APPLIED[*]:-}" = "" ] && rec ok "pin rechazado: bore no se registró" || rec fail "bore se registró pese al pin no válido"
+unset CIZEN_PATCH_SHA256_FALLBACK
 
 printf '%s\n' "== apply_patch_plugin: árbol conservado ya parcheado (v27.22.4) =="
 mkdir -p "$SRC/kernel/sched"

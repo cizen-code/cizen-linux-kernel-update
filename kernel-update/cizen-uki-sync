@@ -20,6 +20,10 @@
 #   CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK  copiar el vmlinuz pelado (default 0)
 #   CIZEN_UKI_KEEP_INITRAMFS             conservar /boot/initramfs-*.img tras
 #                                         integrarlo en la UKI (default 0)
+#   CIZEN_BOOT_TRIES         boot counting de systemd-boot: intentos de arranque
+#                            antes del fallback automático (arch-linux-cizen-v3+N.efi;
+#                            renombrada a plano por systemd-bless-boot al completar
+#                            boot-complete.target). 0 = sin contador (default 3)
 # ============================================================
 
 set -Eeuo pipefail
@@ -31,6 +35,7 @@ CIZEN_UKI_PKGBASE="${CIZEN_UKI_PKGBASE:-linux-cizen-v3}"
 CIZEN_UKI_SUFFIX="${CIZEN_UKI_SUFFIX:--cizen-v3}"
 CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK="${CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK:-0}"
 CIZEN_UKI_KEEP_INITRAMFS="${CIZEN_UKI_KEEP_INITRAMFS:-0}"
+CIZEN_BOOT_TRIES="${CIZEN_BOOT_TRIES:-3}"
 
 # ── Colores ─────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -194,6 +199,29 @@ build_uki() {
   return 1
 }
 
+uki_efi_name() {
+  local base="${CIZEN_UKI_NAME%.efi}"
+  if [ "${CIZEN_BOOT_TRIES:-0}" -gt 0 ]; then
+    printf '%s+%s.efi\n' "$base" "${CIZEN_BOOT_TRIES}"
+  else
+    printf '%s\n' "$CIZEN_UKI_NAME"
+  fi
+}
+
+cleanup_uki_variants() {
+  local base current r f
+  base="${CIZEN_UKI_NAME%.efi}"
+  current="$(uki_efi_name)"
+  for r in /efi /boot/efi /boot; do
+    [ -d "$r" ] || continue
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      [ "$(basename -- "$f")" = "$current" ] && continue
+      "${SUDO[@]}" rm -f -- "$f" 2>/dev/null || true
+    done < <("${SUDO[@]}" find "$r" -maxdepth 5 -type f \( -name "${base}.efi" -o -name "${base}+*.efi" \) 2>/dev/null || true)
+  done
+}
+
 targets_are_current() {
   local cutoff=$((START_EPOCH - 2))
   local f mtime any=false
@@ -204,7 +232,7 @@ targets_are_current() {
     if [ "$mtime" -lt "$cutoff" ]; then
       return 1
     fi
-  done < <(find_uki_targets "$CIZEN_UKI_NAME" || true)
+  done < <(find_uki_targets "$(uki_efi_name)" || true)
   [ "$any" = true ]
 }
 
@@ -213,7 +241,7 @@ if [ "${1:-}" = "--dry-run" ]; then
   DRY_RUN=1
 fi
 
-info "cizen-uki-sync — objetivo: $CIZEN_UKI_NAME"
+info "cizen-uki-sync — objetivo: $(uki_efi_name)"
 info "pkgbase: $CIZEN_UKI_PKGBASE | suffix: $CIZEN_UKI_SUFFIX"
 
 kernel="$(find_cizen_installed_kernel || true)"
@@ -228,15 +256,15 @@ info "cmdline: $(<"$cmdline_file")"
 targets=()
 while IFS= read -r t; do
   [ -n "$t" ] && targets+=("$t")
-done < <(find_uki_targets "$CIZEN_UKI_NAME" || true)
+done < <(find_uki_targets "$(uki_efi_name)" || true)
 
 if [ "${#targets[@]}" -eq 0 ]; then
   esp="$(detect_esp_root 2>/dev/null || true)"
   if [ -z "$esp" ]; then
     rm -f "$cmdline_file"
-    fatal "No encontré una partición EFI montada ni $CIZEN_UKI_NAME en el ESP; no hay nada que actualizar."
+    fatal "No encontré una partición EFI montada ni $(uki_efi_name) en el ESP; no hay nada que actualizar."
   fi
-  targets=("$esp/EFI/Linux/$CIZEN_UKI_NAME")
+  targets=("$esp/EFI/Linux/$(uki_efi_name)")
 fi
 
 if [ "$DRY_RUN" = 1 ]; then
@@ -264,9 +292,11 @@ trap 'rm -f "$tmp" "$cmdline_file"' EXIT
 embedded_initrd=""
 
 if ! build_uki "$kernel" "$cmdline_file" "$tmp"; then
-  fatal "No pude generar la UKI ($CIZEN_UKI_NAME). Instala ukify (systemd-ukify) o binutils y verifica /usr/lib/systemd/boot/efi/linuxx64.efi.stub."
+  fatal "No pude generar la UKI ($(uki_efi_name)). Instala ukify (systemd-ukify) o binutils y verifica /usr/lib/systemd/boot/efi/linuxx64.efi.stub."
 fi
 ok "UKI generada en temporal."
+
+cleanup_uki_variants
 
 for t in "${targets[@]}"; do
   log "Actualizando .efi: $t"

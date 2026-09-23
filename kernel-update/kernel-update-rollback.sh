@@ -5,9 +5,10 @@
 # $ROLLBACK_DIR (/var/lib/kernel-update/rollback por defecto).
 #
 # El archive contiene los módulos (/usr/lib/modules/<release>),
-# /boot/vmlinuz-linux-cizen-v3 y la UKI que se estaba arrancando
-# (boot/EFI/Linux/arch-linux-cizen-v3.efi). krollback los restaura
-# y deja la máquina lista para `sudo reboot` con el kernel anterior.
+# /boot/vmlinuz-linux-cizen-v3 y la/las UKI del ESP
+# (boot/EFI/Linux/arch-linux-cizen-v3.efi y sus variantes +N de boot counting).
+# krollback los restaura y deja la máquina lista para `sudo reboot` con el
+# kernel anterior.
 #
 # Uso:
 #   krollback --list             # listar el archive disponible

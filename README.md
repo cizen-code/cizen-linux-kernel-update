@@ -79,8 +79,62 @@ con otras herramientas):
 | absorb-rebels | `kernel-update.sh <ver> --absorb-rebels` | Mueve a `EXPECTED_REBELS` los símbolos que Kconfig conserva por dependencias, dejando el perfil limpio. Desde v27.25.1 el propio check lo ofrece interactivamente antes de compilar (si la auditoría reporta que Kconfig conserva desactivaciones), sin necesidad del flag |
 | no-prune | `kernel-update.sh <ver> --no-prune` | Desactiva la poda de módulos (default: activada) |
 | changelog | `kernel-update.sh --changelog` | Bumpea banner + `SCRIPT_VERSION` y añade el borrador del siguiente release a `CHANGELOG.md` |
+| hardened | `kernel-update.sh --hardened` | Auditoría de endurecimiento del kernel EN EJECUCIÓN (símbolos de /proc/config.gz + knobs sysctl vivos); sin efectos laterales |
 
-El **modo lite es el ÚNICO modo de compilación** de esta suite (v27.25.4): la
+### Prioridad de compilación y cgroups
+
+`CIZEN_BUILD_PRIORITY=normal` (menú: opciones 2/4/8) compila a **prioridad
+máxima**: se salta nice/ionice. La prioridad por defecto es `low`
+(`nice -n 10` + `ionice -c 3`).
+
+Cuando `systemd-run` está disponible, la compilación se ejecuta en un **scope
+cgroup dedicado**: `CPUWeight=100,IOWeight=100` en prioridad normal y
+`CPUWeight=30,IOWeight=1` en baja (da la CPU/IO al resto del sistema). Si el
+probe de delegación del cgroup falla, se degrada automáticamente al wrap
+nice/ionice clásico. Al terminar (éxito o fallo) se envía una notificación de
+escritorio (notify-send; desactivable con `CIZEN_NOTIFY=0`).
+
+### Recuperación de arranque (boot counting)
+
+Desde esta versión la UKI se escribe con un **contador de intentos** de
+systemd-boot (`arch-linux-cizen-v3+3.efi`): en cada boot sin completar
+`boot-complete.target` resta 1; al agotarse, sd-boot marca la entrada como
+`bad` y arranca el kernel previo (p. ej. el LTS) en lugar de dejarte fuera del
+sistema. `systemd-bless-boot.service` (activación automática, no hay que
+habilitarla) renombra la UKI a nombre plano cuando el arranque completa.
+Configurable con `CIZEN_BOOT_TRIES` (0 = UKI plana, sin boot counting). El
+guard de `kernel-update-verify.sh` (check GUARD) avisa en el login siguiente si
+el kernel arrancado no es el último Cizen instalado.
+
+### Anclaje SHA256 de los parches
+
+Los parches BORE (principal de CachyOS y respaldo upstream) se verifican por
+**SHA256 antes de aplicarse**: si el contenido descargado no coincide con el
+hash anclado en el descriptor del motor, el parche se descarta y el build se
+degrada a vanilla (nunca se aplica un parche cuya procedencia no casa con el
+pin). Overrides: `CIZEN_PATCH_SHA256_MAIN` / `CIZEN_PATCH_SHA256_FALLBACK`
+(otro hash bueno conocido); `CIZEN_PATCH_SHA256_VERIFY=0` desactiva el pin
+(último recurso). Al actualizar a una rama nueva puede ser necesario renovar
+los hashes.
+
+### Guarda OOM pre-build
+
+Antes de descargar, el motor aborta con mensaje claro si la memoria disponible
+(MemAvailable+SwapFree) o el espacio libre del tmpfs de compilación no llegan
+a umbrales mínimos — el enlace con BTF es el punto más hambriento. Umbrales
+configurables: `CIZEN_BUILD_MIN_MEM_MB=8192`, `CIZEN_BUILD_MIN_TMPFS_MB=6144`,
+`CIZEN_BUILD_MIN_MEM_BTF_MB=12288`, `CIZEN_BUILD_MIN_TMPFS_BTF_MB=8192`.
+
+### Verificación post-boot (kernel-update-verify.sh)
+
+Además de PERFIL/BOOT/JOURNAL, el verificador hace en cada arranque:
+- **GUARD**: avisa si arrancó un kernel que no es el último Cizen instalado
+  (fallback por boot counting o selección manual del LTS).
+- **FIRMWARE**: por cada módulo cargado, `modinfo -F firmware` se contrasta
+  contra `/usr/lib/firmware` (acepta binarios `.zst`) y se escanean los fallos
+  "Direct firmware load failed" del journal del boot actual.
+
+El modo lite es el **ÚNICO modo de compilación** de esta suite (v27.25.4): la
 config siempre se adelgaza con `make localmodconfig` antes de compilar. No
 existe build "completo" ni toggle (`--no-lite`/`CIZEN_LITE` fueron eliminados).
 

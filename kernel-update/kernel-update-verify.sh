@@ -15,6 +15,12 @@
 #   c) JOURNAL  : cuenta patrones de regresión del kernel (oops/panic/GPU
 #                 hang/hung task/... ) en el journal del boot actual y avisa
 #                 si aparecen más que en el boot previo.
+#   d) GUARD    : avisa si el kernel arrancado NO es el último Cizen instalado
+#                 (fallback de sd-boot por boot counting, o selección manual).
+#   e) FIRMWARE : por cada módulo cargado, modinfo -F firmware → se verifica que
+#                 el fichero exista en /usr/lib/firmware; además se escanea el
+#                 journal del kernel por "Direct firmware load failed". Avisa
+#                 de cualquier firmware ausente/infallible del boot actual.
 #
 # Estado/log en ~/.local/state/kernel-update/. Solo notifica discrepancias
 # (o el primer arranque de un kernel nuevo). Uso: --dry-run para imprimir
@@ -26,6 +32,7 @@
 #   CIZEN_VERIFY_BOOT_FACTOR umbral de empeoramiento de boot (default 1.35)
 #   CIZEN_VERIFY_BOOT_MIN_DELTA  delta mínimo en s (default 3)
 #   CIZEN_NOTIFY_BIN         binario de notificación (default notify-send)
+#   CIZEN_FIRMWARE_DIR       raíz de firmware a auditar (default /usr/lib/firmware)
 # ============================================================
 
 set -uo pipefail
@@ -38,6 +45,7 @@ HIST="$STATE_DIR/verify-history"
 BUILD_SIG="$STATE_DIR/last-build"
 RENAME_MAP_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/kernel-update/rename-map.conf"
 NOTIFY_BIN="${CIZEN_NOTIFY_BIN:-notify-send}"
+FIRMWARE_DIR="${CIZEN_FIRMWARE_DIR:-/usr/lib/firmware}"
 
 BOOT_FACTOR="${CIZEN_VERIFY_BOOT_FACTOR:-1.35}"
 BOOT_MIN_DELTA="${CIZEN_VERIFY_BOOT_MIN_DELTA:-3}"
@@ -359,12 +367,69 @@ journal_check() {
   return 0
 }
 
+# ---------- 4) GUARD (boot counting / fallback) ----------
+guard_check() {
+  local expected=""
+  expected="$(ls -1d /usr/lib/modules/*-cizen-v3 2>/dev/null | sed -E 's#.*/##' | sort -V | tail -n1 || true)"
+  if [ -z "$expected" ]; then
+    [ "${DRY:-false}" = true ] && info "Guard: no hay kernel Cizen instalado."
+    return 0
+  fi
+  if [ "$CUR_VERSION" = "$expected" ]; then
+    [ "${DRY:-false}" = true ] && info "Guard: arrancó el kernel esperado ($expected)."
+    return 0
+  fi
+  warn "Guard: arrancó $CUR_VERSION, pero el último Cizen instalado es $expected (¿boot counting agotado y sd-boot hizo fallback, o selección manual del LTS?)."
+  ISSUES=$((ISSUES + 1))
+}
+
+# ---------- 5) FIRMWARE ----------
+firmware_missing_for_module() {
+  local mod="$1" out fw rel
+  out="$(modinfo -F firmware "$mod" 2>/dev/null || true)"
+  [ -n "$out" ] || return 0
+  while IFS= read -r fw; do
+    [ -n "$fw" ] || continue
+    rel="${fw#firmware/}"
+    # El árbol linux-firmware almacena los binarios comprimidos como .zst
+    if [ ! -f "$FIRMWARE_DIR/$rel" ] && [ ! -f "$FIRMWARE_DIR/$rel.zst" ]; then
+      printf '%s (%s)\n' "$fw" "$mod"
+    fi
+  done <<< "$out"
+}
+
+firmware_check() {
+  local mod f line
+  local -a missing=() kfail=() all=()
+  FW_COUNT=0
+  while IFS= read -r mod; do
+    [ -n "$mod" ] || continue
+    while IFS= read -r f; do
+      [ -n "$f" ] && missing+=("$f")
+    done < <(firmware_missing_for_module "$mod")
+  done < <(cut -d' ' -f1 /proc/modules 2>/dev/null || true)
+  while IFS= read -r line; do
+    [ -n "$line" ] && kfail+=("$line")
+  done < <(journalctl -k -b 2>/dev/null | grep -oiE 'Direct firmware load (for [^ ]+ )?failed|firmware: failed to load [^ ]+|request_firmware[^)]*failed' | sed -E 's/^[[:space:]]+//' | sort -u || true)
+
+  if [ "${#missing[@]}" -eq 0 ] && [ "${#kfail[@]}" -eq 0 ]; then
+    [ "${DRY:-false}" = true ] && info "Firmware: presentes los requeridos por los módulos cargados."
+    return 0
+  fi
+  while IFS= read -r f; do [ -n "$f" ] && all+=("$f"); done < <(printf '%s\n' "${missing[@]}" "${kfail[@]}" | sort -u || true)
+  FW_COUNT="${#all[@]}"
+  warn "Firmware del boot actual: $FW_COUNT problema(s) (ausentes del árbol o fallos de carga):"
+  for f in "${all[@]}"; do printf '      %s\n' "$f"; done
+  ISSUES=$((ISSUES + FW_COUNT))
+  return 0
+}
+
 # ---------- notificación ----------
 notify_issues() {
   local title body prof_txt
   if [ "$PROFILE_OK" = 1 ]; then prof_txt="OK"; else prof_txt="FALLO"; fi
   title="Kernel Cizen: $CUR_VERSION verificado con ${ISSUES} incidencias"
-  body="Perfil: $prof_txt | Boot: $TOT_TXT | Journal: $JCOUNT patrones"
+  body="Perfil: $prof_txt | Boot: $TOT_TXT | Journal: $JCOUNT patrones | FW: $FW_COUNT"
   if [ "$DRY" = true ]; then
     echo "  (dry-run) Notificarías: $title — $body"
     return 0
@@ -414,6 +479,11 @@ boot_check "$BT_FW" "$BT_LD" "$BT_KE" "$BT_US" "$BT_TOT"
 JCOUNT="$(journal_count)"
 journal_check "$JCOUNT"
 
+guard_check "$CUR_VERSION"
+
+FW_COUNT=0
+firmware_check
+
 read -r P_VER P_KE P_US P_TOT P_J P_ISS P_TS < "$LAST"
 FIRST_BOOT=false
 if [ "${P_VER:-}" != "$CUR_VERSION" ]; then FIRST_BOOT=true; fi
@@ -438,8 +508,9 @@ echo " Kernel en ejecución : $CUR_VERSION"
 echo " Perfil              : $PROFILE_OUT_TXT"
 echo " Boot (systemd)      : total $TOT_TXT (previo: ${P_TOT:-—}s, ${P_VER:-—})"
 echo " Journal (boot atual): $JCOUNT patrones (previo: ${P_J:-—})"
+echo " Firmware            : $FW_COUNT problema(s)"
 echo " Incidencias         : $ISSUES"
-logger_line="${CUR_VERSION} perf=$PROFILE_OK boot=$TOT_N j=$JCOUNT iss=$ISSUES prev=${P_TOT:-0} prevver=${P_VER:-none}"
+logger_line="${CUR_VERSION} perf=$PROFILE_OK boot=$TOT_N j=$JCOUNT fw=$FW_COUNT iss=$ISSUES prev=${P_TOT:-0} prevver=${P_VER:-none}"
 alog "verify done: $logger_line"
 
 if [ "$ISSUES" -gt 0 ]; then

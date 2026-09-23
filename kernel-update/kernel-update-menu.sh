@@ -98,6 +98,7 @@ echo "  ${W}Mantenimiento${N}"
 opt 10 "kcfg"       "editar config con menuconfig"
 opt 11 "selftest"   "autoevaluación del motor"
 opt 12 "changelog"  "bump + borrador → CHANGELOG.md"
+opt 13 "hardened"   "auditoría hardening del kernel en ejecución"
 rule
 echo "  ${W}Consulta y sistema${N}"
 opt 6 "check-update" "última stable de kernel.org"
@@ -105,7 +106,7 @@ opt 9 "rollback"    "restaurar kernel previo"
 rule
 
 while true; do
-  read -r -p "${W}  [0-12] > ${N}" choice
+  read -r -p "${W}  [0-13] > ${N}" choice
   case "$choice" in
     1) exec "$SCRIPT" --absorb-rebels --check ;;
     2) CIZEN_BUILD_PRIORITY=normal exec "$SCRIPT" --absorb-rebels --check ;;
@@ -119,6 +120,7 @@ while true; do
     10) exec "$SCRIPT" --absorb-rebels --menuconfig ;;
     11) exec "$SCRIPT" --selftest ;;
     12) exec "$SCRIPT" --changelog ;;
+    13) exec "$SCRIPT" --hardened ;;
     0) echo "  Saliendo."; exit 0 ;;
     *) printf '  %bOpción no válida: %s%b\n' "$R" "$choice" "$N" ;;
   esac

@@ -5,6 +5,49 @@ changelog vive en este archivo (no en la cabecera del motor);
 `kernel-update.sh --changelog` añade aquí el borrador del siguiente
 release. Formato inspirado en [Keep a Changelog](https://keepachangelog.com/es/1.1.0/).
 
+## [27.28.0] - 2026-09-23
+
+resiliencia y diagnóstico: recuperación de arranque, verificación post-boot, anclaje SHA256 y auditoría hardening
+
+- **Boot counting para systemd-boot**: la UKI se escribe con contador de
+  intentos (`arch-linux-cizen-v3+3.efi`; `CIZEN_BOOT_TRIES`, 0 = UKI plana).
+  Cada boot sin completar `boot-complete.target` resta 1; al agotarse la
+  entrada pasa a `bad` y sd-boot arranca un kernel previo en lugar de dejar el
+  sistema sin arranque. `systemd-bless-boot.service` (activación automática)
+  renombra la UKI a nombre plano al completar el arranque. Se limpian las
+  variantes antiguas al escribir, y el tar de rollback recoge tanto la UKI
+  plana como las `+N`. El verificador suma el check **GUARD**: avisa si el
+  kernel arrancado no es el último Cizen instalado (fallback detectado).
+- **Verificación post-boot**: `kernel-update-verify.sh` añade el check
+  **FIRMWARE** — por cada módulo cargado, `modinfo -F firmware` se contrasta
+  con `/usr/lib/firmware` (acepta binarios `.zst`; `CIZEN_FIRMWARE_DIR`) y se
+  escanean los fallos de carga del journal del boot actual
+  ("Direct firmware load failed"). La notificación incluye `FW: N`.
+- **Anclaje SHA256 de los parches BORE**: los ficheros principal (CachyOS) y
+  de respaldo upstream se verifican por SHA256 contra hashes fijos en el
+  descriptor del motor antes de aplicarse; si no casan, el parche se descarta
+  y el build se degrada a vanilla (nunca se aplica algo no anclado). Overrides:
+  `CIZEN_PATCH_SHA256_MAIN` / `CIZEN_PATCH_SHA256_FALLBACK` /
+  `CIZEN_PATCH_SHA256_VERIFY=0`.
+- **Guarda OOM pre-build**: `check_build_memory()` aborta antes de descargar
+  si MemAvailable+SwapFree (o el espacio libre del tmpfs de build) no llegan
+  al mínimo, con umbrales distintos para BTF (el enlace es lo más hambriento):
+  `CIZEN_BUILD_MIN_MEM_MB=8192`, `CIZEN_BUILD_MIN_TMPFS_MB=6144`,
+  `CIZEN_BUILD_MIN_MEM_BTF_MB=12288`, `CIZEN_BUILD_MIN_TMPFS_BTF_MB=8192`.
+- **Auditoría `--hardened`**: sin efectos laterales, lee `/proc/config.gz` y
+  los knobs sysctl vivos y reporta la postura de endurecimiento (stack,
+  fortify, usercopy, freelist slab, REFCOUNT_FULL, VMAP_STACK, RWX estricto,
+  KASLR, módulos firmados, sysctl runtime). Menú opción **13**. En el kernel
+  7.2.7 resultaron pendientes: `REFCOUNT_FULL` no configurado, `kptr_restrict=0`,
+  `unprivileged_bpf_disabled=0` y `suid_dumpable=2`.
+- **Cgroups para la compilación**: con `systemd-run --scope` (probe de
+  delegación previo; fallback a nice/ionice) la build corre en un scope propio
+  con `CPUWeight/IOWeight` según prioridad (normal 100/100, low 30/1). Al
+  terminar (éxito o fallo) se envía notificación de escritorio por
+  `notify-send` (`CIZEN_NOTIFY=0` desactiva).
+- Harness ampliado: pin SHA256 al hash real de los parches sintéticos de
+  prueba + caso de rechazo con hash no anclado → selftest 23 ok / 0 fail.
+
 ## [27.27.2] - 2026-09-22
 
 poda: nombres canónicos de módulo (corrige el kernel sin sonido HDMI/analógico)
