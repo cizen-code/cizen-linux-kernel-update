@@ -5,6 +5,39 @@ changelog vive en este archivo (no en la cabecera del motor);
 `kernel-update.sh --changelog` añade aquí el borrador del siguiente
 release. Formato inspirado en [Keep a Changelog](https://keepachangelog.com/es/1.1.0/).
 
+## [27.29.3] - 2026-09-24
+
+memoria de la decisión de firma + guía de BIOS para los pasos manuales
+
+- **La firma se recuerda entre builds**: en modo `auto`, la última decisión
+  explícita (sí/no en el prompt "¿Firmar la UKI?") se guarda en
+  `~/.local/state/kernel-update/sign-uki.state` y se reutiliza en los
+  siguientes builds: ya no vuelve a preguntar, funciona en compilaciones no
+  interactivas (cron/scripts) y no decide en silencio. Secure Boot activo en el
+  firmware sigue forzando la firma SIEMPRE; `--sign`/`--no-sign` y
+  `CIZEN_SIGN_UKI=yes|no` tienen prioridad sobre lo recordado.
+- **Guía de BIOS integrada en el setup guiado**: para los pasos que el script
+  no puede automatizar se imprime un paso-a-paso genérico — cómo devolver el
+  firmware a **SETUP MODE** cuando está en User Mode con claves de fábrica
+  (teclas de acceso, apartados "Secure Boot"/"Security", nombres según
+  fabricante: "Reset to Setup Mode"/"Custom"/borrar claves OEM) y cómo
+  **habilitar Secure Boot** cuando la matrícula ya está hecha pero SB queda off
+  en la BIOS.
+
+## [27.29.2] - 2026-09-24
+
+fix: sbctl sign sin `--save` no registraba las firmas en la BD (sbctl 0.18)
+
+- **Firma registrada en la BD de sbctl**: `sbctl sign` (sbctl ≥0.18) solo
+  "pega" la firma y NO la guarda en la base a menos que se pase `-s/--save`.
+  Sin `--save` el hook de pacman `zz-sbctl.hook` (`sbctl sign-all -g`) no
+  vuelve a firmar systemd-boot/UKI tras las actualizaciones de paquetes, y
+  `sbctl verify` deja de reconocer los ficheros. Se añade `--save` en
+  `cizen-uki-sync`, en la ruta directa del motor (`sync_cizen_efi`) y se
+  documenta el requisito en las cabeceras. (Causa raíz diagnosticada tras
+  fallo de arranque con Secure Boot: firmware Dell solo con claves de fábrica
+  Microsoft — las claves sbctl estaban generadas pero nunca matriculadas.)
+
 ## [27.29.1] - 2026-09-23
 
 setup guiado de Secure Boot al firmar la UKI (create-keys / systemd-boot / enroll)

@@ -30,6 +30,9 @@
 #                            si sbctl está instalado pero SB desactivado, no firma.
 #                            Firmar exige claves generadas (sbctl create-keys); sin
 #                            ellas y con SB desactivado, se advierte y no se firma.
+#                            Las firmas se guardan en la BD con '--save' (sbctl ≥0.18:
+#                            sin -s no quedan registradas y sbctl sign-all no las
+#                            re-firma en las actualizaciones de pacman).
 #
 #   sudo cizen-uki-sync --sign        # además firma la UKI con sbctl (--no-sign lo contrario)
 # ============================================================
@@ -303,8 +306,11 @@ secure_boot_active() {
 sign_uki_targets() {
   local t fail=0
   [ -n "$SBCTL_BIN" ] || { warn "sbctl no está instalado; no se puede firmar la UKI."; return 1; }
+  # --save: desde sbctl 0.18 firmar NO registra la firma en la BD de sbctl;
+  # sin --save el hook de pacman (sbctl sign-all) no re-firma la UKI en
+  # actualizaciones y sbctl verify deja de reconocerla.
   for t in "$@"; do
-    if "${SUDO[@]}" sbctl sign "$t" >/dev/null 2>&1; then
+    if "${SUDO[@]}" sbctl sign --save "$t" >/dev/null 2>&1; then
       ok "Firmada con sbctl: $t"
     else
       err "sbctl sign falló: $t"
