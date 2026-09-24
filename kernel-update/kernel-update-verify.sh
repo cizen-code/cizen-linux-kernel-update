@@ -21,6 +21,10 @@
 #                 el fichero exista en /usr/lib/firmware; además se escanea el
 #                 journal del kernel por "Direct firmware load failed". Avisa
 #                 de cualquier firmware ausente/infallible del boot actual.
+#   f) SECURE BOOT: cruza la firma del último build (sb= en last-build) con el
+#                 estado real de Secure Boot (bootctl status, salida fija con
+#                 LC_ALL=C). Avisa si la UKI se firmó pero SB está desactivado,
+#                 o si SB está activo con la UKI sin firmar (no arrancaría).
 #
 # Estado/log en ~/.local/state/kernel-update/. Solo notifica discrepancias
 # (o el primer arranque de un kernel nuevo). Uso: --dry-run para imprimir
@@ -424,6 +428,40 @@ firmware_check() {
   return 0
 }
 
+# ---------- 6) SECURE BOOT (UKI firmada vs estado real) ----------
+secureboot_check() {
+  # La intención del último build está en last-build (sb=yes|no); el estado
+  # efectivo en bootctl status (con LC_ALL=C la salida es fija).
+  local sb_build="no" sboot="desconocido"
+  if [ -f "$BUILD_SIG" ]; then
+    # shellcheck disable=SC1090,SC1091
+    source "$BUILD_SIG" 2>/dev/null || true
+    sb_build="${sb:-no}"
+  fi
+  case "$(bootctl status 2>/dev/null | grep -m1 'Secure Boot:' || true)" in
+    *'enabled')  sboot="HABILITADO" ;;
+    *'disabled') sboot="desactivado" ;;
+  esac
+  if [ "$sb_build" = "yes" ]; then
+    if [ "$sboot" = "HABILITADO" ]; then
+      SB_STATE="$sb_build (UKI firmada; SB $sboot)"
+      [ "${DRY:-false}" = true ] && info "Secure Boot: $sboot — la UKI del último build se firmó con sbctl."
+    else
+      SB_STATE="$sb_build (UKI firmada pero SB $sboot)"
+      warn "La UKI del último build se firmó con sbctl, pero Secure Boot está $sboot: la firma no tiene efecto. Activa Secure Boot (sbctl enroll-keys + BIOS)."
+      ISSUES=$((ISSUES + 1))
+    fi
+  elif [ "$sboot" = "HABILITADO" ]; then
+    SB_STATE="no (UKI sin firmar)"
+    warn "Secure Boot está HABILITADO pero el último build NO firmó la UKI (sb=no): ese kernel no arrancaría. Recompila con --sign o desactiva Secure Boot."
+    ISSUES=$((ISSUES + 1))
+  else
+    SB_STATE="no (SB $sboot)"
+    [ "${DRY:-false}" = true ] && info "Secure Boot: $sboot — UKI sin firmar (correcto con SB desactivado)."
+  fi
+  return 0
+}
+
 # ---------- notificación ----------
 notify_issues() {
   local title body prof_txt
@@ -459,6 +497,7 @@ notify_first_boot() {
 CUR_VERSION="$(uname -r 2>/dev/null || echo 'desconocido')"
 ISSUES=0
 PROFILE_OK=0
+SB_STATE="?"
 
 if ! load_running_config; then
   warn "No se pudo leer /proc/config.gz; se omite la comprobación de perfil."
@@ -483,6 +522,9 @@ guard_check "$CUR_VERSION"
 
 FW_COUNT=0
 firmware_check
+
+secureboot_check
+SB_STATE="${SB_STATE:-—}"
 
 read -r P_VER P_KE P_US P_TOT P_J P_ISS P_TS < "$LAST"
 FIRST_BOOT=false
@@ -509,8 +551,9 @@ echo " Perfil              : $PROFILE_OUT_TXT"
 echo " Boot (systemd)      : total $TOT_TXT (previo: ${P_TOT:-—}s, ${P_VER:-—})"
 echo " Journal (boot atual): $JCOUNT patrones (previo: ${P_J:-—})"
 echo " Firmware            : $FW_COUNT problema(s)"
-echo " Incidencias         : $ISSUES"
-logger_line="${CUR_VERSION} perf=$PROFILE_OK boot=$TOT_N j=$JCOUNT fw=$FW_COUNT iss=$ISSUES prev=${P_TOT:-0} prevver=${P_VER:-none}"
+ echo " Secure Boot         : $SB_STATE"
+ echo " Incidencias         : $ISSUES"
+ logger_line="${CUR_VERSION} perf=$PROFILE_OK boot=$TOT_N j=$JCOUNT fw=$FW_COUNT sb=${SB_STATE:-?} iss=$ISSUES prev=${P_TOT:-0} prevver=${P_VER:-none}"
 alog "verify done: $logger_line"
 
 if [ "$ISSUES" -gt 0 ]; then

@@ -24,6 +24,12 @@
 #                            antes del fallback automático (arch-linux-cizen-v3+N.efi;
 #                            renombrada a plano por systemd-bless-boot al completar
 #                            boot-complete.target). 0 = sin contador (default 3)
+#   CIZEN_SIGN_UKI            yes|no|auto (default auto): firma de la UKI con sbctl
+#                            (Secure Boot). auto: firma SIEMPRE si Secure Boot está
+#                            activo en el firmware (una UKI sin firmar no arrancaría);
+#                            si sbctl está instalado pero SB desactivado, no firma.
+#
+#   sudo cizen-uki-sync --sign        # además firma la UKI con sbctl (--no-sign lo contrario)
 # ============================================================
 
 set -Eeuo pipefail
@@ -36,6 +42,9 @@ CIZEN_UKI_SUFFIX="${CIZEN_UKI_SUFFIX:--cizen-v3}"
 CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK="${CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK:-0}"
 CIZEN_UKI_KEEP_INITRAMFS="${CIZEN_UKI_KEEP_INITRAMFS:-0}"
 CIZEN_BOOT_TRIES="${CIZEN_BOOT_TRIES:-3}"
+SIGN_REQUEST="${CIZEN_SIGN_UKI:-auto}"
+SBCTL_BIN="$(command -v sbctl 2>/dev/null || true)"
+DO_SIGN=false
 
 # ── Colores ─────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -273,13 +282,96 @@ targets_are_current() {
   [ "$any" = true ]
 }
 
+# Secure Boot habilitado en el firmware: variable UEFI SecureBoot (byte 4 de
+# valor; 01 = activo). Los sysfs efivar son legibles por el usuario; si no,
+# se reintenta elevando.
+secure_boot_active() {
+  local val
+  val="$(od -An -j4 -N1 -tu1 \
+      "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c" \
+      2>/dev/null | tr -d '[:space:]' || true)"
+  if [ -z "$val" ] && [ "${#SUDO[@]}" -gt 0 ]; then
+    val="$("${SUDO[@]}" od -An -j4 -N1 -tu1 \
+        "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c" \
+        2>/dev/null | tr -d '[:space:]' || true)"
+  fi
+  [ "$val" = "1" ]
+}
+
+sign_uki_targets() {
+  local t fail=0
+  [ -n "$SBCTL_BIN" ] || { warn "sbctl no está instalado; no se puede firmar la UKI."; return 1; }
+  for t in "$@"; do
+    if "${SUDO[@]}" sbctl sign "$t" >/dev/null 2>&1; then
+      ok "Firmada con sbctl: $t"
+    else
+      err "sbctl sign falló: $t"
+      fail=1
+    fi
+  done
+  [ "$fail" -eq 0 ] || return 1
+  for t in "$@"; do
+    if "${SUDO[@]}" sbctl verify "$t" >/dev/null 2>&1; then
+      ok "Firma verificada: $t"
+    else
+      err "La verificación de la firma falló: $t"
+      fail=1
+    fi
+  done
+  return "$fail"
+}
+
+# Decide DO_SIGN a partir de CIZEN_SIGN_UKI / --sign / --no-sign. auto firma
+# SIEMPRE con Secure Boot activo (fail-safe: una UKI sin firmar no arrancaría).
+resolve_sign_request() {
+  case "$SIGN_REQUEST" in
+    yes)
+      DO_SIGN=true
+      ok "Firma de la UKI con sbctl forzada (--sign / CIZEN_SIGN_UKI=yes)."
+      return 0
+      ;;
+    no)
+      if secure_boot_active; then
+        fatal "CIZEN_SIGN_UKI/--no-sign pide NO firmar pero Secure Boot está ACTIVO: la UKI sin firmar no arrancaría."
+      fi
+      info "Firma de la UKI desactivada (--no-sign / CIZEN_SIGN_UKI=no)."
+      return 0
+      ;;
+  esac
+  if [ -z "$SBCTL_BIN" ]; then
+    if secure_boot_active; then
+      fatal "Secure Boot está ACTIVO y sbctl no está instalado: la UKI sin firmar no arrancaría. Instala sbctl (sudo pacman -S sbctl)."
+    fi
+    info "sbctl no detectado: la UKI no se firmará."
+    return 0
+  fi
+  if secure_boot_active; then
+    DO_SIGN=true
+    ok "Secure Boot ACTIVO: la UKI se firmará con sbctl (obligatorio)."
+  else
+    info "sbctl disponible pero Secure Boot desactivado: la UKI no se firmará (--sign para forzar)."
+  fi
+  return 0
+}
+
 DRY_RUN=0
-if [ "${1:-}" = "--dry-run" ]; then
-  DRY_RUN=1
-fi
+SIGN_REQUEST="${CIZEN_SIGN_UKI:-auto}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --sign) SIGN_REQUEST="yes"; shift ;;
+    --no-sign) SIGN_REQUEST="no"; shift ;;
+    *) break ;;
+  esac
+done
+case "$SIGN_REQUEST" in
+  yes|no|auto) ;;
+  *) err "CIZEN_SIGN_UKI inválido: $CIZEN_SIGN_UKI (use yes, no o auto)."; exit 1 ;;
+esac
 
 info "cizen-uki-sync — objetivo: $(uki_efi_name)"
 info "pkgbase: $CIZEN_UKI_PKGBASE | suffix: $CIZEN_UKI_SUFFIX"
+resolve_sign_request
 
 kernel="$(find_cizen_installed_kernel || true)"
 if [ -z "$kernel" ] || [ ! -s "$kernel" ]; then
@@ -354,6 +446,17 @@ done
 
 if ! targets_are_current; then
   fatal "La UKI no quedó actualizada después de escribir en el objetivo."
+fi
+
+# Firma de la UKI con sbctl (Secure Boot): tras escribir, se firma y verifica
+# cada objetivo. Con SB activo una UKI sin firmar no arrancaría: fail-safe.
+if [ "$DO_SIGN" = true ]; then
+  if ! sign_uki_targets "${targets[@]}"; then
+    if secure_boot_active; then
+      fatal "La UKI no quedó firmada con Secure Boot ACTIVO: el sistema no arrancaría. Revisa sbctl (sbctl sign / sbctl enroll-keys)."
+    fi
+    fatal "No se pudo firmar la UKI (sbctl sign/verify falló)."
+  fi
 fi
 
 if [ -n "$embedded_initrd" ] && [ "$CIZEN_UKI_KEEP_INITRAMFS" != "1" ] && [ -f "$embedded_initrd" ]; then

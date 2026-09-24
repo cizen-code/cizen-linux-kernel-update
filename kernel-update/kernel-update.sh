@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.28.0 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.29.0 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / XFS / systemd / KVM-libvirt / QEMU-OVMF
 #
@@ -66,6 +66,13 @@
 #   ./kernel-update.sh --hardened                             # auditoría hardening del kernel en ejecución
 #   ./kernel-update.sh --changelog                            # bump versión + borrador en CHANGELOG.md
 #   CIZEN_BOOT_TRIES=3 ./kernel-update.sh <versión>           # boot counting sd-boot (0 = UKI plana)
+#   ./kernel-update.sh <versión> --sign                       # firmar la UKI con sbctl (Secure Boot)
+#   ./kernel-update.sh <versión> --no-sign                    # NO firmar la UKI (evitar con Secure Boot activo)
+#   CIZEN_SIGN_UKI=auto ./kernel-update.sh <versión>          # firma de la UKI con sbctl (auto|yes|no; default auto)
+#     auto: sbctl es dependencia OBLIGATORIA (se ofrece autoinstalarlo) y al
+#     confirmar la compilación (build o recompilación) se sugiere firmar la UKI
+#     (S/n). Con Secure Boot ACTIVO en el firmware la UKI se firma SIEMPRE:
+#     sin firma el sistema no arrancaría.
 #   CIZEN_PATCH_SHA256_VERIFY=0 ./kernel-update.sh <versión>  # desactivar pin SHA256 de los parches
 #   JOBS=3 ./kernel-update.sh <versión>
 #   CIZEN_DOWNLOAD_PARALLEL=8 ./kernel-update.sh <versión>   # conexiones paralelas (aria2c)
@@ -105,7 +112,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.28.0"
+SCRIPT_VERSION="27.29.0"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -205,6 +212,15 @@ HARDENED_AUDIT=false
 PUBLISH_REPO=false
 PUBLISH_REPO_DIR=""
 PUBLISH_REPO_MSG=""
+
+# Firma de la UKI con sbctl (Secure Boot, v27.29.0). auto (default): si sbctl
+# está instalado se sugiere firmar al confirmar la compilación; con Secure Boot
+# activo se firma siempre (una UKI sin firmar no arrancaría). Override por env
+# CIZEN_SIGN_UKI=yes|no|auto; los flags --sign/--no-sign (más abajo) tienen prioridad.
+SIGN_UKI="${CIZEN_SIGN_UKI:-auto}"
+DO_SIGN_UKI=false
+SBCTL_BIN="$(command -v sbctl 2>/dev/null || true)"
+SIGN_UKI_REASON=""
 
 # Rama de kernel.org a seguir: stable (default) o longterm/LTS mayor.
 CIZEN_KERNEL_TRACK="${CIZEN_KERNEL_TRACK:-stable}"
@@ -377,6 +393,10 @@ while [ $# -gt 0 ]; do
       PRUNE_MODULES=0; shift ;;
     --prune)
       PRUNE_MODULES=1; shift ;;
+    --sign)
+      SIGN_UKI="yes"; shift ;;
+    --no-sign)
+      SIGN_UKI="no"; shift ;;
     --list-renames)
       DO_LIST=true; shift ;;
     --rename)
@@ -421,6 +441,10 @@ fi
 case "$PRUNE_MODULES" in
   0|1) ;;
   *) fatal "CIZEN_PRUNE_MODULES inválido: $PRUNE_MODULES (use 0 o 1)." ;;
+esac
+case "$SIGN_UKI" in
+  auto|yes|no) ;;
+  *) fatal "CIZEN_SIGN_UKI inválido: $SIGN_UKI (use auto, yes o no)." ;;
 esac
 # Ruta al podador: en la suite instalada o junto al motor (preferencia a la env).
 if [ -n "${CIZEN_PRUNE_SCRIPT:-}" ]; then
@@ -1040,6 +1064,7 @@ declare -A TOOL_PKG=(
   [make]=make         [mktemp]=coreutils   [mount]=util-linux
   [nproc]=coreutils   [pahole]=pahole     [perl]=perl        [rm]=coreutils
   [sed]=sed
+  [sbctl]=sbctl
   [sleep]=coreutils   [sort]=coreutils     [stat]=coreutils
   [tar]=tar           [timeout]=coreutils  [tr]=coreutils
   [umount]=util-linux [wget]=wget          [xargs]=findutils
@@ -1084,7 +1109,7 @@ install_dependency_packages() {
 
 check_prerequisites() {
   local cmd pkg rc
-  local -a tools=(awk bash bc bison cat ccache cmp cp date df du find findmnt flex flock fuser grep gcc gpg head id ls make mktemp mount nproc pacman pahole perl rm sed sleep sort stat tar tr umount wget xargs xz timeout cizen-uki-sync)
+  local -a tools=(awk bash bc bison cat ccache cmp cp date df du find findmnt flex flock fuser grep gcc gpg head id ls make mktemp mount nproc pacman pahole perl rm sbctl sed sleep sort stat tar tr umount wget xargs xz timeout cizen-uki-sync)
   local -a missing_cmds=() missing_pkgs=()
 
   for cmd in "${tools[@]}"; do
@@ -3195,6 +3220,7 @@ write_verify_signature() {
     fi
     printf 'btf=%s\n' "$([ "$BTF_REQUESTED" = true ] && echo yes || echo no)"
     printf 'clang=%s\n' "$([ "$CLANG_BUILD" = true ] && echo yes || echo no)"
+    printf 'sb=%s\n' "$([ "${DO_SIGN_UKI:-false}" = true ] && echo yes || echo no)"
     printf 'pkgrel=%s\n' "$PKGREL"
     printf 'profile_sha=%s\n' "${profile_hash:-}"
     printf 'ts=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -3487,6 +3513,13 @@ sync_cizen_efi() {
     if ! cizen_uki_targets_are_current; then
         cizen_uki_fail "La UKI no quedó actualizada después de escribir en el objetivo."
     fi
+
+    # Firma de la UKI (ruta directa del motor, sin cizen-uki-sync).
+    if [ "$DO_SIGN_UKI" = true ]; then
+        if ! cizen_uki_sign_targets "${targets[@]}"; then
+            cizen_uki_fail "No se pudo firmar la UKI con sbctl."
+        fi
+    fi
 }
 
 ensure_cizen_efi_updated() {
@@ -3496,6 +3529,108 @@ ensure_cizen_efi_updated() {
     fi
 
     sync_cizen_efi
+}
+
+# ============================================================
+# FIRMA DE LA UKI CON SBCTL (SECURE BOOT, v27.29.0)
+# ============================================================
+# Secure Boot habilitado en el firmware: la variable UEFI SecureBoot (efivar)
+# lleva en el byte 4 el valor (01 = activo). Los sysfs efivar son legibles por
+# el usuario; si no, se reintenta con sudo (ticket ya calentado).
+secure_boot_active() {
+    local val
+    val="$(od -An -j4 -N1 -tu1 \
+        "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c" \
+        2>/dev/null | tr -d '[:space:]' || true)"
+    if [ -z "$val" ] && sudo -n true 2>/dev/null; then
+        val="$(sudo od -An -j4 -N1 -tu1 \
+            "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c" \
+            2>/dev/null | tr -d '[:space:]' || true)"
+    fi
+    [ "$val" = "1" ]
+}
+
+# Firma cada objetivo con sbctl y verifica. Uso: cizen_uki_sign_targets "archivo"...
+cizen_uki_sign_targets() {
+    local t fail=0
+    [ -n "$SBCTL_BIN" ] || { warn "sbctl no está instalado; no se puede firmar la UKI."; return 1; }
+    for t in "$@"; do
+        if sudo sbctl sign "$t" >/dev/null 2>&1; then
+            ok "Firmada con sbctl: $t"
+        else
+            warn "sbctl sign falló: $t"
+            fail=1
+        fi
+    done
+    [ "$fail" -eq 0 ] || return 1
+    for t in "$@"; do
+        if sudo sbctl verify "$t" >/dev/null 2>&1; then
+            ok "Firma verificada: $t"
+        else
+            warn "La verificación de la firma falló: $t"
+            fail=1
+        fi
+    done
+    return "$fail"
+}
+
+# Decide DO_SIGN_UKI. "auto" (default): si sbctl está instalado se SUgiere
+# firmar al confirmar la compilación (S/n); con Secure Boot activo se firma
+# siempre, sin pregunta (una UKI sin firmar no arrancaría).
+resolve_sign_uki() {
+    local answer
+    case "$SIGN_UKI" in
+        yes)
+            DO_SIGN_UKI=true
+            SIGN_UKI_REASON="--sign / CIZEN_SIGN_UKI=yes"
+            info "Firma de la UKI con sbctl forzada ($SIGN_UKI_REASON)."
+            ;;
+        no)
+            if secure_boot_active; then
+                fatal "Se pidió NO firmar la UKI (--no-sign) pero Secure Boot está ACTIVO: el arranque fallaría. Usa --sign, CIZEN_SIGN_UKI=yes o desactiva Secure Boot."
+            fi
+            DO_SIGN_UKI=false
+            SIGN_UKI_REASON="--no-sign / CIZEN_SIGN_UKI=no"
+            info "Firma de la UKI desactivada ($SIGN_UKI_REASON)."
+            ;;
+        *)
+            if [ -z "$SBCTL_BIN" ]; then
+                DO_SIGN_UKI=false
+                SIGN_UKI_REASON="sbctl no instalado (sudo pacman -S sbctl)"
+                info "No se detecta sbctl: la UKI no se firmará."
+                return 0
+            fi
+            if secure_boot_active; then
+                DO_SIGN_UKI=true
+                SIGN_UKI_REASON="Secure Boot activo (imprescindible)"
+                ok "Secure Boot ACTIVO: la UKI se firmará con sbctl."
+                return 0
+            fi
+            if ! [ -t 0 ] && ! [ -t 1 ]; then
+                DO_SIGN_UKI=false
+                SIGN_UKI_REASON="sin terminal interactiva"
+                info "Secure Boot desactivado y sin terminal interactiva: la UKI no se firmará."
+                return 0
+            fi
+            printf '\n'
+            printf '  Se ha detectado sbctl (Secure Boot). La UKI %s puede firmarse\n' "$(cizen_uki_efi_name)"
+            printf '  para arrancar con Secure Boot habilitado (sbctl sign).\n'
+            read -r -p "  ¿Firmar la UKI del kernel con sbctl? [S/n] " answer < /dev/tty || answer="n"
+            case "${answer:-s}" in
+                s|S|si|SI|Sí|sí|y|Y|yes|YES)
+                    DO_SIGN_UKI=true
+                    SIGN_UKI_REASON="sugerido y confirmado"
+                    ok "La UKI se firmará con sbctl."
+                    ;;
+                *)
+                    DO_SIGN_UKI=false
+                    SIGN_UKI_REASON="rechazado por el usuario"
+                    info "Se continuará SIN firmar la UKI."
+                    ;;
+            esac
+            ;;
+    esac
+    return 0
 }
 
 # ============================================================
@@ -3715,7 +3850,7 @@ run_selftest() {
     rc=1
   fi
 
-  for t in patch aria2c xz gpg tar ccache clang ld.lld pahole; do
+  for t in patch aria2c xz gpg tar ccache clang ld.lld pahole sbctl; do
     if command -v "$t" >/dev/null 2>&1; then
       ok "herramienta '$t' disponible"
     else
@@ -3992,7 +4127,7 @@ if ! flock -n 9; then
 fi
 
 log "Kernel Cizen v$SCRIPT_VERSION — perfil $PROFILE"
-log "Objetivo  : $VERSION (check=$CHECK_ONLY force=$FORCE strict=$STRICT jobs=$JOBS prio=$BUILD_PRIORITY_LABEL)"
+log "Objetivo  : $VERSION (check=$CHECK_ONLY force=$FORCE strict=$STRICT jobs=$JOBS prio=$BUILD_PRIORITY_LABEL sign=$SIGN_UKI)"
 log "Cache/build: $KERNEL_BUILD_ROOT | $TMPFS_ROOT (${TMPFS_SIZE}, mín. ${TMPFS_MIN_FREE_MB} MB)"
 
 if [ "$KEEP_SRC" = true ]; then
@@ -4294,6 +4429,11 @@ if [ "$CHECK_ONLY" = true ]; then
     exit 0
   fi
 fi
+
+# Firma de la UKI (Secure Boot): nueva opción sugerida en la solicitud de
+# compilación (build directo o transformado desde --check). En auto se pregunta
+# si hay sbctl y Secure Boot desactivado; con SB activo se firma siempre.
+resolve_sign_uki
 
 # ============================================================
 # COMPILACIÓN
@@ -4646,7 +4786,13 @@ install_kernel_package || fatal "No se pudo instalar $PKG_NAME-$PKG_VERSION con 
 ok "Paquete instalado: $PKG_NAME-$PKG_VERSION"
 
 log "Sincronizando UKI..."
-sudo cizen-uki-sync
+declare -a UKI_SYNC_ARGS=()
+if [ "$DO_SIGN_UKI" = true ]; then
+  UKI_SYNC_ARGS+=(--sign)
+else
+  UKI_SYNC_ARGS+=(--no-sign)
+fi
+sudo cizen-uki-sync "${UKI_SYNC_ARGS[@]}"
 ensure_cizen_efi_updated
 ok "UKI sincronizado"
 FULL_PIPELINE_OK=true
@@ -4718,6 +4864,7 @@ ${PUBLISH_REPO_MSG:+  ${PUBLISH_REPO_MSG}}
  Build tmpfs : $TMPFS_ROOT (size=$TMPFS_SIZE)
  Podar       : $([ "${CIZEN_PRUNE_MODULES:-$PRUNE_MODULES}" = "1" ] && echo 'sí (solo módulos de este hardware)' || echo 'no')
  Lite        : sí (único modo: solo se compilan los módulos en uso; localmodconfig)
+ Firma UKI   : $([ "$DO_SIGN_UKI" = true ] && printf '%s' 'sí (sbctl)' || printf '%s' 'no')${SIGN_UKI_REASON:+ — $SIGN_UKI_REASON}
 ${SNAPSHOT_DESC:+ Snapshot   : $SNAPSHOT_DESC}
 ${VERIFY_ROLLBACK_FILE:+ Rollback  : $VERIFY_ROLLBACK_FILE}
 

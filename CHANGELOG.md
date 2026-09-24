@@ -5,6 +5,28 @@ changelog vive en este archivo (no en la cabecera del motor);
 `kernel-update.sh --changelog` añade aquí el borrador del siguiente
 release. Formato inspirado en [Keep a Changelog](https://keepachangelog.com/es/1.1.0/).
 
+## [27.29.0] - 2026-09-23
+
+firma de la UKI con sbctl (Secure Boot): sugerida al confirmar la compilación
+
+- **Firma de la UKI (Secure Boot)**: `sbctl` pasa a ser **dependencia
+  obligatoria** de la suite (`check_prerequisites`: si falta, se ofrece
+  autoinstalarlo) y, al solicitar un build/recompilación, se sugiere firmar la
+  UKI al confirmar la compilación ("¿Firmar la UKI del kernel con sbctl?
+  [S/n]", default S). Con Secure Boot
+  activo en el firmware la firma es SIEMPRE obligatoria (una UKI sin firmar no
+  arrancaría) y se aplica sin pregunta. Flags `--sign`/`--no-sign` y env
+  `CIZEN_SIGN_UKI=yes|no|auto`. `cizen-uki-sync` firma y verifica cada objetivo
+  con `sbctl sign`/`sbctl verify` tras escribir la UKI, y aborta con fail-safe
+  si el resultado queda sin firmar con Secure Boot activo; el camino directo
+  del motor (`sync_cizen_efi`) replica la firma. La decisión queda en
+  `last-build` (`sb=yes|no`) y en el resumen final (`Firma UKI`).
+- **Verificación post-boot**: `kernel-update-verify.sh` añade el check
+  **SECURE BOOT** — cruza la firma del último build (`sb=` en `last-build`) con
+  el estado real (bootctl status, salida fija con `LC_ALL=C`) y avisa si la UKI
+  se firmó pero Secure Boot está desactivado (la firma no tiene efecto), o si
+  Secure Boot está activo con la UKI sin firmar (no arrancaría).
+
 ## [27.28.0] - 2026-09-23
 
 resiliencia y diagnóstico: recuperación de arranque, verificación post-boot, anclaje SHA256 y auditoría hardening

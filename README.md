@@ -78,6 +78,8 @@ con otras herramientas):
 | list-renames | `kernel-update.sh --list-renames` | Muestra el mapa de renombres de config |
 | absorb-rebels | `kernel-update.sh <ver> --absorb-rebels` | Mueve a `EXPECTED_REBELS` los símbolos que Kconfig conserva por dependencias, dejando el perfil limpio. Desde v27.25.1 el propio check lo ofrece interactivamente antes de compilar (si la auditoría reporta que Kconfig conserva desactivaciones), sin necesidad del flag |
 | no-prune | `kernel-update.sh <ver> --no-prune` | Desactiva la poda de módulos (default: activada) |
+| sign | `kernel-update.sh <ver> --sign` | Firma la UKI con sbctl (Secure Boot); recomendable antes de activar SB en la BIOS |
+| no-sign | `kernel-update.sh <ver> --no-sign` | No firmar la UKI (no usar con Secure Boot activo) |
 | changelog | `kernel-update.sh --changelog` | Bumpea banner + `SCRIPT_VERSION` y añade el borrador del siguiente release a `CHANGELOG.md` |
 | hardened | `kernel-update.sh --hardened` | Auditoría de endurecimiento del kernel EN EJECUCIÓN (símbolos de /proc/config.gz + knobs sysctl vivos); sin efectos laterales |
 
@@ -105,6 +107,22 @@ habilitarla) renombra la UKI a nombre plano cuando el arranque completa.
 Configurable con `CIZEN_BOOT_TRIES` (0 = UKI plana, sin boot counting). El
 guard de `kernel-update-verify.sh` (check GUARD) avisa en el login siguiente si
 el kernel arrancado no es el último Cizen instalado.
+
+### Firma de la UKI (Secure Boot)
+
+Al confirmar la solicitud de compilación (build o recompilación), el motor
+**sugiere firmar la UKI** con `sbctl` ("¿Firmar la UKI del kernel con sbctl?
+[S/n]"), que es **dependencia requerida** (si falta, se ofrece autoinstalarlo
+con pacman). Con Secure Boot
+**habilitado** en el firmware la firma es obligatoria y se aplica siempre —una
+UKI sin firmar no arrancaría—, por eso la sugerencia solo aparece con Secure
+Boot desactivado. Control: flags `--sign` / `--no-sign` y env
+`CIZEN_SIGN_UKI=yes|no|auto` (default `auto`). La firma/verificación la ejecuta
+`cizen-uki-sync` (y el camino directo `sync_cizen_efi` del motor) con `sbctl
+sign`/`sbctl verify` sobre cada objetivo. `kernel-update-verify.sh` cruza la
+firma del último build (`sb=` en `last-build`) con el estado real de Secure Boot
+(check **SECURE BOOT**) y avisa si la UKI se firmó pero SB está desactivado, o
+al revés (SB activo con UKI sin firmar).
 
 ### Anclaje SHA256 de los parches
 
