@@ -50,6 +50,9 @@ BUILD_SIG="$STATE_DIR/last-build"
 RENAME_MAP_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/kernel-update/rename-map.conf"
 NOTIFY_BIN="${CIZEN_NOTIFY_BIN:-notify-send}"
 FIRMWARE_DIR="${CIZEN_FIRMWARE_DIR:-/usr/lib/firmware}"
+# Sufijo de localversion de los kernels Cizen. Debe coincidir con
+# LOCALVERSION_SUFFIX del motor / CIZEN_UKI_SUFFIX de cizen-uki-sync.
+CIZEN_VERIFY_SUFFIX="${CIZEN_VERIFY_SUFFIX:--cizen-v3}"
 
 BOOT_FACTOR="${CIZEN_VERIFY_BOOT_FACTOR:-1.35}"
 BOOT_MIN_DELTA="${CIZEN_VERIFY_BOOT_MIN_DELTA:-3}"
@@ -374,7 +377,7 @@ journal_check() {
 # ---------- 4) GUARD (boot counting / fallback) ----------
 guard_check() {
   local expected=""
-  expected="$(ls -1d /usr/lib/modules/*-cizen-v3 2>/dev/null | sed -E 's#.*/##' | sort -V | tail -n1 || true)"
+  expected="$(ls -1d /usr/lib/modules/*"$CIZEN_VERIFY_SUFFIX" 2>/dev/null | sed -E 's#.*/##' | sort -V | tail -n1 || true)"
   if [ -z "$expected" ]; then
     [ "${DRY:-false}" = true ] && info "Guard: no hay kernel Cizen instalado."
     return 0

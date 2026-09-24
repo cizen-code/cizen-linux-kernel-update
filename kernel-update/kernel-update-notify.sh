@@ -99,8 +99,11 @@ get_remote_latest_stable() {
   json="$(wget -qO- --timeout=30 --tries=2 "$KERNEL_RELEASES_JSON_URL" 2>/dev/null)" || return 1
   if command -v jq >/dev/null 2>&1; then
     if [ "$track" = "longterm" ] || [ "$track" = "lts" ]; then
+      # Mismo orden numérico que kernel-update.sh (sort_by de partes numéricas
+      # de la versión): jq `max` sobre strings compara LEXICOGRÁFICAMENTE y
+      # elegiría la rama más vieja ("6.12" < "6.6" → se quedaría en "6.6").
       latest="$(printf '%s\n' "$json" | jq -r --arg m 'longterm|lts' \
-        '[.releases[] | select(.moniker | test($m)) | .version] | max // empty' 2>/dev/null || true)"
+        '([.releases[] | select(.moniker | test($m))] | if length > 0 then (map({ver: [.version | split(".") | map(tonumber)], name: .version}) | max_by(.ver) | .name) else empty end)' 2>/dev/null || true)"
       [ -n "$latest" ] || alog "CIZEN_KERNEL_TRACK=$track no resuelto con jq; fallback a latest_stable"
     fi
     if [ -z "${latest:-}" ]; then

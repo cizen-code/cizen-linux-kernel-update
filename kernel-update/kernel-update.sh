@@ -3493,6 +3493,14 @@ build_cizen_uki() {
             --os-release=@"$osrel_file"
             --output="$out"
         )
+        # Si el kernel Cizen usa initramfs (preset mkinitcpio) se integra en la
+        # UKI; si no existe el archivo, la UKI queda sin initrd (kernel
+        # autosuficiente). Mismo comportamiento que cizen-uki-sync/build_uki.
+        local initrd="/boot/initramfs-${CIZEN_PKGBASE}.img"
+        if [ -s "$initrd" ]; then
+            args+=(--initrd="$initrd")
+            ok "Incluyendo initramfs: $initrd"
+        fi
         if "${args[@]}"; then
             rm -f "$osrel_file"
             return 0
@@ -4834,12 +4842,10 @@ if command -v ccache >/dev/null 2>&1; then
   #  - base_dir=$HOME: los hits no dependen del cwd donde se compila
   #  - max_size: límite opcional vía CCACHE_MAX_SIZE (cosa por defecto)
   #  - compiler_check=content: hash del binario del compilador, no del path
-  if command -v ccache >/dev/null 2>&1; then
-    ccache -o base_dir="$HOME" >/dev/null 2>&1 || true
-    ccache -o compiler_check=content >/dev/null 2>&1 || true
-    if [ -n "${CCACHE_MAX_SIZE:-}" ]; then
-      ccache -o max_size="$CCACHE_MAX_SIZE" >/dev/null 2>&1 || true
-    fi
+  ccache -o base_dir="$HOME" >/dev/null 2>&1 || true
+  ccache -o compiler_check=content >/dev/null 2>&1 || true
+  if [ -n "${CCACHE_MAX_SIZE:-}" ]; then
+    ccache -o max_size="$CCACHE_MAX_SIZE" >/dev/null 2>&1 || true
   fi
   MAKE_CC_OPTS+=(
     'CC=ccache gcc'
@@ -4928,8 +4934,17 @@ if command -v systemd-run >/dev/null 2>&1 && [ -d /sys/fs/cgroup ]; then
       --property="CPUWeight=$cpu_w" --property="IOWeight=$io_w")
     info "Compilación en scope cgroup dedicado (CPUWeight=$cpu_w, IOWeight=$io_w)."
   else
-    warn "systemd-run --scope no puede delegar el cgroup; se usan nice/ionice clásicos (${BUILD_PRIORITY_WRAP[*]:-sin limitación})."
+    warn "systemd-run --scope no puede delegar el cgroup; se intentan los nice/ionice clásicos."
   fi
+fi
+# Sin scope cgroup (systemd-run ausente, sin delegación o probe fallido): en
+# prioridad baja se enganchan aquí los nice/ionice ya preparados en
+# BUILD_PRIORITY_WRAP, que AHORA SÍ entran en la línea de make (antes solo se
+# anunciaban en un warn). Con BUILD_PRIORITY=normal el array queda vacío y la
+# build corre sin acotación, como es la intención.
+if [ "${#SCOPE_RUNNER[@]}" -eq 0 ] && [ "${#BUILD_PRIORITY_WRAP[@]}" -gt 0 ]; then
+  SCOPE_RUNNER=("${BUILD_PRIORITY_WRAP[@]}")
+  warn "Compilación con nice/ionice clásicos (${BUILD_PRIORITY_WRAP[*]})."
 fi
 # Notificación de escritorio al terminar (build ok / build rota). Obvia si el
 # binario no existe o si CIZEN_NOTIFY=0.
@@ -4945,7 +4960,12 @@ notify_desktop() {
 # solo llegaba al script y NO cancelaba la compilación. Con --foreground,
 # Ctrl+C llega directo a make (que ya tiene traps INT/TERM y remata sus .o y
 # sub-makes), permitiendo cancelar la build en cualquier momento.
-if time "${SCOPE_RUNNER[@]:-}" timeout --foreground --signal=TERM --kill-after=60s "$BUILD_TIMEOUT" \
+# NOTA: se usa "${SCOPE_RUNNER[@]}" (no "${SCOPE_RUNNER[@]:-}"): con el array
+# vacío la variante :- expande a UN argumento vacío y el make abortaría con
+# "command not found"; la forma sin :- expande a CERO palabras y timeout recibe
+# solo sus argumentos. SCOPE_RUNNER siempre está declarado (arriba), así que
+# set -u no dispara.
+if time "${SCOPE_RUNNER[@]}" timeout --foreground --signal=TERM --kill-after=60s "$BUILD_TIMEOUT" \
     make -j"$JOBS" "${MAKE_CC_OPTS[@]}" KBUILD_REVISION="$PKGREL" pacman-pkg; then
   :
 else
