@@ -5,6 +5,31 @@ changelog vive en este archivo (no en la cabecera del motor);
 `kernel-update.sh --changelog` añade aquí el borrador del siguiente
 release. Formato inspirado en [Keep a Changelog](https://keepachangelog.com/es/1.1.0/).
 
+## [27.29.1] - 2026-09-23
+
+setup guiado de Secure Boot al firmar la UKI (create-keys / systemd-boot / enroll)
+
+- **Setup guiado de Secure Boot**: al aceptar la firma de la UKI el motor abre
+  un asistente interactivo que revisa el estado real de la cadena y ofrece,
+  pregunta a pregunta (S/n), únicamente lo que quede pendiente:
+  `sbctl create-keys` (generar las claves de firma), `sbctl sign` sobre
+  systemd-boot (fuente del paquete + copias reales del ESP) y
+  `sbctl enroll-keys` (matricular las claves en el firmware, obligatorio para
+  que la BIOS confíe en ellas). Termina con un resumen del estado
+  (claves / enroll / systemd-boot) y recuerda habilitar Secure Boot en la BIOS
+  y comprobar con `sbctl status`. Idempotente: solo pregunta lo pendiente.
+- **Matrícula real detectada por huella**: la variable UEFI `PK` se lee y se
+  compara por huella SHA256 con la PK propia de sbctl; si el firmware está en
+  User Mode con claves de fábrica (Dell/Microsoft) no se da la matrícula por
+  hecha: se explica que `sbctl enroll-keys` exige Setup Mode y se guía al
+  usuario a la BIOS (Dell: Secure Boot → Expert Key Management).
+- **Fail-safe ante claves ausentes**: `cizen-uki-sync` detecta si no hay claves
+  sbctl generadas (`/var/lib/sbctl/keys`). Con Secure Boot activo aborta (no
+  sería posible producir una UKI firmada); con SB desactivado avisa y deja la
+  UKI sin firmar sin cancelar la instalación.
+- **Verificación post-build**: tras sincronizar la UKI el motor ejecuta
+  `sbctl verify` y muestra el resultado (aviso si quedan ficheros sin firmar).
+
 ## [27.29.0] - 2026-09-23
 
 firma de la UKI con sbctl (Secure Boot): sugerida al confirmar la compilación

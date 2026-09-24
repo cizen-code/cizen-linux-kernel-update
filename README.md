@@ -117,9 +117,21 @@ con pacman). Con Secure Boot
 **habilitado** en el firmware la firma es obligatoria y se aplica siempre —una
 UKI sin firmar no arrancaría—, por eso la sugerencia solo aparece con Secure
 Boot desactivado. Control: flags `--sign` / `--no-sign` y env
-`CIZEN_SIGN_UKI=yes|no|auto` (default `auto`). La firma/verificación la ejecuta
-`cizen-uki-sync` (y el camino directo `sync_cizen_efi` del motor) con `sbctl
-sign`/`sbctl verify` sobre cada objetivo. `kernel-update-verify.sh` cruza la
+`CIZEN_SIGN_UKI=yes|no|auto` (default `auto`).
+
+Al aceptar la firma se abre un **setup guiado de Secure Boot**: revisa el
+estado real de la cadena y ofrece ejecutar, solo si queda pendiente y siempre
+pregunta a pregunta, `sbctl create-keys` (generar las claves), firmar
+**systemd-boot** (fuente + copias del ESP: obligatorio, la BIOS verifica el
+gestor antes que la UKI) y `sbctl enroll-keys` (matricular las claves en el
+firmware; sin esto la BIOS rechaza hasta lo firmado). Termina con un resumen
+del estado y recuerda habilitar Secure Boot en la BIOS y verificar con
+`sbctl status`. Tras el build, `sbctl verify` confirma todas las firmas.
+
+La firma/verificación de la UKI la ejecuta `cizen-uki-sync` (y el camino
+directo `sync_cizen_efi` del motor) con `sbctl sign`/`sbctl verify` sobre cada
+objetivo; si no hay claves generadas, avisa y no firma (o aborta si Secure
+Boot está activo). `kernel-update-verify.sh` cruza la
 firma del último build (`sb=` en `last-build`) con el estado real de Secure Boot
 (check **SECURE BOOT**) y avisa si la UKI se firmó pero SB está desactivado, o
 al revés (SB activo con UKI sin firmar).

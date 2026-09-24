@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.29.0 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.29.1 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / XFS / systemd / KVM-libvirt / QEMU-OVMF
 #
@@ -72,7 +72,10 @@
 #     auto: sbctl es dependencia OBLIGATORIA (se ofrece autoinstalarlo) y al
 #     confirmar la compilación (build o recompilación) se sugiere firmar la UKI
 #     (S/n). Con Secure Boot ACTIVO en el firmware la UKI se firma SIEMPRE:
-#     sin firma el sistema no arrancaría.
+#     sin firma el sistema no arrancaría. Al aceptar la firma se abre el
+#     SETUP GUIADO de Secure Boot: genera las claves (sbctl create-keys),
+#     firma systemd-boot y matricula las claves en la BIOS (sbctl enroll-keys),
+#     todo pendiente, pregunta a pregunta (S/n).
 #   CIZEN_PATCH_SHA256_VERIFY=0 ./kernel-update.sh <versión>  # desactivar pin SHA256 de los parches
 #   JOBS=3 ./kernel-update.sh <versión>
 #   CIZEN_DOWNLOAD_PARALLEL=8 ./kernel-update.sh <versión>   # conexiones paralelas (aria2c)
@@ -112,7 +115,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.29.0"
+SCRIPT_VERSION="27.29.1"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -213,10 +216,12 @@ PUBLISH_REPO=false
 PUBLISH_REPO_DIR=""
 PUBLISH_REPO_MSG=""
 
-# Firma de la UKI con sbctl (Secure Boot, v27.29.0). auto (default): si sbctl
+# Firma de la UKI con sbctl (Secure Boot, v27.29.1). auto (default): si sbctl
 # está instalado se sugiere firmar al confirmar la compilación; con Secure Boot
-# activo se firma siempre (una UKI sin firmar no arrancaría). Override por env
-# CIZEN_SIGN_UKI=yes|no|auto; los flags --sign/--no-sign (más abajo) tienen prioridad.
+# activo se firma siempre (una UKI sin firmar no arrancaría). Al aceptar la firma
+# se abre el setup guiado (create-keys / enroll-keys / systemd-boot) para dejar
+# la cadena Secure Boot lista. Override por env CIZEN_SIGN_UKI=yes|no|auto; los
+# flags --sign/--no-sign (más abajo) tienen prioridad.
 SIGN_UKI="${CIZEN_SIGN_UKI:-auto}"
 DO_SIGN_UKI=false
 SBCTL_BIN="$(command -v sbctl 2>/dev/null || true)"
@@ -3532,7 +3537,7 @@ ensure_cizen_efi_updated() {
 }
 
 # ============================================================
-# FIRMA DE LA UKI CON SBCTL (SECURE BOOT, v27.29.0)
+# FIRMA DE LA UKI CON SBCTL (SECURE BOOT, v27.29.1)
 # ============================================================
 # Secure Boot habilitado en el firmware: la variable UEFI SecureBoot (efivar)
 # lleva en el byte 4 el valor (01 = activo). Los sysfs efivar son legibles por
@@ -3574,9 +3579,21 @@ cizen_uki_sign_targets() {
     return "$fail"
 }
 
+# Verifica que TODOS los objetivos estén firmados (sbctl verify). 0 = sí.
+cizen_uki_sign_targets_verify() {
+    [ -n "$SBCTL_BIN" ] && [ "$#" -gt 0 ] || return 1
+    local t
+    for t in "$@"; do
+        sudo sbctl verify "$t" >/dev/null 2>&1 || return 1
+    done
+    return 0
+}
+
 # Decide DO_SIGN_UKI. "auto" (default): si sbctl está instalado se SUgiere
 # firmar al confirmar la compilación (S/n); con Secure Boot activo se firma
-# siempre, sin pregunta (una UKI sin firmar no arrancaría).
+# siempre, sin pregunta (una UKI sin firmar no arrancaría). Cuando la firma
+# queda activada, se ofrece además el setup guiado de Secure Boot (claves,
+# systemd-boot y enroll de claves) para dejar toda la cadena lista.
 resolve_sign_uki() {
     local answer
     case "$SIGN_UKI" in
@@ -3598,39 +3615,216 @@ resolve_sign_uki() {
                 DO_SIGN_UKI=false
                 SIGN_UKI_REASON="sbctl no instalado (sudo pacman -S sbctl)"
                 info "No se detecta sbctl: la UKI no se firmará."
-                return 0
-            fi
-            if secure_boot_active; then
+            elif secure_boot_active; then
                 DO_SIGN_UKI=true
                 SIGN_UKI_REASON="Secure Boot activo (imprescindible)"
                 ok "Secure Boot ACTIVO: la UKI se firmará con sbctl."
-                return 0
-            fi
-            if ! [ -t 0 ] && ! [ -t 1 ]; then
+            elif ! [ -t 0 ] && ! [ -t 1 ]; then
                 DO_SIGN_UKI=false
                 SIGN_UKI_REASON="sin terminal interactiva"
                 info "Secure Boot desactivado y sin terminal interactiva: la UKI no se firmará."
-                return 0
+            else
+                printf '\n'
+                printf '  Se ha detectado sbctl (Secure Boot). La UKI %s puede firmarse\n' "$(cizen_uki_efi_name)"
+                printf '  para arrancar con Secure Boot habilitado (sbctl sign).\n'
+                read -r -p "  ¿Firmar la UKI del kernel con sbctl? [S/n] " answer < /dev/tty || answer="n"
+                case "${answer:-s}" in
+                    s|S|si|SI|Sí|sí|y|Y|yes|YES)
+                        DO_SIGN_UKI=true
+                        SIGN_UKI_REASON="sugerido y confirmado"
+                        ok "La UKI se firmará con sbctl."
+                        ;;
+                    *)
+                        DO_SIGN_UKI=false
+                        SIGN_UKI_REASON="rechazado por el usuario"
+                        info "Se continuará SIN firmar la UKI."
+                        ;;
+                esac
             fi
-            printf '\n'
-            printf '  Se ha detectado sbctl (Secure Boot). La UKI %s puede firmarse\n' "$(cizen_uki_efi_name)"
-            printf '  para arrancar con Secure Boot habilitado (sbctl sign).\n'
-            read -r -p "  ¿Firmar la UKI del kernel con sbctl? [S/n] " answer < /dev/tty || answer="n"
-            case "${answer:-s}" in
-                s|S|si|SI|Sí|sí|y|Y|yes|YES)
-                    DO_SIGN_UKI=true
-                    SIGN_UKI_REASON="sugerido y confirmado"
-                    ok "La UKI se firmará con sbctl."
-                    ;;
-                *)
-                    DO_SIGN_UKI=false
-                    SIGN_UKI_REASON="rechazado por el usuario"
-                    info "Se continuará SIN firmar la UKI."
-                    ;;
-            esac
             ;;
     esac
+    if [ "$DO_SIGN_UKI" = true ]; then
+        secure_boot_guided_setup
+    fi
     return 0
+}
+
+# ── Setup guiado de Secure Boot (v27.29.1) ──────────────────────────────────
+# Al aceptar la firma de la UKI se revisa el estado real de la cadena por la
+# BIOS (claves = /var/lib/sbctl/keys, SetupMode efivar, systemd-boot firmado)
+# y se ofrece punto a punto, de forma interactiva, ejecutar lo que falte:
+#   1. sbctl create-keys         3. sbctl sign systemd-boot
+#   2. sbctl enroll-keys         4. habilita Secure Boot en la BIOS (manual)
+# La UKI del build se firma después, en cizen-uki-sync. Idempotente: solo
+# pregunta por lo que queda pendiente.
+sbctl_keys_present() {
+    sudo test -s /var/lib/sbctl/keys/db/db.key 2>/dev/null && \
+    sudo test -s /var/lib/sbctl/keys/PK/PK.key 2>/dev/null && \
+    sudo test -s /var/lib/sbctl/keys/KEK/KEK.key 2>/dev/null
+}
+
+# 1 = firmware en Setup Mode (sin claves). 0 = User Mode (con claves ya en la
+# BIOS, aunque sean las de fábrica: Dell/Microsoft). En User Mode sbctl
+# enroll-keys NO puede ejecutarse.
+sbctl_setup_mode() {
+    local v
+    v="$(od -An -j4 -N1 -tu1 \
+        "/sys/firmware/efi/efivars/SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c" \
+        2>/dev/null | tr -d '[:space:]' || true)"
+    if [ -z "$v" ] && sudo -n true 2>/dev/null; then
+        v="$(sudo od -An -j4 -N1 -tu1 \
+            "/sys/firmware/efi/efivars/SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c" \
+            2>/dev/null | tr -d '[:space:]' || true)"
+    fi
+    [ "$v" = "1" ]
+}
+
+# ¿La PK matriculada en el firmware es NUESTRA clave sbctl? Mira el certificado
+# real de la variable UEFI PK (efivar: cabecera de 4 bytes + EFI_SIGNATURE_LIST
+# de 44 bytes, el X.509 DER arranca en el byte 48) y lo compara por huella SHA256
+# con /var/lib/sbctl/keys/PK/PK.pem. Robustez: con cualquier fallo devuelve "no".
+sbctl_pk_enrolled() {
+    local pkvar="/sys/firmware/efi/efivars/PK-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+    local pem="/var/lib/sbctl/keys/PK/PK.pem"
+    local ours fw tmp
+    if ! sudo test -s "$pem" 2>/dev/null || [ ! -e "$pkvar" ]; then
+        return 1
+    fi
+    ours="$(sudo openssl x509 -in "$pem" -noout -fingerprint -sha256 2>/dev/null \
+        | awk -F= 'NR==1{print toupper($2)}' | tr -d ':')"
+    [ -n "$ours" ] || return 1
+    tmp="$(mktemp 2>/dev/null || printf '/tmp/sbctl-pk.der.%s' "$$")"
+    if [ -r "$pkvar" ]; then
+        dd if="$pkvar" of="$tmp" bs=1 skip=48 status=none 2>/dev/null
+    else
+        sudo dd if="$pkvar" of="$tmp" bs=1 skip=48 status=none 2>/dev/null
+    fi
+    fw="$(openssl x509 -inform DER -in "$tmp" -noout -fingerprint -sha256 2>/dev/null \
+        | awk -F= 'NR==1{print toupper($2)}' | tr -d ':')"
+    rm -f "$tmp"
+    [ -n "$fw" ] && [ "$fw" = "$ours" ]
+}
+
+# Copias del gestor a firmar: la fuente del paquete (la re-firma el hook de sbctl
+# al actualizar systemd) y las copias reales de arranque en el ESP.
+collect_systemd_boot_targets() {
+    local s r f
+    [ -s /usr/lib/systemd/boot/efi/systemd-bootx64.efi ] && \
+        printf '%s\n' /usr/lib/systemd/boot/efi/systemd-bootx64.efi
+    for r in /efi /boot/efi /boot; do
+        [ -d "$r" ] || continue
+        while IFS= read -r f; do
+            [ -n "$f" ] && printf '%s\n' "$f"
+        done < <(sudo find "$r" -maxdepth 5 -type f \
+            \( -iname 'systemd-bootx64.efi' -o -iname 'BOOTX64.EFI' \) \
+            2>/dev/null || true)
+    done
+}
+
+# Al aceptar la firma de la UKI se revisa el estado real de la cadena por la
+# BIOS (claves en /var/lib/sbctl/keys, matrícula REAL de la PK por huella del
+# certificado del efivar PK, systemd-boot firmado) y se ofrece punto a punto,
+# de forma interactiva, ejecutar lo que falte:
+#   1. sbctl create-keys         3. sbctl sign systemd-boot
+#   2. sbctl enroll-keys         4. habilita Secure Boot en la BIOS (manual)
+# La UKI del build se firma después, en cizen-uki-sync. Idempotente: solo
+# pregunta por lo que queda pendiente. Con claves de fábrica (Dell/MS) en User
+# Mode no puede hacer enroll desde el sistema: lo detecta y lo explica (BIOS →
+# setup mode), sin dar una matrícula falsa por hecha.
+secure_boot_guided_setup() {
+    local -a boot_targets=() f
+    local pending=false keyt="n/d" enrollp="n/d" bootp="n/d"
+
+    printf '%s\n' \
+        "  ──────── Setup guiado de Secure Boot (sbctl) ────────"
+
+    if ! sbctl_keys_present; then
+        pending=true
+        keyt="no"
+        printf '  Las claves Secure Boot NO están generadas (sbctl create-keys).\n'
+        if ask_user_yes "¿Generarlas ahora ('sudo sbctl create-keys')? [S/n]"; then
+            if sudo sbctl create-keys && sbctl_keys_present; then
+                keyt="sí"
+                ok "Claves Secure Boot generadas (/var/lib/sbctl/keys)."
+            else
+                err "sbctl create-keys falló."
+            fi
+        else
+            warn "Claves no generadas: la UKI del build no podrá firmarse y Secure Boot quedaría inutilizable."
+            return 1
+        fi
+    else
+        keyt="sí"
+        ok "Claves Secure Boot presentes (/var/lib/sbctl/keys)."
+    fi
+
+    if sbctl_setup_mode; then
+        pending=true
+        enrollp="no"
+        printf '  El firmware está en SETUP MODE (sin claves matriculadas).\n'
+        if ask_user_yes "¿Matricular las claves en la BIOS ('sudo sbctl enroll-keys')? [S/n]"; then
+            if sudo sbctl enroll-keys && sbctl_pk_enrolled; then
+                enrollp="sí"
+                ok "Claves matriculadas en el firmware (User Mode)."
+            else
+                enrollp="no"
+                err "sbctl enroll-keys falló (¿el firmware no estaba en setup mode?)."
+            fi
+        else
+            warn "Claves sin matricular: habilitar Secure Boot sin esto NO arrancaría."
+        fi
+    elif sbctl_pk_enrolled; then
+        enrollp="sí"
+        ok "Claves del usuario ya matriculadas en el firmware (User Mode)."
+    else
+        pending=true
+        enrollp="no"
+        printf '  El firmware está en USER MODE con claves de fábrica (Dell/Microsoft):\n'
+        printf '  sbctl enroll-keys NO puede ejecutarse en este estado. Para matricular\n'
+        printf '  tus claves, devuelve el firmware a SETUP MODE desde la BIOS\n'
+        printf '  (Dell: Secure Boot → Expert Key Management / borrar las claves OEM) y\n'
+        printf '  vuelve a ejecutar este setup guiado. Sin matricular tus claves, la BIOS\n'
+        printf '  solo aceptaría binarios firmados por Dell/Microsoft, no tu kernel.\n'
+    fi
+
+    boot_targets=()
+    while IFS= read -r f; do
+        [ -n "$f" ] && boot_targets+=("$f")
+    done < <(collect_systemd_boot_targets | sort -u || true)
+
+    if [ "${#boot_targets[@]}" -gt 0 ]; then
+        if cizen_uki_sign_targets_verify "${boot_targets[@]}"; then
+            bootp="sí"
+            ok "systemd-boot ya firmado con sbctl."
+        else
+            pending=true
+            bootp="no"
+            printf '  systemd-boot no está firmado (imprescindible para arrancar con SB).\n'
+            if ask_user_yes "¿Firmar systemd-boot (${#boot_targets[@]} fichero(s)) con sbctl? [S/n]"; then
+                if cizen_uki_sign_targets "${boot_targets[@]}"; then
+                    bootp="sí"
+                    ok "systemd-boot firmado."
+                else
+                    err "Fallo al firmar systemd-boot."
+                fi
+            else
+                warn "systemd-boot sin firmar: con Secure Boot activo no arrancaría nada."
+            fi
+        fi
+    else
+        warn "No localicé systemd-boot en el ESP; fírmalo antes de activar Secure Boot (sbctl sign /usr/lib/systemd/boot/efi/systemd-bootx64.efi)."
+    fi
+
+    printf '%s\n' \
+        "  ──────────────────────────────────────────────────────"
+    printf '  Claves           : %s\n' "$keyt"
+    printf '  Firmware (enroll): %s\n' "$enrollp"
+    printf '  systemd-boot     : %s\n' "$bootp"
+    if [ "$enrollp" = "sí" ] && ! secure_boot_active; then
+        warn "Secure Boot sigue desactivado en la BIOS: reinicia, habilítalo en la BIOS (F12/setup) y"
+        printf '  confírmalo tras el arranque con: sudo sbctl status\n'
+    fi
+    [ "$pending" = true ]
 }
 
 # ============================================================
@@ -4795,6 +4989,13 @@ fi
 sudo cizen-uki-sync "${UKI_SYNC_ARGS[@]}"
 ensure_cizen_efi_updated
 ok "UKI sincronizado"
+if [ "$DO_SIGN_UKI" = true ]; then
+  if sudo sbctl verify >/dev/null 2>&1; then
+    ok "Firmas sbctl verificadas (sbctl verify)."
+  else
+    warn "sbctl verify detecta ficheros sin firmar; repásalos antes de habilitar Secure Boot: sudo sbctl verify"
+  fi
+fi
 FULL_PIPELINE_OK=true
 
 prune_stale_packages

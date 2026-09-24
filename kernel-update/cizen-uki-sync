@@ -28,6 +28,8 @@
 #                            (Secure Boot). auto: firma SIEMPRE si Secure Boot está
 #                            activo en el firmware (una UKI sin firmar no arrancaría);
 #                            si sbctl está instalado pero SB desactivado, no firma.
+#                            Firmar exige claves generadas (sbctl create-keys); sin
+#                            ellas y con SB desactivado, se advierte y no se firma.
 #
 #   sudo cizen-uki-sync --sign        # además firma la UKI con sbctl (--no-sign lo contrario)
 # ============================================================
@@ -321,6 +323,13 @@ sign_uki_targets() {
   return "$fail"
 }
 
+# Claves sbctl ya generadas (sbctl create-keys). Firmar sin claves fallaría.
+sbctl_keys_present() {
+  "${SUDO[@]}" test -s /var/lib/sbctl/keys/db/db.key 2>/dev/null && \
+  "${SUDO[@]}" test -s /var/lib/sbctl/keys/PK/PK.key 2>/dev/null && \
+  "${SUDO[@]}" test -s /var/lib/sbctl/keys/KEK/KEK.key 2>/dev/null
+}
+
 # Decide DO_SIGN a partir de CIZEN_SIGN_UKI / --sign / --no-sign. auto firma
 # SIEMPRE con Secure Boot activo (fail-safe: una UKI sin firmar no arrancaría).
 resolve_sign_request() {
@@ -451,7 +460,12 @@ fi
 # Firma de la UKI con sbctl (Secure Boot): tras escribir, se firma y verifica
 # cada objetivo. Con SB activo una UKI sin firmar no arrancaría: fail-safe.
 if [ "$DO_SIGN" = true ]; then
-  if ! sign_uki_targets "${targets[@]}"; then
+  if ! sbctl_keys_present; then
+    if secure_boot_active; then
+      fatal "Secure Boot ACTIVO y sin claves sbctl generadas (sbctl create-keys/enroll-keys): no se puede firmar la UKI."
+    fi
+    warn "No hay claves sbctl (sudo sbctl create-keys): la UKI queda sin firmar por ahora."
+  elif ! sign_uki_targets "${targets[@]}"; then
     if secure_boot_active; then
       fatal "La UKI no quedó firmada con Secure Boot ACTIVO: el sistema no arrancaría. Revisa sbctl (sbctl sign / sbctl enroll-keys)."
     fi
