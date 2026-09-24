@@ -74,8 +74,10 @@
 #     (S/n). Con Secure Boot ACTIVO en el firmware la UKI se firma SIEMPRE:
 #     sin firma el sistema no arrancaría. Al aceptar la firma se abre el
 #     SETUP GUIADO de Secure Boot: genera las claves (sbctl create-keys),
-#     firma systemd-boot y matricula las claves en la BIOS (sbctl enroll-keys),
-#     todo pendiente, pregunta a pregunta (S/n).
+#     firma systemd-boot y matricula las claves en la BIOS (sbctl enroll-keys,
+#     con reintento automático con --microsoft si sbctl exige flag por falta de
+#     TPM Eventlog en equipos sin TPM2), preguntando solo lo que queda
+#     pendiente, pregunta a pregunta (S/n).
 #   CIZEN_PATCH_SHA256_VERIFY=0 ./kernel-update.sh <versión>  # desactivar pin SHA256 de los parches
 #   JOBS=3 ./kernel-update.sh <versión>
 #   CIZEN_DOWNLOAD_PARALLEL=8 ./kernel-update.sh <versión>   # conexiones paralelas (aria2c)
@@ -99,6 +101,13 @@
 #   - Usa un tmpfs anidado de 10 GiB bajo /tmp para el árbol de compilación; el montaje /tmp existente se respeta.
 #   - Si el árbol objetivo ya existe, usa KERNEL_TMPFS_EXISTING_SRC_MIN_FREE_MB
 #     (2048 MB por defecto) como margen incremental para reutilización.
+#   - El chequeo de espacio del tmpfs en check_build_memory solo aplica si el
+#     tmpfs de build ESTÁ montado (`df` sobre un punto sin montar leería el /tmp
+#     padre, ~5,8G, y falsearía "espacio insuficiente"); en frío, prepare_tmpfs_build
+#     lo monta de 10G y valida su espacio. Si el tmpfs arrastra el árbol de una
+#     ejecución anterior y no llega al mínimo de espacio libre, se libera solo:
+#     purga los artefactos re-generables del enlace (vmlinux*/System.map) y
+#     elimina los árboles huérfanos de otras versiones antes de abortar.
 #   - Mantiene el timestamp sudo durante builds largas sin pedir contraseña en
 #     segundo plano; si el ticket caduca, el keep-alive se detiene de forma segura.
 #   - El tmpfs de build usa exec (necesario para generar/ejecutar herramientas host); /tmp del sistema sigue noexec.
@@ -303,14 +312,23 @@ fi
 
 # Guarda OOM pre-build: aborta pronto y con mensaje claro si no hay memoria
 # suficiente (el enlace con BTF es el punto más hambriento, ver historial de
-# OOM al compilar con DEBUG_INFO_BTF) o si el tmpfs de compilación no tiene
-# espacio libre para el árbol. Umbrales superables por env.
+# OOM al compilar con DEBUG_INFO_BTF) o si el tmpfs de compilación ya montado
+# no tiene espacio libre. Umbrales superables por env.
+# El chequeo del tmpfs SOLO se hace si el tmpfs de build está efectivamente
+# montado: si no lo está (arranque de sesión), `df -Pk $TMPFS_ROOT` devolvería
+# las estadísticas del /tmp padre (5,8G en este sistema) y daría un falso
+# "espacio insuficiente" cuando todavía no hay nada que limpiar. En ese caso
+# prepare_tmpfs_build lo monta de 10G y valida su propio espacio.
+# Si el tmpfs arrastra árboles/artefactos de una ejecución anterior, primero
+# se intenta liberar (liberate_tmpfs_space) y con el árbol de esta versión ya
+# reutilizable se aplica el margen incremental TMPFS_EXISTING_SRC_MIN_FREE_MB,
+# coherente con prepare_tmpfs_build.
 CIZEN_BUILD_MIN_MEM_MB="${CIZEN_BUILD_MIN_MEM_MB:-8192}"
 CIZEN_BUILD_MIN_TMPFS_MB="${CIZEN_BUILD_MIN_TMPFS_MB:-6144}"
 CIZEN_BUILD_MIN_MEM_BTF_MB="${CIZEN_BUILD_MIN_MEM_BTF_MB:-12288}"
 CIZEN_BUILD_MIN_TMPFS_BTF_MB="${CIZEN_BUILD_MIN_TMPFS_BTF_MB:-8192}"
 check_build_memory() {
-  local min_mem min_tmp avail swapfree mem free_mb
+  local min_mem min_tmp min_tmp_used avail swapfree mem free_mb
   if [ "$BTF_REQUESTED" = true ]; then
     min_mem="${CIZEN_BUILD_MIN_MEM_BTF_MB}"; min_tmp="${CIZEN_BUILD_MIN_TMPFS_BTF_MB}"
   else
@@ -322,14 +340,68 @@ check_build_memory() {
   if [ "$mem" -lt "$min_mem" ]; then
     fatal "Memoria insuficiente para el build (BTF=$BTF_REQUESTED): MemAvailable+SwapFree=${mem} MB < ${min_mem} MB. Cierra aplicaciones o ajusta CIZEN_BUILD_MIN_MEM_MB (o _BTF_MB)."
   fi
-  free_mb="$(df -Pk "$TMPFS_ROOT" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
-  if [ -n "$free_mb" ]; then
-    free_mb=$((free_mb / 1024))
-    if [ "$free_mb" -lt "$min_tmp" ]; then
-      fatal "Espacio libre insuficiente en el tmpfs de build ($TMPFS_ROOT): ${free_mb} MB < ${min_tmp} MB. Libera el árbol anterior o ajusta CIZEN_BUILD_MIN_TMPFS_MB (o _BTF_MB)."
+  if tmpfs_is_mounted; then
+    free_mb="$(df -Pk "$TMPFS_ROOT" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
+    [ -n "$free_mb" ] && free_mb=$((free_mb / 1024))
+    if [ -n "$free_mb" ] && [ "$free_mb" -lt "$min_tmp" ]; then
+      # El tmpfs guarda el árbol de la ejecución anterior: en vez de abortar, se
+      # intenta liberar espacio (purgar artefactos regenerables del enlace del
+      # árbol de esta versión + eliminar árboles huérfanos de versiones
+      # distintas) y se vuelve a medir. Evita el bloqueo clásico: el árbol del
+      # propio 7.2.7 (~4-5 GB) deja el tmpfs de 10G por debajo del mínimo BTF.
+      info "tmpfs de build escaso (${free_mb} MB libres < ${min_tmp} MB mínimos); liberando espacio del árbol anterior…"
+      liberate_tmpfs_space
+      free_mb="$(df -Pk "$TMPFS_ROOT" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
+      [ -z "$free_mb" ] || free_mb=$((free_mb / 1024))
+      # Si queda el árbol de esta versión se reutiliza: basta el margen
+      # incremental de reutilización (2048 MB), el mismo que aplica
+      # prepare_tmpfs_build para ese caso exacto. El margen de build completo
+      # (min_tmp) solo se exige cuando no hay nada reutilizable y hay que
+      # extraer un árbol nuevo desde cero.
+      if [ -d "$SRC" ]; then
+        min_tmp_used="$TMPFS_EXISTING_SRC_MIN_FREE_MB"
+      else
+        min_tmp_used="$min_tmp"
+      fi
+      if [ -z "$free_mb" ] || [ "$free_mb" -lt "$min_tmp_used" ]; then
+        fatal "Espacio libre insuficiente en el tmpfs de build ($TMPFS_ROOT): ${free_mb:-?} MB < ${min_tmp_used} MB (árbol reutilizable=$([ -d "$SRC" ] && echo sí || echo no)). Tras purgar los artefactos regenerables sigue lleno: remonta el tmpfs (sudo umount $TMPFS_ROOT) o ajusta CIZEN_BUILD_MIN_TMPFS_MB (o _BTF_MB)."
+      fi
+      ok "Espacio del tmpfs liberado tras limpieza: ${free_mb} MB libres (mín ${min_tmp_used} MB)."
     fi
   fi
-  ok "Build memory ok (BTF=$BTF_REQUESTED): MemAvailable+SwapFree=${mem} MB (mín ${min_mem} MB), tmpfs libre=${free_mb:-?} MB (mín ${min_tmp} MB)."
+  if tmpfs_is_mounted; then
+    ok "Build memory ok (BTF=$BTF_REQUESTED): MemAvailable+SwapFree=${mem} MB (mín ${min_mem} MB), tmpfs libre=${free_mb:-?} MB (mín ${min_tmp} MB)."
+  else
+    ok "Build memory ok (BTF=$BTF_REQUESTED): MemAvailable+SwapFree=${mem} MB (mín ${min_mem} MB), tmpfs de build no montado (lo monta prepare_tmpfs_build)."
+  fi
+}
+
+# Libera espacio en el tmpfs de build cuando una ejecución anterior lo dejó
+# ocupado. Solo toca lo re-generable: artefactos del enlace final (vmlinux*,
+# System.map, .tmp_vmlinux*) del árbol de esta versión y árboles huérfanos de
+# versiones distintas. NUNCA borra el árbol de la versión en curso (es la
+# inversión reutilizable del build; se vuelve a enlazar en minutos).
+liberate_tmpfs_space() {
+  local purged=0 art
+  tmpfs_is_mounted || return 0
+
+  # 1. Artefactos del enlace final del árbol de esta versión. El vmlinux con
+  #    .BTF es el mayor consumidor del tmpfs; su purga devuelve varios GB.
+  if [ -d "$SRC" ]; then
+    while IFS= read -r -d '' art; do
+      rm -f -- "$art"
+      purged=1
+    done < <(find "$SRC" -maxdepth 1 -type f \( -name 'vmlinux' -o -name 'vmlinux.o' -o \
+        -name 'vmlinux.unstripped' -o -name 'System.map' -o -name '.tmp_vmlinux*' \) -print0 2>/dev/null || true)
+    unset art
+    if [ "$purged" = 1 ]; then
+      log "Artefactos del enlace purgados del árbol reutilizable (se regenerarán durante el build)."
+    fi
+  fi
+
+  # 2. Árboles de versiones distintas (misma semántica que cleanup_old_source_trees,
+  #    que se ejecuta más adelante y ya encontrará estos directorios libres).
+  cleanup_old_source_trees
 }
 
 on_err() {
@@ -3654,7 +3726,8 @@ resolve_sign_uki() {
 # BIOS (claves = /var/lib/sbctl/keys, SetupMode efivar, systemd-boot firmado)
 # y se ofrece punto a punto, de forma interactiva, ejecutar lo que falte:
 #   1. sbctl create-keys         3. sbctl sign systemd-boot
-#   2. sbctl enroll-keys         4. habilita Secure Boot en la BIOS (manual)
+#   2. sbctl enroll-keys --microsoft (reintento auto si falta TPM Eventlog)
+#   4. habilita Secure Boot en la BIOS (manual)
 # La UKI del build se firma después, en cizen-uki-sync. Idempotente: solo
 # pregunta por lo que queda pendiente.
 sbctl_keys_present() {
@@ -3677,6 +3750,32 @@ sbctl_setup_mode() {
             2>/dev/null | tr -d '[:space:]' || true)"
     fi
     [ "$v" = "1" ]
+}
+
+# sbctl 0.18+ en sistemas SIN TPM2 se niega a matricular por defecto:
+# "Could not find any TPM Eventlog in the system... we do not know if there is
+# any OptionROM present" → exige un flag explícito. El reintento con
+# --microsoft es la opción estándar: matricula además los certificados OEM de
+# Microsoft en db, lo que mantiene el arranque de OptionROM/multiboot MS junto
+# a las claves propias. Solo se reintenta si el fallo es exactamente ese.
+sbctl_enroll_keys() {
+    local out
+    if out="$(sudo sbctl enroll-keys 2>&1)"; then
+        return 0
+    fi
+    if printf '%s' "$out" | grep -qE "TPM Eventlog|might-brick"; then
+        info "sbctl no encuentra TPM Eventlog (equipo sin TPM2) y exige flag explícito; reintentando 'sbctl enroll-keys --microsoft' (matricula también los certificados OEM de Microsoft en db)…"
+        if out="$(sudo sbctl enroll-keys --microsoft 2>&1)"; then
+            ok "Claves matriculadas con certificados de Microsoft (--microsoft)."
+            return 0
+        fi
+        err "sbctl enroll-keys --microsoft falló:"
+        printf '%s\n' "$out"
+        return 1
+    fi
+    err "sbctl enroll-keys falló (requisito: firmware en Setup Mode; revisa la salida):"
+    printf '%s\n' "$out"
+    return 1
 }
 
 # ¿La PK matriculada en el firmware es NUESTRA clave sbctl? Mira el certificado
@@ -3726,7 +3825,8 @@ collect_systemd_boot_targets() {
 # certificado del efivar PK, systemd-boot firmado) y se ofrece punto a punto,
 # de forma interactiva, ejecutar lo que falte:
 #   1. sbctl create-keys         3. sbctl sign systemd-boot
-#   2. sbctl enroll-keys         4. habilita Secure Boot en la BIOS (manual)
+#   2. sbctl enroll-keys --microsoft (reintento auto si falta TPM Eventlog)
+#   4. habilita Secure Boot en la BIOS (manual)
 # La UKI del build se firma después, en cizen-uki-sync. Idempotente: solo
 # pregunta por lo que queda pendiente. Con claves de fábrica (Dell/MS) en User
 # Mode no puede hacer enroll desde el sistema: lo detecta y lo explica (BIOS →
@@ -3762,13 +3862,13 @@ secure_boot_guided_setup() {
         pending=true
         enrollp="no"
         printf '  El firmware está en SETUP MODE (sin claves matriculadas).\n'
-        if ask_user_yes "¿Matricular las claves en la BIOS ('sudo sbctl enroll-keys')? [S/n]"; then
-            if sudo sbctl enroll-keys && sbctl_pk_enrolled; then
+        if ask_user_yes "¿Matricular las claves en la BIOS ('sudo sbctl enroll-keys --microsoft')? [S/n]"; then
+            if sbctl_enroll_keys && sbctl_pk_enrolled; then
                 enrollp="sí"
                 ok "Claves matriculadas en el firmware (User Mode)."
             else
                 enrollp="no"
-                err "sbctl enroll-keys falló (¿el firmware no estaba en setup mode?)."
+                err "sbctl enroll-keys no completó la matrícula (requisito: firmware en Setup Mode; revisa la salida)."
             fi
         else
             warn "Claves sin matricular: habilitar Secure Boot sin esto NO arrancaría."

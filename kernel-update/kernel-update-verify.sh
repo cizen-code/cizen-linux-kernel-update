@@ -448,7 +448,7 @@ secureboot_check() {
       [ "${DRY:-false}" = true ] && info "Secure Boot: $sboot — la UKI del último build se firmó con sbctl."
     else
       SB_STATE="$sb_build (UKI firmada pero SB $sboot)"
-      warn "La UKI del último build se firmó con sbctl, pero Secure Boot está $sboot: la firma no tiene efecto. Activa Secure Boot (sbctl enroll-keys + BIOS)."
+      warn "La UKI del último build se firmó con sbctl, pero Secure Boot está $sboot: la firma no tiene efecto. Activa Secure Boot (sbctl enroll-keys --microsoft + BIOS)."
       ISSUES=$((ISSUES + 1))
     fi
   elif [ "$sboot" = "HABILITADO" ]; then

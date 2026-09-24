@@ -467,7 +467,7 @@ if [ "$DO_SIGN" = true ]; then
     warn "No hay claves sbctl (sudo sbctl create-keys): la UKI queda sin firmar por ahora."
   elif ! sign_uki_targets "${targets[@]}"; then
     if secure_boot_active; then
-      fatal "La UKI no quedó firmada con Secure Boot ACTIVO: el sistema no arrancaría. Revisa sbctl (sbctl sign / sbctl enroll-keys)."
+      fatal "La UKI no quedó firmada con Secure Boot ACTIVO: el sistema no arrancaría. Revisa sbctl (sbctl sign / sbctl enroll-keys --microsoft)."
     fi
     fatal "No se pudo firmar la UKI (sbctl sign/verify falló)."
   fi
