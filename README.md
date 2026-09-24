@@ -97,7 +97,7 @@ con otras herramientas):
 | timer-freq | `kernel-update.sh --timer-freq 1000` | `CONFIG_HZ` |
 | ntsync | `kernel-update.sh --ntsync` | Fuerza `CONFIG_NTSYNC` (nativo ≥6.10; backport CachyOS <6.10) |
 | fsync | `kernel-update.sh --fsync` | fsync legacy (futex_waitv), solo <6.14 (excluyente con ntsync) |
-| cachy | `kernel-update.sh --cachy` | Parches misc CachyOS (`CIZEN_CACHY_PATCH_SET`, p. ej. nap-governor reflex-governor); fail-soft |
+| cachy | `kernel-update.sh --cachy` | Parches misc CachyOS (`CIZEN_CACHY_PATCH_SET`, default `acpi-call`; válidas: acpi-call aufs dkms-clang handheld hardened nvidia rt-i915); fail-soft, y auto-habilita en la config los símbolos Kconfig que introduce (p. ej. `CONFIG_ACPI_CALL=m`), sobreviviendo a la config lite |
 | user-patches | `CIZEN_USER_PATCHES_DIR=/dir kernel-update.sh` | Aplica `.patch/.diff` propios en orden alfabético (fallo = aborto) |
 | frag-dir | `kernel-update.sh --frag-dir /dir` | Frags de config `.frag` (con `#include`) aplicados tras el perfil |
 | modprobed-db | `kernel-update.sh --modprobed-db` | Alimenta el build `--lite` desde la bbdd de modprobed-db (auto-descubierta) |

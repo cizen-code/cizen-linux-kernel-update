@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.30.0 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.30.1 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / XFS / systemd / KVM-libvirt / QEMU-OVMF
 #
@@ -126,7 +126,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.30.0"
+SCRIPT_VERSION="27.30.1"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -350,8 +350,14 @@ CIZEN_PATCH_NTSYNC="${CIZEN_PATCH_NTSYNC:-auto}"
 CIZEN_PATCH_FSYNC="${CIZEN_PATCH_FSYNC:-0}"
 # Pack misc de CachyOS (best-effort, cada parche fail-soft). Set editable vía
 # CIZEN_CACHY_PATCH_SET (nombres separados por espacio entre los soportados).
+# Default verificado para árbol vanilla 7.x: 'acpi-call'. nap-governor y
+# reflex-governor fueron retirados del stack CachyOS (2026-09: no existen en
+# CachyOS/kernel-patches ni en los PKGBUILD de linux-cachyos).
 CIZEN_CACHY_PATCHES="${CIZEN_CACHY_PATCHES:-0}"
-CIZEN_CACHY_PATCH_SET="${CIZEN_CACHY_PATCH_SET:-nap-governor reflex-governor}"
+CIZEN_CACHY_PATCH_SET="${CIZEN_CACHY_PATCH_SET:-acpi-call}"
+# Símbolos Kconfig que los parches misc introducen; apply_cachy_misc_symbols los
+# re-habilita tras perfil+frags para que sobrevivan a la config lite.
+declare -a CACHY_MISC_SYMBOLS=()
 # Parches propios del usuario: directorio con .patch/.diff que se aplican tras
 # los de terceros. Un fallo aquí es fatal (responsabilidad del usuario).
 CIZEN_USER_PATCHES_DIR="${CIZEN_USER_PATCHES_DIR:-}"
@@ -2464,12 +2470,59 @@ apply_user_patches() {
   return 0
 }
 
+# _misc_extract_kconfig_symbols <fichero.patch>: extrae los símbolos Kconfig
+# que un parche misc introduce (líneas '+config'/'+menuconfig') junto a su tipo
+# (tristate→m, bool/def_bool→y). Por stdout: 'SIMBOLO=tipo' por línea.
+_misc_extract_kconfig_symbols() {
+  local pf="${1:-}"
+  [ -s "$pf" ] || return 0
+  awk '
+    /^\+config[[:space:]]+[A-Za-z0-9_]+/ {
+      if (sym != "") print sym "=" typ;
+      sym = $2; typ = "m"; next;
+    }
+    /^\+menuconfig[[:space:]]+[A-Za-z0-9_]+/ {
+      if (sym != "") print sym "=" typ;
+      sym = ""; typ = "m"; next;
+    }
+    sym != "" && /^\+[[:space:]]*(bool|def_bool)([[:space:]]|$)/ { typ = "y"; next; }
+    sym != "" && /^\+[[:space:]]*(tristate|def_tristate)([[:space:]]|$)/ { typ = "m"; next; }
+    END { if (sym != "") print sym "=" typ; }
+  ' "$pf"
+}
+
+# apply_cachy_misc_symbols(): re-habilita en la fase de config los símbolos que
+# el pack misc introdujo y que la config lite habría descartado (módulos no
+# cargados). Se invoca DESPUÉS de perfil+frags y ANTES de la auditoría: los
+# símbolos quedan disponibles para olddefconfig y la validación no los reclama
+# (no están en el perfil): si sus dependencias no existen, Kconfig los descarta
+# en silencio, coherente con el fail-soft del pack.
+apply_cachy_misc_symbols() {
+  [ "${#CACHY_MISC_SYMBOLS[@]}" -gt 0 ] || return 0
+  local -a args=()
+  local symdef sym typ
+  for symdef in "${CACHY_MISC_SYMBOLS[@]}"; do
+    sym="${symdef%%=*}"; typ="${symdef#*=}"
+    case "$typ" in
+      y) args+=(--enable "$sym") ;;
+      *) args+=(--module "$sym") ;;
+    esac
+  done
+  if ( cd "$SRC" && scripts/config "${args[@]}" ) >/dev/null 2>&1; then
+    ok "Pack cachy: ${#CACHY_MISC_SYMBOLS[@]} símbolo(s) introducido(s) por los parches misc habilitado(s) en la config."
+  else
+    warn "Pack cachy: no se pudieron habilitar los símbolos misc en la config; se continúa sin ellos."
+  fi
+  return 0
+}
+
 # apply_cachy_misc_single(): intenta descargar y aplicar un parche misc del pack
 # de CachyOS para la rama del kernel objetivo. Cada candidato de nombre se prueba
 # (0001-<item>.patch o <item>.patch según el repo) con download+validación
-# patch --dry-run. Devuelve 0 si aplicó.
+# patch --dry-run. Devuelve 0 si aplicó. Cuando aplica, recolecta los símbolos
+# Kconfig que introduce para habilitarlos en la fase de config.
 apply_cachy_misc_single() {
-  local br="$1" item="$2" cand tmp url applied=0
+  local br="$1" item="$2" cand tmp url applied=0 __symdef
   command -v patch >/dev/null 2>&1 || return 1
   for cand in "0001-${item}.patch" "${item}.patch"; do
     tmp="$(mktemp "$KERNEL_BUILD_ROOT/cachy-${item}-${br}.XXXXXX.patch" 2>/dev/null || mktemp)"
@@ -2480,6 +2533,10 @@ apply_cachy_misc_single() {
         if patch -p1 -d "$SRC" < "$tmp" >/dev/null 2>&1; then
           ok "CachyOS misc: $item aplicado (rama $br, $cand)."
           applied=1
+          while IFS= read -r __symdef; do
+            [ -n "$__symdef" ] || continue
+            CACHY_MISC_SYMBOLS+=("$__symdef")
+          done < <(_misc_extract_kconfig_symbols "$tmp")
         fi
       fi
     fi
@@ -2490,17 +2547,23 @@ apply_cachy_misc_single() {
 }
 
 # apply_cachy_misc_patchset(): orquesta el pack misc best-effort. Solo parches
-# razonablemente independientes del árbol CachyOS entran en el default set
-# (governors nap/reflex); el resto (hardened, aufs, nvidia, acpi-call...) queda
-# disponible vía CIZEN_CACHY_PATCH_SET. Cada fallo es un warn, nunca fatal.
+# verificados como aplicables a un árbol vanilla (sin el árbol de CachyOS)
+# están en el default set; el resto (aufs, hardened, handheld, rt-i915...) es
+# opt-in vía CIZEN_CACHY_PATCH_SET y falla suave si no aplica. Cada fallo es un
+# warn, nunca fatal. Los símbolos Kconfig que los parches introducen (p. ej.
+# CONFIG_ACPI_CALL) se recolectan aquí y se habilitan después de perfil+frags en
+# apply_cachy_misc_symbols, de modo que la opción 16 no solo aplica fuentes sino
+# que hace que esas opciones se compilen de verdad (y sobrevivan a la lite).
 apply_cachy_misc_patchset() {
   [ "$CIZEN_CACHY_PATCHES" = "1" ] || return 0
   command -v patch >/dev/null 2>&1 || { warn "pack cachy: sin 'patch' instalado; se omite."; return 0; }
   local br="$(bore_branch_from_version "$VERSION")" item applied=0 skipped=0
-  info "Pack misc CachyOS (best-effort) para la rama $br: ${CIZEN_CACHY_PATCH_SET:-nap-governor reflex-governor} ..."
-  for item in ${CIZEN_CACHY_PATCH_SET:-nap-governor reflex-governor}; do
+  local -a __cachy_items=()
+  IFS=' ' read -r -a __cachy_items <<< "${CIZEN_CACHY_PATCH_SET:-acpi-call}"
+  info "Pack misc CachyOS (best-effort) para la rama $br: ${CIZEN_CACHY_PATCH_SET:-acpi-call} ..."
+  for item in "${__cachy_items[@]}"; do
     case "$item" in
-      nap-governor|reflex-governor|acpi-call|clang-polly|hardened|rt-i915)
+      acpi-call|aufs|dkms-clang|handheld|hardened|nvidia|rt-i915)
         if apply_cachy_misc_single "$br" "$item"; then
           applied=$((applied + 1))
         else
@@ -2508,7 +2571,7 @@ apply_cachy_misc_patchset() {
           skipped=$((skipped + 1))
         fi
         ;;
-      *) warn "pack cachy: entrada desconocida '$item' (se ignora; válidas: nap-governor reflex-governor acpi-call clang-polly hardened rt-i915)." ;;
+      *) warn "pack cachy: entrada desconocida '$item' (se ignora; válidas: acpi-call aufs dkms-clang handheld hardened nvidia rt-i915)." ;;
     esac
   done
   [ "$applied" -gt 0 ] && ok "Pack misc CachyOS: $applied aplicado(s)${skipped:+ (${skipped} omitido(s))}."
@@ -4583,6 +4646,7 @@ secure_boot_guided_setup() {
         if ask_user_yes "¿Generarlas ahora ('sudo sbctl create-keys')? [S/n]"; then
             if sudo sbctl create-keys && sbctl_keys_present; then
                 keyt="sí"
+                pending=false
                 ok "Claves Secure Boot generadas (/var/lib/sbctl/keys)."
             else
                 err "sbctl create-keys falló."
@@ -4603,6 +4667,7 @@ secure_boot_guided_setup() {
         if ask_user_yes "¿Matricular las claves en la BIOS ('sudo sbctl enroll-keys --microsoft')? [S/n]"; then
             if sbctl_enroll_keys && sbctl_pk_enrolled; then
                 enrollp="sí"
+                pending=false
                 ok "Claves matriculadas en el firmware (User Mode)."
             else
                 enrollp="no"
@@ -4642,6 +4707,7 @@ secure_boot_guided_setup() {
             if ask_user_yes "¿Firmar systemd-boot (${#boot_targets[@]} fichero(s)) con sbctl? [S/n]"; then
                 if cizen_uki_sign_targets "${boot_targets[@]}"; then
                     bootp="sí"
+                    pending=false
                     ok "systemd-boot firmado."
                 else
                     err "Fallo al firmar systemd-boot."
@@ -4663,7 +4729,11 @@ secure_boot_guided_setup() {
         warn "Secure Boot sigue desactivado en la BIOS: falta el último paso manual."
         secure_boot_bios_guide enable
     fi
-    [ "$pending" = true ]
+    if [ "$pending" = true ]; then
+        err "Cadena Secure Boot con pasos pendientes: resuélvelos y vuelve a ejecutar."
+        return 1
+    fi
+    return 0
 }
 
 # ============================================================
@@ -5269,6 +5339,7 @@ touch "$BUILD_MARKER"
 inject_build_overlay
 apply_config_requests || fatal "Falló scripts/config al aplicar el perfil."
 apply_config_fragments || fatal "Falló scripts/config al aplicar los frags."
+apply_cachy_misc_symbols
 
 # Auditoría oficial Kconfig.
 run_kconfig_audit || fatal "Auditoría Kconfig fallida."
@@ -5494,9 +5565,8 @@ fi
 # si hay sbctl y Secure Boot desactivado; con SB activo se firma siempre.
 resolve_sign_uki
 
-# Auditoría de disco cifrado (opción --luks-audit): avisa antes de construir el
-# UKI si la raíz LUKS no tiene parámetros de desbloqueo en el cmdline.
-luks_fde_audit
+# Auditoría de disco cifrado (opción --luks-audit): se ejecuta tras la
+# instalación; la definición está más adelante en el flujo principal.
 
 # ============================================================
 # COMPILACIÓN
@@ -6090,6 +6160,9 @@ else
 fi
 # Respaldo del UKI previo antes de sobrescribirlo (feature LinuxLocker).
 uki_backup_prev
+# Auditoría de disco cifrado (opción --luks-audit): avisa antes de regenerar el
+# UKI si la raíz LUKS no tiene parámetros de desbloqueo en el cmdline.
+luks_fde_audit
 sudo cizen-uki-sync "${UKI_SYNC_ARGS[@]}"
 ensure_cizen_efi_updated
 ok "UKI sincronizado"

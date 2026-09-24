@@ -51,15 +51,21 @@ patch() {
 # cuál se sirvió. Devuelve 1 si la URL no coincide con ninguna rama conocida.
 DL_CALLED=0
 LAST_SERVED=""
-download_file() {
+download_file_good() {
   local url="$1" out="$2"
   DL_CALLED=$((DL_CALLED + 1))
+  printf '%s\n' "$url" >> "$ROOT/dl.log"
   case "$url" in
     *"/sched/0001-bore-cachy.patch") LAST_SERVED="cachy";    cp -- "$ROOT/patch-cachy.patch" "$out" 2>/dev/null; return 0 ;;
-    *"/sched/0001-bore.patch")       LAST_SERVED="upstream"; cp -- "$ROOT/patch-upstream.patch" "$out" 2>/dev/null; return 0 ;;
+    *"/sched/0001-bore.patch")       LAST_SERVED="upstream"; cp -- "$ROOT/patch-cachy.patch" "$out" 2>/dev/null; return 0 ;;
+    *"/misc/0001-acpi-call.patch")     LAST_SERVED="upstream"; cp -- "$ROOT/patch-misc.patch" "$out" 2>/dev/null; return 0 ;;
+    *"/misc/acpi-call.patch")          LAST_SERVED="upstream"; cp -- "$ROOT/patch-misc.patch" "$out" 2>/dev/null; return 0 ;;
+    *"/misc/0001-rt-i915.patch")       LAST_SERVED="upstream"; cp -- "$ROOT/patch-misc.patch" "$out" 2>/dev/null; return 0 ;;
+    *"/misc/rt-i915.patch")            LAST_SERVED="upstream"; cp -- "$ROOT/patch-misc.patch" "$out" 2>/dev/null; return 0 ;;
   esac
   return 1
 }
+download_file() { download_file_good "$@"; }
 
 # parches de prueba (contienen el PATCH_MAGIC que exige el motor)
 printf 'config SCHED_BORE\n--- a/init/Kconfig\n+++ b/init/Kconfig\n' > "$ROOT/patch-cachy.patch"
@@ -83,6 +89,11 @@ extract() { # $1 = nombre de función (hasta el `}` inicial en columna 0)
   extract patch_markers_hit
   extract apply_patch_register
   extract apply_patch_plugin
+  extract _misc_extract_kconfig_symbols
+  extract apply_cachy_misc_symbols
+  extract apply_cachy_misc_single
+  extract apply_cachy_misc_patchset
+  extract secure_boot_guided_setup
 } > "$ROOT/fns.sh"
 
 if [ ! -s "$ROOT/fns.sh" ]; then
@@ -321,6 +332,130 @@ grep -q -- '--enable FOO' "$SRC/scripts-config.log" 2>/dev/null \
 export CIZEN_FRAGS_DIR="$ROOT/no-existe"
 apply_config_fragments && rec ok "frag: sin directorio -> no-op rc=0" || rec fail "sin frag-dir debía ser no-op"
 unset CIZEN_FRAGS_DIR
+
+printf '%s\n' "== apply_cachy_misc_patchset: splitting del CIZEN_CACHY_PATCH_SET (fix 2026-09-24) =="
+download_file() { download_file_good "$@"; }
+printf 'diff --git a/init/Kconfig b/init/Kconfig\n--- a/init/Kconfig\n+++ b/init/Kconfig\n' > "$ROOT/patch-misc.patch"
+export CIZEN_CACHY_PATCHES=1
+export CIZEN_CACHY_PATCH_SET="acpi-call rt-i915"
+: > "$ROOT/dl.log"
+apply_cachy_misc_patchset
+grep -q "misc/0001-acpi-call.patch" "$ROOT/dl.log" 2>/dev/null \
+  && rec ok "cachy: intentó acpi-call (splitting correcto)" || rec fail "cachy: acpi-call no se intentó (splitting roto)"
+grep -q "misc/0001-rt-i915.patch" "$ROOT/dl.log" 2>/dev/null \
+  && rec ok "cachy: intentó rt-i915 (splitting correcto)" || rec fail "cachy: rt-i915 no se intentó"
+grep -qE "misc/0001-(nap|reflex)-governor" "$ROOT/dl.log" 2>/dev/null \
+  && rec fail "cachy: set por defecto ya no debe usar nap/reflex (retirados)" || rec ok "cachy: sin referencias a nap/reflex"
+unset CIZEN_CACHY_PATCH_SET
+: > "$ROOT/dl.log"
+apply_cachy_misc_patchset
+grep -q "misc/0001-acpi-call.patch" "$ROOT/dl.log" 2>/dev/null \
+  && rec ok "cachy: default (sin CIZEN_CACHY_PATCH_SET) = acpi-call" || rec fail "cachy: default no intentó acpi-call"
+unset CIZEN_CACHY_PATCHES
+
+printf '%s\n' "== _misc_extract_kconfig_symbols + apply_cachy_misc_symbols (auto-enable del CONFIG que el parche introduce) =="
+cat > "$ROOT/patch-kconfig-syms.patch" <<'EOF'
+diff --git a/drivers/platform/x86/Kconfig b/drivers/platform/x86/Kconfig
+--- a/drivers/platform/x86/Kconfig
++++ b/drivers/platform/x86/Kconfig
+@@ -1,3 +1,8 @@
++config ACPI_CALL
++	tristate "ACPI Call"
++	boolconn
++config CIZEN_BOOL
++	bool "Cizen bool"
++menuconfig CIZEN_MENU
++	bool "menu"
++config CIZEN_INNER
++	def_bool y
+EOF
+SYMS_OK=$(_misc_extract_kconfig_symbols "$ROOT/patch-kconfig-syms.patch" | sort)
+EXPECTED_SYMS=$'ACPI_CALL=m\nCIZEN_BOOL=y\nCIZEN_INNER=y'
+[ "$SYMS_OK" = "$EXPECTED_SYMS" ] \
+  && rec ok "cachy: extrae símbolos y tipo (ACPI_CALL=m, CIZEN_BOOL=y, CIZEN_INNER=y)" \
+  || rec fail "cachy: extracción de símbolos inesperada: [$SYMS_OK]"
+mkdir -p "$ROOT/src/scripts"
+cat > "$ROOT/src/scripts/config" <<'EOF'
+#!/bin/bash
+echo "$*" >> "$ROOT/config-calls.log"
+exit 0
+EOF
+chmod +x "$ROOT/src/scripts/config"
+: > "$ROOT/config-calls.log"
+CACHY_MISC_SYMBOLS=(ACPI_CALL=m CIZEN_BOOL=y CIZEN_INNER=y)
+apply_cachy_misc_symbols
+grep -q -- "--module ACPI_CALL" "$ROOT/config-calls.log" \
+  && rec ok "cachy: apply_cachy_misc_symbols habilita ACPI_CALL como módulo" \
+  || rec fail "cachy: ACPI_CALL no se habilitó como módulo"
+grep -q -- "--enable CIZEN_BOOL" "$ROOT/config-calls.log" \
+  && rec ok "cachy: apply_cachy_misc_symbols habilita CIZEN_BOOL como builtin" \
+  || rec fail "cachy: CIZEN_BOOL no se habilitó"
+grep -q -- "--enable CIZEN_INNER" "$ROOT/config-calls.log" \
+  && rec ok "cachy: CIZEN_INNER (def_bool) como builtin" \
+  || rec fail "cachy: CIZEN_INNER no se habilitó"
+CACHY_MISC_SYMBOLS=()
+apply_cachy_misc_symbols
+[ ! -s "$ROOT/config-calls.log" ] \
+  && rec fail "cachy: apply_cachy_misc_symbols sin símbolos no debe tocar scripts/config" \
+  || rec ok "cachy: con lista vacía no toca scripts/config"
+rm -f -- "$ROOT/src/scripts/config" "$ROOT/src/scripts/.." >/dev/null 2>&1 || true
+rm -f -- "$ROOT/config-calls.log" "$ROOT/patch-kconfig-syms.patch"
+unset SYMS_OK EXPECTED_SYMS
+
+printf '%s\n' "== apply_cachy_misc_single: recolecta símbolos tras aplicar (end-to-end) =="
+printf 'diff --git a/aaa b/aaa\nindex 0000000..1111111\n--- /dev/null\n+++ b/cachy-dummy\n@@ -0,0 +1,2 @@\n+config ACPI_CALL\n+\ttristate "ACPI Call"\n' > "$ROOT/patch-misc.patch"
+: > "$ROOT/dl.log"
+CACHY_MISC_SYMBOLS=()
+download_file() { download_file_good "$@"; }
+CIZEN_CACHY_PATCHES=1
+apply_cachy_misc_single "7.2" "acpi-call"
+cnt="${#CACHY_MISC_SYMBOLS[@]}"
+[ "$cnt" -ge 1 ] && printf '%s\n' "${CACHY_MISC_SYMBOLS[@]}" | grep -q "^ACPI_CALL=m$" \
+  && rec ok "cachy: al aplicar recolectó ACPI_CALL=m" \
+  || rec fail "cachy: no recolectó símbolos al aplicar (array=[${CACHY_MISC_SYMBOLS[*]:-}] )"
+rm -f -- "$SRC/cachy-dummy"
+CACHY_MISC_SYMBOLS=()
+unset CIZEN_CACHY_PATCHES
+
+printf '%s\n' "== secure_boot_guided_setup: guarda final de pendientes (fix 2026-09-24) =="
+# Stubs del marco sbctl/BIOS para aislar el setup guiado.
+ask_user_yes(){ return 0; }
+sbctl_keys_present(){ return 0; }
+sbctl_setup_mode(){ [ "$SB_SCENARIO" = pending ] && return 0; return 1; }
+sbctl_pk_enrolled(){ [ "$SB_SCENARIO" = pending ] && return 1; return 0; }
+sbctl_enroll_keys(){ [ "$SB_SCENARIO" = pending ] && return 1; return 0; }
+collect_systemd_boot_targets(){ printf '%s\n' "$ROOT/systemd-bootx64.efi"; }
+: > "$ROOT/systemd-bootx64.efi"
+cizen_uki_sign_targets_verify(){ [ "$SB_SCENARIO" = pending ] && return 1; return 0; }
+cizen_uki_sign_targets(){ [ "$SB_SCENARIO" = pending ] && return 1; return 0; }
+secure_boot_active(){ return 0; }
+secure_boot_bios_guide(){ :; }
+SB_SCENARIO=all_ok
+if secure_boot_guided_setup; then
+  rec ok "cadena completa (claves/enroll/boot firmado) -> rc=0, no aborta"
+else
+  rec fail "cadena completa abortaba (bug guarda invertida)"
+fi
+SB_SCENARIO=pending
+if secure_boot_guided_setup; then
+  rec fail "pasos pendientes debían abortar (fail-closed)"
+else
+  rec ok "pasos pendientes -> rc=1 (fail-closed)"
+fi
+SB_SCENARIO=all_ok
+unset SB_SCENARIO
+
+printf '%s\n' "== orden definición vs llamada en el flujo principal (fix luks_fde_audit) =="
+for _fn in uki_backup_prev module_sign_installed luks_fde_audit apply_cachy_misc_symbols; do
+  _def="$(grep -nE "^${_fn}\(\)" "$MOTOR" | cut -d: -f1 | head -1)"
+  _call="$(grep -nE "^[[:space:]]*${_fn}[[:space:]]*$" "$MOTOR" | cut -d: -f1 | head -1)"
+  if [ -n "$_def" ] && [ -n "$_call" ] && [ "$_call" -gt "$_def" ]; then
+    rec ok "${_fn}: definición (L$_def) antes de la llamada (L$_call)"
+  else
+    rec fail "${_fn}: orden inválido def=[$_def] call=[$_call]"
+  fi
+done
+unset _fn _def _call
 
 # --- resumen ---
 echo

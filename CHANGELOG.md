@@ -1,3 +1,30 @@
+## [27.30.1] - 2026-09-24
+
+Correcciones de robustez detectadas al probar la opción 16 del menú (pack misc
+CachyOS) sobre el propio release v27.30.0, más saneamiento del pack.
+
+- **Guarda Secure Boot corregida** (`secure_boot_guided_setup`): el test final
+  `[ "$pending" = true ]` estaba invertido y abortaba la cadena con `errexit`
+  aun con todos los pasos resueltos. Ahora `pending=false` al resolver claves,
+  enroll y firma del gestor, y el cierre verifica `pending` en falso.
+- **Splitting de `CIZEN_CACHY_PATCH_SET`**: con el `IFS` global (`\n`, tab)
+  del motor, el set default no se separaba y la opción 16 intentaba un solo
+  nombre («entrada desconocida»). Se lee con `read -a` bajo `IFS=' '`.
+- **Orden de definición de `luks_fde_audit`**: se llamaba antes de su
+  definición (error 127); se movió la llamada justo antes de `cizen-uki-sync`.
+- **Pack misc CachyOS saneado**: los governors `nap-governor`/`reflex-governor`
+  fueron **retirados** del stack CachyOS (ausentes en `CachyOS/kernel-patches`
+  de todas las ramas y en los PKGBUILD de `linux-cachyos`); el default ahora es
+  `acpi-call` (verificado que aplica limpio sobre el árbol vanilla 7.2) y la
+  lista de válidas es `acpi-call aufs dkms-clang handheld hardened nvidia rt-i915`.
+- **Auto-enable de símbolos del pack**: al aplicar un parche misc se extraen los
+  símbolos Kconfig que introduce y se re-habilitan tras perfil+frags y antes de
+  la auditoría (`apply_cachy_misc_symbols`), de modo que p. ej.
+  `CONFIG_ACPI_CALL=m` sobrevive a la config lite y el módulo se compila.
+  Sustituye a la nota anterior de «la opción 16 solo aplica fuentes».
+- **Selftest**: 50 → 66 checks (guardas SB, splitting, orden de definición,
+  extracción/tipado de símbolos, auto-enable y recolección end-to-end).
+
 # Changelog
 
 Historial de versiones de la suite `cizen-linux-kernel-update`. El
@@ -39,7 +66,12 @@ gestor multi-kernel, firma persistente de módulos y UKI backup
   enable/module/disable/set-val/set-str.
 - **Parches de usuario + misc CachyOS**: `apply_user_patches` (fatal si un
   `.patch/.diff` de `CIZEN_USER_PATCHES_DIR` falla) y
-  `apply_cachy_misc_patchset` (fail-soft: nap-governor, reflex-governor, etc.).
+  `apply_cachy_misc_patchset` (fail-soft; default `acpi-call`, set válido:
+  acpi-call aufs dkms-clang handheld hardened nvidia rt-i915). Los símbolos
+  Kconfig que introducen los parches misc se auto-habilitan en la config
+  (`apply_cachy_misc_symbols`, tras perfil+frags y antes de la auditoría), de
+  modo que `CONFIG_ACPI_CALL=m` sobrevive a la config lite y el módulo se
+  compila.
 - **Empaquetado multi-backend**: `--pkg-backend` con `arch/pacman-pkg`,
   `deb/deb-pkg`(+dpkg), `rpm/rpm-pkg`(+rpm), `generic|gentoo`/targz-pkg con
   `modules_install`+vmlinuz directo; pkgrel y guards pacman solo en arch.
