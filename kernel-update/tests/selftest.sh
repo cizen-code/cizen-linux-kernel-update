@@ -584,6 +584,33 @@ for _fn in uki_backup_prev module_sign_installed luks_fde_audit apply_cachy_misc
 done
 unset _fn _def _call
 
+printf '%s\n' "== clang/lld como dependencias OBLIGATORIAS cuando el usuario elige LLVM (--clang/LTO) =="
+if grep -q 'tools+=(clang ld.lld)' "$MOTOR"; then
+  rec ok "check_prerequisites exige clang+ld.lld cuando CLANG_REQUESTED=true"
+else
+  rec fail "check_prerequisites: falta la exigencia condicional 'tools+=(clang ld.lld)'"
+fi
+if grep -q '\[ld.lld\]=lld' "$MOTOR"; then
+  rec ok "TOOL_PKG mapea ld.lld -> lld (autoinstalación 'sudo pacman -S lld')"
+else
+  rec fail "TOOL_PKG: falta '[ld.lld]=lld'"
+fi
+if grep -q 'sin clang/lld instalados; se ignora el LTO'; then
+  rec fail "LTO ya no debe degradar/ignorarse por faltar clang/lld (rama eliminada)"
+else
+  rec ok "LTO con clang/lld ausentes ya no se ignora; se exige la toolchain"
+fi
+if grep -q 'se degrada a GCC (sudo pacman -S clang lld)'; then
+  rec fail "--clang ya no debe degradar a GCC (rama eliminada)"
+else
+  rec ok "--clang sin toolchain ya no degrada a gcc (fatal en su lugar)"
+fi
+if grep -q 'jamás se degrada a gcc' "$MOTOR"; then
+  rec ok "CLANG_BUILD documenta la exigencia previa en check_prerequisites"
+else
+  rec fail "CLANG_BUILD: falta la sanidad/documentación de dependencias exigidas"
+fi
+
 # --- resumen ---
 echo
 printf 'Totales: %d ok, %d fail\n' "$PASS" "$FAIL"

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.31.0 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.31.1 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / XFS / systemd / KVM-libvirt / QEMU-OVMF
 #
@@ -127,7 +127,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.0"
+SCRIPT_VERSION="27.31.1"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -329,6 +329,8 @@ fi
 # tocan el perfil cizen salvo que el usuario lo pida explícitamente.
 # ============================================================
 # Compilador: auto (clang si está, si no gcc) | gcc | clang. --clang == clang.
+# Elegir clang (o LTO) convierte a clang+lld en dependencias OBLIGATORIAS:
+# si faltan, check_prerequisites los ofrece e instala como las demás.
 CIZEN_CC="${CIZEN_CC:-auto}"
 # LTO únicamente con clang: 0=off (default), 1|thin=CONFIG_LTO_CLANG_THIN,
 # full=CONFIG_LTO_CLANG_FULL.
@@ -676,13 +678,13 @@ case "$CIZEN_LLVM_LTO" in 0|1|thin|full) ;; *) fatal "CIZEN_LLVM_LTO inválido: 
 # la fase de config, para no inyectar CONFIG_LTO_CLANG_* en un build que luego
 # degrade a gcc (olddefconfig los descartaría y la validación ENABLE fallaría).
 if [ "$CIZEN_LLVM_LTO" != "0" ]; then
-  if [ "$CIZEN_CC" = "gcc" ] && ! command -v clang >/dev/null 2>&1; then
+  if [ "$CIZEN_CC" = "gcc" ]; then
     warn "LTO (${CIZEN_LLVM_LTO}) exige clang; CIZEN_CC=gcc → se ignora el LTO."
     CIZEN_LLVM_LTO=0
-  elif ! command -v clang >/dev/null 2>&1 || ! command -v ld.lld >/dev/null 2>&1; then
-    warn "LTO (${CIZEN_LLVM_LTO}) sin clang/lld instalados; se ignora el LTO (sudo pacman -S clang lld)."
-    CIZEN_LLVM_LTO=0
   else
+    # LTO únicamente se compila con clang+lld (LLVM=1): en lugar de degradar a
+    # gcc o ignorar el LTO cuando faltan, se EXIGEN ahora como dependencias
+    # obligatorias (check_prerequisites las ofrece e instala como las demás).
     [ "$CIZEN_CC" = "auto" ] && CIZEN_CC=clang
     CLANG_REQUESTED=true
   fi
@@ -1434,6 +1436,7 @@ declare -A TOOL_PKG=(
   [umount]=util-linux [wget]=wget          [xargs]=findutils
   [xz]=xz
   [clang]=clang          [lld]=lld          [llvm-ar]=llvm
+  [ld.lld]=lld
   [mokutil]=mokutil      [openssl]=openssl  [dpkg]=dpkg
   [objcopy]=binutils     [readelf]=binutils
 )
@@ -1478,6 +1481,14 @@ check_prerequisites() {
   local cmd pkg rc
   local -a tools=(awk bash bc bison cat ccache cmp cp date df du find findmnt flex flock fuser grep gcc gpg head id ls make mktemp mount nproc pacman pahole perl rm sbctl sed sleep sort stat tar tr umount wget xargs xz timeout cizen-uki-sync)
   local -a missing_cmds=() missing_pkgs=()
+
+  # --clang (o LTO, que solo se compila con clang/lld): clang y lld pasan a ser
+  # dependencias OBLIGATORIAS, se ofrecen e instalan igual que el resto (mismo
+  # flujo check → sudo pacman -S --needed → fatal si se rechaza). Nunca degrada
+  # a gcc: si el usuario eligió LLVM/Clang se respeta como elección explícita.
+  if [ "$CLANG_REQUESTED" = true ]; then
+    tools+=(clang ld.lld)
+  fi
 
   for cmd in "${tools[@]}"; do
     if command -v "$cmd" >/dev/null 2>&1; then
@@ -5807,7 +5818,9 @@ case "$CIZEN_CPU_OPT" in
 esac
 
 # Build con LLVM/Clang (--clang): Kbuild aplica LLVM=1 (CC=clang, ld.lld,
-# llvm-ar/nm, etc.). Si clang o ld.lld no están, se degrada a GCC (fatal suave).
+# llvm-ar/nm, etc.). clang/lld ya se exigieron e instalaron como dependencias
+# obligatorias en check_prerequisites (--clang / LTO → jamás se degrada a gcc);
+# esta sanidad solo es una red de seguridad.
 CLANG_BUILD=false
 if [ "$CLANG_REQUESTED" = true ]; then
   if command -v clang >/dev/null 2>&1 && command -v ld.lld >/dev/null 2>&1; then
@@ -5824,7 +5837,7 @@ if [ "$CLANG_REQUESTED" = true ]; then
     CLANG_BUILD=true
     ok "Compilación con LLVM/Clang (LLVM=1)."
   else
-    warn "clang/ld.lld no están instalados; --clang se degrada a GCC (sudo pacman -S clang lld)."
+    fatal "clang/ld.lld no están disponibles pese a exigirse como dependencia (sudo pacman -S clang lld)."
   fi
 fi
 

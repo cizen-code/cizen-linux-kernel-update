@@ -1,3 +1,22 @@
+## [27.31.1] - 2026-09-24
+
+clang y lld pasan a ser dependencias **obligatorias** (con el mismo flujo de
+instalación que el resto) cuando el usuario elige la toolchain LLVM, en vez de
+degradar a GCC en silencio.
+
+- Elegir `--clang`, `--cc clang` o `--llvm-lto thin|full` (que solo se compila
+  con clang/lld) y no tener clang/ld.lld instalados ya **no degrada a gcc**:
+  `check_prerequisites` incluye `clang` y `ld.lld` (paquete `lld`) entre las
+  dependencias requeridas, se ofrecen con `sudo pacman -S --needed clang lld`
+  (mismo prompt Sí/No que las demás) y, si se rechazan o la instalación falla,
+  se aborta con el comando sugerido.
+- El LTO ya no se ignora por faltar la toolchain: se retiene la petición y se
+  exigen las dependencias antes de la fase de configuración.
+- Comportamiento intacto para `auto` (usa clang solo si ya está presente) y
+  `gcc`.
+- Selftest 81→86 checks (regresión sobre el flujo de exigencia); `bash -n`;
+  repo==instalado (motor `69da0789`, selftest `b17f62bf`).
+
 ## [27.30.1] - 2026-09-24
 
 Correcciones de robustez detectadas al probar la opción 16 del menú (pack misc
