@@ -78,7 +78,7 @@
 #     firma se abre el SETUP GUIADO de Secure Boot: genera las claves
 #     (sbctl create-keys), firma systemd-boot y matricula las claves en la BIOS
 #     (sbctl enroll-keys, con reintento automático con --microsoft si sbctl exige
-#     flag por falta de TPM Eventlog en equipos sin TPM2), preguntando solo lo
+#     flag por falta de TPM Eventlog — TPM deshabilitado o ausente), preguntando solo lo
 #     que queda pendiente, pregunta a pregunta (S/n).
 #   CIZEN_PATCH_SHA256_VERIFY=0 ./kernel-update.sh <versión>  # desactivar pin SHA256 de los parches
 #   JOBS=3 ./kernel-update.sh <versión>
@@ -3811,7 +3811,8 @@ sbctl_setup_mode() {
     [ "$v" = "1" ]
 }
 
-# sbctl 0.18+ en sistemas SIN TPM2 se niega a matricular por defecto:
+# sbctl 0.18+ se niega a matricular por defecto cuando no encuentra TPM
+# Eventlog (TPM deshabilitado en BIOS o ausente del hardware):
 # "Could not find any TPM Eventlog in the system... we do not know if there is
 # any OptionROM present" → exige un flag explícito. El reintento con
 # --microsoft es la opción estándar: matricula además los certificados OEM de
@@ -3823,7 +3824,7 @@ sbctl_enroll_keys() {
         return 0
     fi
     if printf '%s' "$out" | grep -qE "TPM Eventlog|might-brick"; then
-        info "sbctl no encuentra TPM Eventlog (equipo sin TPM2) y exige flag explícito; reintentando 'sbctl enroll-keys --microsoft' (matricula también los certificados OEM de Microsoft en db)…"
+        info "sbctl no encuentra TPM Eventlog (TPM deshabilitado o ausente) y exige flag explícito; reintentando 'sbctl enroll-keys --microsoft' (matricula también los certificados OEM de Microsoft en db)…"
         if out="$(sudo sbctl enroll-keys --microsoft 2>&1)"; then
             ok "Claves matriculadas con certificados de Microsoft (--microsoft)."
             return 0
