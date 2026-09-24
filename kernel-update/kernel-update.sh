@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.30.1 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.31.0 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / XFS / systemd / KVM-libvirt / QEMU-OVMF
 #
@@ -59,6 +59,7 @@
 #   CIZEN_PATCHES="bore" ./kernel-update.sh <versión>         # parches por env
 #   ./kernel-update.sh <versión> --no-btf                     # sin CONFIG_DEBUG_INFO_BTF (opt-out; default: BTF=y)
 #   ./kernel-update.sh <versión> --clang                      # build LLVM/clang (opt-in)
+#   ./kernel-update.sh <versión> --tree auto|vanilla|cachyos  # árbol de fuentes: auto (pds/bmq/lfbmq/muqss -> fork CachyOS) | vanilla | cachyos
 #   ./kernel-update.sh <versión> --menuconfig                 # editar config con menuconfig
 #   ./kernel-update.sh [versión] --publish-repo               # publicar pkg a repo pacman local
 #   CIZEN_PUBLISH_REPO=/srv/repo ./kernel-update.sh <versión> # dónde publicar (default /var/lib/kernel-update/repo)
@@ -126,7 +127,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.30.1"
+SCRIPT_VERSION="27.31.0"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -342,6 +343,11 @@ CIZEN_CPU_OPT="${CIZEN_CPU_OPT:-inherit}"
 CIZEN_TIMER_FREQ="${CIZEN_TIMER_FREQ:-inherit}"
 # Scheduler de compilación: inherit | eevdf (vanilla) | bore | pds | bmq | lfbmq | muqss.
 CIZEN_SCHED="${CIZEN_SCHED:-inherit}"
+# Árbol de fuentes del kernel: auto (vanilla salvo que un scheduler seleccionado
+# exija el fork CachyOS) | vanilla (kernel.org) | cachyos (fork CachyOS/linux).
+# Los schedulers PRJC (pds/bmq/lfbmq) y MuQSS solo se publican como parches
+# -cachy que aplican sobre el árbol del fork, NO sobre la release vanilla.
+CIZEN_KERNEL_TREE="${CIZEN_KERNEL_TREE:-auto}"
 # Sincronización Wine (ntsync/fsync): ntsync en mainline >= 6.10 como CONFIG
 # NTSYNC; para < 6.10 se intenta el parche de CachyOS (--patch ntsync). fsync
 # legacy (serie futex_waitv) solo tiene sentido < 6.14 y es excluyente con
@@ -588,6 +594,11 @@ while [ $# -gt 0 ]; do
       shift 2 ;;
     --sched=*)
       CIZEN_SCHED="${1#--sched=}"; shift ;;
+    --tree)
+      CIZEN_KERNEL_TREE="${2:-}"; [ -n "$CIZEN_KERNEL_TREE" ] || { err "--tree requiere auto|vanilla|cachyos"; exit 1; }
+      shift 2 ;;
+    --tree=*)
+      CIZEN_KERNEL_TREE="${1#--tree=}"; shift ;;
     --ntsync)
       CIZEN_PATCH_NTSYNC=1; shift ;;
     --no-ntsync)
@@ -695,6 +706,7 @@ case "$CIZEN_PKG_BACKEND" in arch|deb|rpm|generic|gentoo) ;;
   *) fatal "CIZEN_PKG_BACKEND inválido: $CIZEN_PKG_BACKEND (use arch, deb, rpm, generic o gentoo)." ;;
 esac
 case "$CIZEN_MODULE_SIGN" in yes|no) ;; *) fatal "CIZEN_MODULE_SIGN inválido: $CIZEN_MODULE_SIGN (use yes o no)." ;; esac
+case "$CIZEN_KERNEL_TREE" in auto|vanilla|cachyos) ;; *) fatal "CIZEN_KERNEL_TREE inválido: $CIZEN_KERNEL_TREE (use auto, vanilla o cachyos)." ;; esac
 if [ -n "$CIZEN_USER_PATCHES_DIR" ] && [ ! -d "$CIZEN_USER_PATCHES_DIR" ]; then
   fatal "CIZEN_USER_PATCHES_DIR no existe o no es un directorio: $CIZEN_USER_PATCHES_DIR"
 fi
@@ -974,6 +986,66 @@ resolve_latest_release() {
   fi
 }
 
+# Decide KERNEL_TREE (vanilla | cachyos) una vez resuelta VERSION.
+# En "auto" (defecto) los schedulers PRJC/MuQSS fuerzan el fork CachyOS: sus
+# parches -cachy solo aplican sobre el árbol del fork CachyOS/linux; sobre la
+# release vanilla de kernel.org los ficheros vanilla (0001-prjc.patch) ya no se
+# publican para ramas recientes y el resultado es build vanilla silencioso.
+resolve_kernel_tree() {
+  KERNEL_TREE="$CIZEN_KERNEL_TREE"
+  if [ "$KERNEL_TREE" = "auto" ]; then
+    local __p
+    for __p in "${PATCH_NAMES[@]:-}"; do
+      case "$__p" in
+        pds|bmq|lfbmq|muqss) KERNEL_TREE="cachyos"; break ;;
+      esac
+    done
+    [ "$KERNEL_TREE" = "auto" ] && KERNEL_TREE="vanilla"
+  fi
+}
+
+# Determina el tagrel del release del fork CachyOS/linux para $VERSION. Los
+# releases se publican como cachyos-<VERSION>-<N> (p. ej. cachyos-7.2.7-1, con
+# assets .tar.gz + .tar.gz.asc firmados por los mantenedores). Resolución:
+#   1) API de releases (cacho de 100, más recientes primero): se queda con el
+#      mayor tagrel para la versión (patrón cachyos-$VERSION-[0-9]+).
+#   2) Fallback sin depender de rate limits ni paginación: sondeo directo del
+#      .asc de los tags cachyos-$VERSION-1..8 (asset mínimo; 404 = tag ausente).
+resolve_cachyos_release() {
+  local ver="$1" i cand_url probes
+  CACHYOS_TAGREL=""
+  probes="$KERNEL_BUILD_ROOT/.cizen-cachy-probe-$$"
+  rm -f -- "$probes"
+
+  if download_file "https://api.github.com/repos/CachyOS/linux/releases?per_page=100" "$probes" >/dev/null 2>&1; then
+    CACHYOS_TAGREL="$(
+      grep -oE 'cachyos-'"$ver"'-[-A-Za-z0-9.]+' "$probes" \
+      | sed -E 's/^cachyos-'"$ver"'-([0-9]+)$/\1/' \
+      | grep -E '^[0-9]+$' \
+      | sort -n | tail -n1
+    )"
+    rm -f -- "$probes"
+    if [ -n "$CACHYOS_TAGREL" ]; then
+      ok "Release CachyOS detectado (API): cachyos-${ver}-${CACHYOS_TAGREL}"
+      return 0
+    fi
+  fi
+
+  # Fallback: probar .asc de los candidatos directos.
+  rm -f -- "$probes"
+  for i in $(seq 1 8); do
+    cand_url="https://github.com/CachyOS/linux/releases/download/cachyos-${ver}-${i}/cachyos-${ver}-${i}.tar.gz.asc"
+    if download_file "$cand_url" "$probes" >/dev/null 2>&1; then
+      CACHYOS_TAGREL="$i"
+      rm -f -- "$probes"
+      ok "Release CachyOS detectado (sondeo): cachyos-${ver}-${CACHYOS_TAGREL}"
+      return 0
+    fi
+  done
+  rm -f -- "$probes"
+  fatal "No se pudo determinar el release cachyos-${ver}-N del fork CachyOS/linux (¿red? ¿el fork no publicó esa versión?). El build del árbol CachyOS se aborta."
+}
+
 # ============================================================
 # RUTAS / ESTADO
 # ============================================================
@@ -982,6 +1054,12 @@ MAJOR=""
 TARBALL=""
 SRC=""
 URL=""
+# Árbol de fuentes resuelto (vanilla | cachyos), tagrel del release CachyOS y
+# rutas .asc/.sign derivadas. Se fijan tras la resolución de VERSION.
+KERNEL_TREE=""
+CACHYOS_TAGREL=""
+SIG_FILE=""
+SIG_URL=""
 
 TS="$(date +%Y%m%d-%H%M%S)"
 BUILD_MARKER="$TMPFS_ROOT/.build-marker-$TS"
@@ -1636,21 +1714,22 @@ unmount_tmpfs_build() {
 }
 
 cleanup_kernel_cache() {
-  local current_tarball="linux-$VERSION.tar.xz"
-  local current_sig="linux-$VERSION.tar.xz.sign"
-  local current_verified="linux-$VERSION.tar.xz.verified-ok"
-  local item base keep
+  local current_tarball current_sig current_verified item base keep
+  current_tarball="$(basename -- "$TARBALL")"
+  current_sig="$(basename -- "$SIG_FILE")"
+  current_verified="${current_tarball}.verified-ok"
 
   mkdir -p "$KERNEL_BUILD_ROOT"
 
   # Solo se conservan el tarball, su firma y su huella de verificación de la
-  # versión solicitada. No se tocan gnupg/, kernel-update.lock ni otros
+  # versión solicitada (del árbol vanilla linux-X.Y.Z.tar.xz o del fork
+  # cachyos-X.Y.Z-N.tar.gz). No se tocan gnupg/, kernel-update.lock ni otros
   # elementos ajenos a artefactos.
   shopt -s nullglob
   # Limpia todos los artefactos de tarball/firma antiguos, incluidos temporales
   # de descargas interrumpidas. La versión objetivo se conserva solo bajo sus
   # nombres definitivos, nunca con sufijos .download/.bad/.partial.
-  for item in "$KERNEL_BUILD_ROOT"/linux-*.tar.xz*; do
+  for item in "$KERNEL_BUILD_ROOT"/*.tar.xz* "$KERNEL_BUILD_ROOT"/*.tar.gz*; do
     base="$(basename -- "$item")"
     keep=false
     case "$base" in
@@ -1802,7 +1881,11 @@ cleanup_tmpfs_on_exit() {
   # Nunca dejar temporales de descarga tras éxito, error o interrupción.
   if [ -n "${TARBALL:-}" ]; then
     rm -f -- "${TARBALL}.download-"* "${TARBALL}.partial-"* 2>/dev/null || true
+    # La firma puede ser .sign (kernel.org) o .asc (fork CachyOS/linux).
     rm -f -- "${TARBALL}.sign.download-"* "${TARBALL}.sign.partial-"* 2>/dev/null || true
+    if [ "$KERNEL_TREE" = "cachyos" ]; then
+      rm -f -- "${TARBALL}.asc.download-"* "${TARBALL}.asc.partial-"* 2>/dev/null || true
+    fi
   fi
 
   # Retirar cualquier copia temporal de configuración que haya quedado por una
@@ -1851,12 +1934,25 @@ declare -A KERNEL_TRUSTED_SIGNERS=(
   [torvalds@kernel.org]="ABAF11C65A2970B130ABE3C479BE3E4300411886"
 )
 
+# Firmantes de las releases del fork CachyOS/linux (.asc): huellas recogidas de
+# los validpgpkeys de los PKGBUILD linux-cachyos (Eric Naim — dnaim@cachyos.org
+# — y Peter Jung — admin@ptr1337.dev —). Conviene revisarlas si CachyOS cambia
+# de firmantes.
+declare -A CACHYOS_TRUSTED_SIGNERS=(
+  [dnaim@cachyos.org]="E18447AC260021D31F3FF6C4C8A2A4774B8B63C4"
+  [admin@ptr1337.dev]="E8B9AA39F054E30E8290D492C3C4820857F654FE"
+)
+
 verify_tarball() {
   local file="$1"
   [ -f "$file" ] || return 1
   [ -s "$file" ] || return 1
   log "Verificando integridad del tarball ($(du -h "$file" | cut -f1))..."
-  xz -t "$file" >/dev/null 2>&1
+  if [ "$KERNEL_TREE" = "cachyos" ]; then
+    gzip -t "$file" >/dev/null 2>&1
+  else
+    xz -t "$file" >/dev/null 2>&1
+  fi
 }
 
 prepare_gpg_home() {
@@ -1869,17 +1965,40 @@ prepare_gpg_home() {
 # o cuya huella no coincida, se descarta (y se elimina del keyring si llegó
 # a importarse) en vez de bloquear la ejecución: basta con que AL MENOS UNO
 # de los firmantes reconocidos quede disponible para poder verificar.
+# El conjunto de firmantes depende del árbol: kernel.org (WKD) o el fork
+# CachyOS/linux (WKD + keyservers, porque sus claves no siempre publican WKD).
 ensure_kernel_signing_keys() {
   local email fp expected pinned=0
+  local origin="kernel.org"
+  declare -A signers=()
   prepare_gpg_home
 
-  for email in "${!KERNEL_TRUSTED_SIGNERS[@]}"; do
-    expected="${KERNEL_TRUSTED_SIGNERS[$email]}"
+  if [ "$KERNEL_TREE" = "cachyos" ]; then
+    origin="CachyOS"
+    for email in "${!CACHYOS_TRUSTED_SIGNERS[@]}"; do
+      signers[$email]="${CACHYOS_TRUSTED_SIGNERS[$email]}"
+    done
+  else
+    for email in "${!KERNEL_TRUSTED_SIGNERS[@]}"; do
+      signers[$email]="${KERNEL_TRUSTED_SIGNERS[$email]}"
+    done
+  fi
+
+  for email in "${!signers[@]}"; do
+    expected="${signers[$email]}"
     fp="$(gpg --homedir "$KERNEL_GPG_HOME" --batch --with-colons --fingerprint "$email" 2>/dev/null | awk -F: '$1=="fpr" {print $10; exit}')"
 
     if [ "$fp" != "$expected" ]; then
-      log "Clave de $email no disponible en el keyring dedicado; se obtiene mediante WKD de kernel.org."
+      log "Clave de $email no disponible en el keyring dedicado; se obtiene mediante WKD de $origin."
       gpg --homedir "$KERNEL_GPG_HOME" --batch --yes --locate-keys "$email" >/dev/null 2>&1 || true
+      fp="$(gpg --homedir "$KERNEL_GPG_HOME" --batch --with-colons --fingerprint "$email" 2>/dev/null | awk -F: '$1=="fpr" {print $10; exit}')"
+    fi
+
+    if [ "$fp" != "$expected" ] && [ "$KERNEL_TREE" = "cachyos" ]; then
+      log "WKD no disponible para $email; se intenta por keyserver (openpgp.org, luego keys.cachyos.org)."
+      gpg --homedir "$KERNEL_GPG_HOME" --batch --keyserver hkps://keys.openpgp.org --recv-key "$expected" >/dev/null 2>&1 \
+        || gpg --homedir "$KERNEL_GPG_HOME" --batch --keyserver hkps://keys.cachyos.org --recv-key "$expected" >/dev/null 2>&1 \
+        || true
       fp="$(gpg --homedir "$KERNEL_GPG_HOME" --batch --with-colons --fingerprint "$email" 2>/dev/null | awk -F: '$1=="fpr" {print $10; exit}')"
     fi
 
@@ -1890,13 +2009,14 @@ ensure_kernel_signing_keys() {
       warn "No se pudo confirmar la clave PGP de $email (obtenida: '${fp:-ninguna}'); no se usará para verificar firmas."
       if [ -n "$fp" ]; then
         # Nunca dejamos en el keyring dedicado una clave cuya huella no
-        # coincide con la esperada, aunque WKD haya devuelto algo.
+        # coincide con la esperada, aunque WKD/keyserver haya devuelto algo.
         gpg --homedir "$KERNEL_GPG_HOME" --batch --yes --delete-keys "$fp" >/dev/null 2>&1 || true
       fi
     fi
   done
+  unset signers
 
-  [ "$pinned" -gt 0 ] || fatal "No se pudo confirmar ninguna clave PGP oficial de kernel.org (${!KERNEL_TRUSTED_SIGNERS[*]})."
+  [ "$pinned" -gt 0 ] || fatal "No se pudo confirmar ninguna clave PGP oficial de $origin (${!KERNEL_TRUSTED_SIGNERS[*]} / ${!CACHYOS_TRUSTED_SIGNERS[*]})."
 }
 
 verify_tarball_signature() {
@@ -1905,15 +2025,22 @@ verify_tarball_signature() {
   [ -s "$sig" ] || return 1
   ensure_kernel_signing_keys
   log "Verificando firma PGP oficial del tarball..."
-  # kernel.org firma el archivo .tar sin comprimir, mientras el archivo
-  # descargado para la build es .tar.xz. La verificación correcta es
-  # descomprimir por streaming y pasar el .tar a gpg mediante stdin.
+  if [ "$KERNEL_TREE" = "cachyos" ]; then
+    # El fork CachyOS/linux firma el .tar.gz tal cual (el .asc del release).
+    # gpg --verify sig archivo verifica la firma directa sobre el binario.
+    gpg_out="$(gpg --homedir "$KERNEL_GPG_HOME" --batch --verify "$sig" "$tarball" 2>&1)" || true
+  else
+    # kernel.org firma el archivo .tar sin comprimir, mientras el archivo
+    # descargado para la build es .tar.xz. La verificación correcta es
+    # descomprimir por streaming y pasar el .tar a gpg mediante stdin.
+    gpg_out="$(xz -cd -- "$tarball" | gpg --homedir "$KERNEL_GPG_HOME" --batch --verify "$sig" - 2>&1)" || true
+  fi
   # El keyring dedicado solo contiene claves ya fijadas por huella en
   # ensure_kernel_signing_keys(), así que un "Good signature" de gpg aquí
   # implica necesariamente que la firma es de uno de los firmantes
   # confiables (LC_ALL=C está exportado al inicio del script, así que el
   # texto de salida de gpg es estable para este grep).
-  if gpg_out="$(xz -cd -- "$tarball" | gpg --homedir "$KERNEL_GPG_HOME" --batch --verify "$sig" - 2>&1)"; then
+  if [ "${gpg_out%Good signature*}" != "$gpg_out" ]; then
     signer="$(printf '%s\n' "$gpg_out" | sed -n 's/.*Good signature from "\([^"]*\)".*/\1/p' | head -n1)"
     ok "Firma PGP del kernel verificada correctamente${signer:+ (firmante: $signer)}"
     return 0
@@ -1976,9 +2103,17 @@ download_file() {
 }
 
 get_tarball() {
-  local tarball="$1" url="$2" tmp_download tmp_sign sig bad_name
-  sig="${tarball}.sign"
+  local tarball="$1" url="$2" tmp_download tmp_sign sig bad_name sign_url
+  if [ "$KERNEL_TREE" = "cachyos" ]; then
+    sig="${tarball}.asc"
+    sign_url="${url}.asc"
+  else
+    sig="${tarball}.sign"
+    sign_url="${url%.tar.xz}.tar.sign"
+  fi
   local verified_marker="${tarball}.verified-ok"
+  local signer_origin="kernel.org"
+  [ "$KERNEL_TREE" = "cachyos" ] && signer_origin="CachyOS"
 
   # Limpia residuos temporales previos de esta misma versión antes de reutilizar
   # el caché. Nunca se considera válido un .download/.bad/.partial.
@@ -2048,8 +2183,8 @@ get_tarball() {
     return 1
   fi
 
-  log "Descargando firma PGP: ${url%.tar.xz}.tar.sign"
-  if ! download_file "${url%.tar.xz}.tar.sign" "$tmp_sign"; then
+  log "Descargando firma PGP: $sign_url"
+  if ! download_file "$sign_url" "$tmp_sign"; then
     rm -f -- "$tmp_download" "$tmp_sign"
     err "No se pudo descargar la firma PGP del kernel."
     return 1
@@ -2065,7 +2200,7 @@ get_tarball() {
   mv -f -- "$tmp_download" "$tarball"
   mv -f -- "$tmp_sign" "$sig"
   tarball_fingerprint "$tarball" "$sig" > "$verified_marker" 2>/dev/null || true
-  ok "Tarball descargado, íntegro y firmado por kernel.org"
+  ok "Tarball descargado, íntegro y firmado por $signer_origin"
 }
 
 # ============================================================
@@ -2076,10 +2211,12 @@ source_tree_valid() {
 }
 
 extract_tarball() {
+  local _top extract_top kver
   cleanup_old_source_trees
 
   if source_tree_valid; then
-    if [ "$(make -C "$SRC" -s kernelversion 2>/dev/null || true)" = "$VERSION" ]; then
+    kver="$(make -C "$SRC" -s kernelversion 2>/dev/null || true)"
+    if [ "$kver" = "$VERSION" ] || [[ "$kver" == "$VERSION"-* ]]; then
       return 0
     fi
     warn "El árbol existente no coincide con $VERSION; se elimina y se vuelve a extraer."
@@ -2089,14 +2226,29 @@ extract_tarball() {
   log "Extrayendo fuentes en $(dirname "$SRC") ..."
   tar -xf "$TARBALL" -C "$(dirname "$SRC")"
 
+  # El tarball de kernel.org extrae linux-X.Y.Z (== basename de $SRC); el del
+  # fork CachyOS/linux extrae cachyos-X.Y.Z-N. Si el árbol esperado no quedó
+  # donde debe, se mueve el directorio extraído a $SRC.
+  if ! source_tree_valid; then
+    _top="$(tar -tf "$TARBALL" 2>/dev/null | head -n1)"
+    extract_top="${_top%%/*}"
+    if [ -n "$extract_top" ] && [ "$extract_top" != "$(basename -- "$SRC")" ] \
+       && [ -d "$(dirname "$SRC")/$extract_top" ] \
+       && [ -f "$(dirname "$SRC")/$extract_top/Makefile" ]; then
+      log "Reubicando árbol extraído ($extract_top) a $SRC"
+      mv -- "$(dirname "$SRC")/$extract_top" "$SRC"
+    fi
+  fi
+
   if ! source_tree_valid; then
     err "Extracción incompleta: falta $SRC/Makefile"
     rm -rf "$SRC"
     return 1
   fi
 
-  if [ "$(make -C "$SRC" -s kernelversion 2>/dev/null || true)" != "$VERSION" ]; then
-    err "La versión del árbol extraído no coincide con $VERSION"
+  kver="$(make -C "$SRC" -s kernelversion 2>/dev/null || true)"
+  if [ "$kver" != "$VERSION" ] && [[ "$kver" != "$VERSION"-* ]]; then
+    err "La versión del árbol extraído no coincide con $VERSION (obtenida: '${kver:-?}')"
     rm -rf "$SRC"
     return 1
   fi
@@ -2179,6 +2331,9 @@ _patch_desc_scheduler_base() {
   PATCH_SKIP_REASON=""
   PATCH_SHA256_MAIN=""
   PATCH_SHA256_FALLBACK=""
+  # PRJC/MuQSS solo se publican como parches -cachy que aplican sobre el árbol
+  # del fork CachyOS/linux, nunca sobre la release vanilla de kernel.org.
+  PATCH_TREE_REQUIRED="cachyos"
   case "$kind" in
     pds)
       PATCH_DESC="PRJC/PDS scheduler (Piotr Gorski)"
@@ -2331,6 +2486,9 @@ apply_patch_plugin() {
     warn "Parche '$name' desconocido o sin descriptor en el motor; se omite."
     return 1
   fi
+  # Cada descriptor decide PATCH_TREE_REQUIRED; se parte de vacío para que el
+  # valor de un parche anterior (variable global) no se filtre.
+  unset PATCH_TREE_REQUIRED PATCH_SKIP_REASON
 "patch_desc_$name"
 
   # Un descriptor puede decidir que el parche NO aplica a esta versión (p. ej.
@@ -2338,6 +2496,14 @@ apply_patch_plugin() {
   # aquí con aviso, sin tocar el árbol.
   if [ -n "${PATCH_SKIP_REASON:-}" ]; then
     warn "${PATCH_SKIP_REASON}"
+    return 1
+  fi
+
+  # Si el parche exige un árbol de fuentes concreto (p. ej. schedulers PRJC/
+  # MuQSS -> árbol CachyOS) y el build se hizo sobre otro, se omite de forma
+  # fail-soft (build vanilla) con aviso, sin intentar descargar nada.
+  if [ -n "${PATCH_TREE_REQUIRED:-}" ] && [ "$KERNEL_TREE" != "$PATCH_TREE_REQUIRED" ]; then
+    warn "${PATCH_DISP_NAME:-$name} requiere el árbol de fuentes '$PATCH_TREE_REQUIRED' (compila con --tree $PATCH_TREE_REQUIRED); se omite y se continúa con el árbol actual ($KERNEL_TREE)."
     return 1
   fi
 
@@ -5220,10 +5386,28 @@ if [ -z "$VERSION" ]; then
   fi
 
 # La versión ya está resuelta: a partir de aquí todas las rutas son deterministas.
+# Primero se decide el árbol de fuentes: los schedulers PRJC/MuQSS (pds, bmq,
+# lfbmq, muqss) solo existen como parches -cachy y exigen el fork CachyOS/linux.
+resolve_kernel_tree
+if [ "$KERNEL_TREE" = "cachyos" ]; then
+  resolve_cachyos_release "$VERSION"
+fi
+log "Árbol de fuentes: $KERNEL_TREE"
+
 MAJOR="${VERSION%%.*}"
-TARBALL="$KERNEL_BUILD_ROOT/linux-$VERSION.tar.xz"
-SRC="$TMPFS_ROOT/linux-$VERSION"
-URL="https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-$VERSION.tar.xz"
+if [ "$KERNEL_TREE" = "cachyos" ]; then
+  TARBALL="$KERNEL_BUILD_ROOT/cachyos-$VERSION-$CACHYOS_TAGREL.tar.gz"
+  SIG_FILE="${TARBALL}.asc"
+  SIG_URL="https://github.com/CachyOS/linux/releases/download/cachyos-$VERSION-$CACHYOS_TAGREL/cachyos-$VERSION-$CACHYOS_TAGREL.tar.gz.asc"
+  SRC="$TMPFS_ROOT/linux-$VERSION"
+  URL="https://github.com/CachyOS/linux/releases/download/cachyos-$VERSION-$CACHYOS_TAGREL/cachyos-$VERSION-$CACHYOS_TAGREL.tar.gz"
+else
+  TARBALL="$KERNEL_BUILD_ROOT/linux-$VERSION.tar.xz"
+  SIG_FILE="${TARBALL}.sign"
+  SIG_URL="https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-$VERSION.tar.sign"
+  SRC="$TMPFS_ROOT/linux-$VERSION"
+  URL="https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-$VERSION.tar.xz"
+fi
 
 # Lock exclusivo. Mantemos una única operación para evitar carreras sobre el árbol persistente.
 exec 9>"$LOCK_FILE"

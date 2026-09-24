@@ -25,6 +25,44 @@ CachyOS) sobre el propio release v27.30.0, más saneamiento del pack.
 - **Selftest**: 50 → 66 checks (guardas SB, splitting, orden de definición,
   extracción/tipado de símbolos, auto-enable y recolección end-to-end).
 
+## [27.31.0] - 2026-09-24
+
+Soporte del **árbol de fuentes del fork CachyOS/linux** para que los schedulers
+PRJC y MuQSS apliquen de verdad. Los parches `-cachy` de `CachyOS/kernel-patches`
+(pds/bmq/lfbmq/muqss) solo aplican sobre el árbol del fork, no sobre la release
+vanilla de kernel.org: los archivos vanilla (`0001-prjc.patch`) dejaron de
+publicarse para ramas recientes, y sobre vanilla 7.2 el forward-port no encajaba
+(contexto Kconfig distinto) y el build caía a vanilla silenciosamente.
+
+- **`CIZEN_KERNEL_TREE` / `--tree auto|vanilla|cachyos`**: decisión del árbol de
+  fuentes tras resolver la versión. En `auto` (defecto) los schedulers
+  `pds`/`bmq`/`lfbmq`/`muqss` fuerzan el árbol `cachyos`; `bore` y el resto de
+  parches siguen sobre `vanilla`. `resolve_kernel_tree` decide antes de fijar
+  TARBALL/SRC/URL.
+- **`resolve_cachyos_release`**: calcula el tagrel del release del fork
+  (`cachyos-<VERSION>-N`, p. ej. `cachyos-7.2.7-1`) consultando la API de
+  releases de `CachyOS/linux` (mayor tagrel de la versión) con fallback por
+  sondeo directo de los `.asc` (`cachyos-$V-1..8`, sin depender de rate limits
+  ni paginación). Validado en vivo contra el API real.
+- **Descarga y verificación por árbol**: el fork usa `.tar.gz` + `.asc` (firma
+  del tarball directo), verificación PGP `gpg --verify sig file` y `gzip -t`;
+  kernel.org sigue con `.tar.xz` + `.tar.sign` (`xz -cd | gpg`, `xz -t`).
+- **Firmantes CachyOS atados por huella** (`CACHYOS_TRUSTED_SIGNERS`):
+  `dnaim@cachyos.org` (`E18447AC…B8B63C4`) y `admin@ptr1337.dev`
+  (`E8B9AA39…7F654FE`), obtenidos por WKD y keyserver (openpgp.org →
+  keys.cachyos.org). Verificado end-to-end con el tarball real `cachyos-7.2.7-1`
+  (firma de Peter Jung).
+- **Extracción**: el tarball del fork extrae `cachyos-X.Y.Z-N`; se reubica a
+  `$SRC` (`linux-$VERSION`) y el chequeo `kernelversion` tolera el sufijo
+  `-cachyos`.
+- **`cleanup_kernel_cache` y traps** parametrizados por árbol (conservan SOLO el
+  tarball/firma de la versión objetivo de cualquiera de los dos árboles).
+- **Guardia fail-soft**: un descriptor con `PATCH_TREE_REQUIRED=cachyos` que se
+  pide sobre un build `--tree vanilla` se omite con WARN (sin descargar, sin
+  registrar), nunca rompe.
+- **Selftest**: 68 → 81 checks (selección de árbol, parseo del JSON de releases,
+  sondeo directo de `.asc` y guardia de árbol).
+
 # Changelog
 
 Historial de versiones de la suite `cizen-linux-kernel-update`. El

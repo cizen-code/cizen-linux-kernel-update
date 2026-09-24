@@ -37,6 +37,9 @@ warn(){ :; }
 info(){ :; }
 log() { :; }
 err() { :; }
+# fatal en el motor hace exit 1; en el harness NO debe matar el selftest, solo
+# señalizar el fallo con rc=1 a la función que lo invocó.
+fatal(){ return 1; }
 
 # stub de patch(1): no se aplica nada real. Como el motor usa `patch ... < f`,
 # el fichero llega por stdin (no por argumento); la decisión se toma con la
@@ -86,6 +89,8 @@ extract() { # $1 = nombre de función (hasta el `}` inicial en columna 0)
   extract patch_desc_ntsync
   extract patch_desc_fsync
   extract kernel_version_ge
+  extract resolve_kernel_tree
+  extract resolve_cachyos_release
   extract process_frag_file
   extract apply_config_fragments
   extract patch_markers_hit
@@ -263,6 +268,9 @@ esac
 printf '%s\n' "== apply_patch_plugin: plugins sin pin SHA256 (bmq) no crashean (set -u) =="
 rm -rf "$SRC/kernel/sched"; mkdir -p "$SRC"
 PATCHES_APPLIED=(); PATCH_ENABLE_ALL=(); PATCH_REBEL_ALL=(); PATCH_DISABLE_ALL=(); BORE_ENABLED=false
+# bmq exige el árbol del fork CachyOS: en el harness se fuerza ese árbol para
+# que el flujo de aplicación llegue al final (v27.31.0).
+KERNEL_TREE=cachyos
 unset CIZEN_PATCH_SHA256_MAIN CIZEN_PATCH_SHA256_FALLBACK
 printf 'config SCHED_BMQ\n--- a/init/Kconfig\n+++ b/init/Kconfig\n' > "$ROOT/patch-bmq.patch"
 : > "$ROOT/dl.log"
@@ -276,6 +284,104 @@ case " ${PATCH_ENABLE_ALL[*]:-} " in
   *) rec fail "bmq ENABLE: [${PATCH_ENABLE_ALL[*]:-}]" ;;
 esac
 rm -f -- "$ROOT/patch-bmq.patch"
+
+printf '%s\n' "== resolve_release_tree (v27.31.0): selección del árbol CachyOS =="
+KERNEL_TREE=""
+CIZEN_KERNEL_TREE=auto
+PATCH_NAMES=(bmq)
+resolve_kernel_tree
+[ "$KERNEL_TREE" = "cachyos" ] && rec ok "auto + bmq -> árbol cachyos" || rec fail "auto+bmq -> KERNEL_TREE=$KERNEL_TREE"
+PATCH_NAMES=(bore)
+resolve_kernel_tree
+[ "$KERNEL_TREE" = "vanilla" ] && rec ok "auto + bore -> árbol vanilla" || rec fail "auto+bore -> KERNEL_TREE=$KERNEL_TREE"
+PATCH_NAMES=(pds)
+resolve_kernel_tree
+[ "$KERNEL_TREE" = "cachyos" ] && rec ok "auto + pds -> árbol cachyos" || rec fail "auto+pds -> KERNEL_TREE=$KERNEL_TREE"
+PATCH_NAMES=(lfbmq)
+resolve_kernel_tree
+[ "$KERNEL_TREE" = "cachyos" ] && rec ok "auto + lfbmq -> árbol cachyos" || rec fail "auto+lfbmq -> KERNEL_TREE=$KERNEL_TREE"
+PATCH_NAMES=(muqss)
+resolve_kernel_tree
+[ "$KERNEL_TREE" = "cachyos" ] && rec ok "auto + muqss -> árbol cachyos" || rec fail "auto+muqss -> KERNEL_TREE=$KERNEL_TREE"
+PATCH_NAMES=(bore)
+CIZEN_KERNEL_TREE=vanilla
+resolve_kernel_tree
+[ "$KERNEL_TREE" = "vanilla" ] && rec ok "vanilla forzado se respeta" || rec fail "vanilla forzado -> KERNEL_TREE=$KERNEL_TREE"
+PATCH_NAMES=(bmq)
+CIZEN_KERNEL_TREE=cachyos
+resolve_kernel_tree
+[ "$KERNEL_TREE" = "cachyos" ] && rec ok "cachyos forzado se respeta" || rec fail "cachyos forzado -> KERNEL_TREE=$KERNEL_TREE"
+CIZEN_KERNEL_TREE=auto
+PATCH_NAMES=()
+resolve_kernel_tree
+[ "$KERNEL_TREE" = "vanilla" ] && rec ok "auto sin parches -> vanilla" || rec fail "auto sin parches -> KERNEL_TREE=$KERNEL_TREE"
+PATCH_NAMES=()
+
+printf '%s\n' "== resolve_cachyos_release (v27.31.0): parseo del JSON de releases =="
+releases_json() {
+  printf '%s\n' '[
+  {"tag_name": "cachyos-7.2.8-1", "draft": false},
+  {"tag_name": "cachyos-7.2.7-2", "draft": false},
+  {"tag_name": "cachyos-7.2.7-1", "draft": false},
+  {"tag_name": "cachyos-7.2.7-rc4-1", "draft": false},
+  {"tag_name": "cachyos-7.2.6-1", "draft": false}
+]'
+}
+download_file() {
+  local url="$1" out="$2"
+  case "$url" in
+    *"releases?per_page=100") printf '%s\n' "$(releases_json)" > "$out"; return 0 ;;
+  esac
+  return 1
+}
+CACHYOS_TAGREL=""
+if resolve_cachyos_release 7.2.7; then
+  if [ "$CACHYOS_TAGREL" = "2" ]; then
+    rec ok "API: tagrel máximo cachyos-7.2.7-2"
+  elif [ "$CACHYOS_TAGREL" = "1" ]; then
+    rec fail "API: eligió tagrel 1 (debía coger el máximo, el -2)"
+  else
+    rec fail "API: tagrel=$CACHYOS_TAGREL (esperado 2)"
+  fi
+else
+  rec fail "resolve_cachyos_release falló con JSON de releases válido"
+fi
+
+printf '%s\n' "== resolve_cachyos_release (v27.31.0): sondeo directo de .asc =="
+download_file() {
+  local url="$1" out="$2"
+  case "$url" in
+    *"cachyos-7.2.7-3.tar.gz.asc") : > "$out"; return 0 ;;
+  esac
+  return 1
+}
+CACHYOS_TAGREL=""
+if resolve_cachyos_release 7.2.7; then
+  [ "$CACHYOS_TAGREL" = "3" ] \
+    && rec ok "sondeo: API caída -> probó .asc y halló tagrel 3" \
+    || rec fail "sondeo: tagrel=$CACHYOS_TAGREL (esperado 3)"
+else
+  rec fail "resolve_cachyos_release falló en el camino de sondeo directo"
+fi
+
+printf '%s\n' "== apply_patch_plugin: guardia de árbol del fork (bmq sobre vanilla) =="
+rm -rf "$SRC/kernel/sched"; mkdir -p "$SRC"
+PATCHES_APPLIED=(); PATCH_ENABLE_ALL=(); PATCH_REBEL_ALL=(); PATCH_DISABLE_ALL=(); BORE_ENABLED=false
+KERNEL_TREE=vanilla; DL_CALLED=0
+printf 'config SCHED_BMQ\n--- a/init/Kconfig\n+++ b/init/Kconfig\n' > "$ROOT/patch-bmq.patch"
+: > "$ROOT/dl.log"
+if apply_patch_plugin bmq; then
+  rec fail "bmq sobre árbol vanilla debía omitirse (fail-soft)"
+else
+  rec ok "bmq + árbol vanilla -> omitido con WARN (fail-soft)"
+fi
+[ "$DL_CALLED" = 0 ] && rec ok "guardia: no descargó nada" || rec fail "guardia descargó pese a omitir (DL_CALLED=$DL_CALLED)"
+[ "${PATCHES_APPLIED[*]:-}" = "" ] && rec ok "guardia: bmq no se registró" || rec fail "guardia registró bmq: [${PATCHES_APPLIED[*]:-}]"
+KERNEL_TREE=cachyos
+rm -f -- "$ROOT/patch-bmq.patch"
+# restaura el stub bueno de descarga para el resto del harness
+download_file() { download_file_good "$@"; }
+unset releases_json
 
 printf '%s\n' "== patch_desc: skip por versión (ntsync / fsync) =="
 VERSION_SAVE="$VERSION"
