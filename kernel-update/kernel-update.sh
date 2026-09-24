@@ -2177,6 +2177,8 @@ _patch_desc_scheduler_base() {
   PATCH_CDN_SUBDIR="sched"
   PATCH_BRANCH="$(bore_branch_from_version "$VERSION")"
   PATCH_SKIP_REASON=""
+  PATCH_SHA256_MAIN=""
+  PATCH_SHA256_FALLBACK=""
   case "$kind" in
     pds)
       PATCH_DESC="PRJC/PDS scheduler (Piotr Gorski)"
@@ -2359,8 +2361,8 @@ apply_patch_plugin() {
 
   patch_file="$KERNEL_BUILD_ROOT/${PATCH_CACHE_NAME}-${PATCH_BRANCH}.patch"
 
-  PATCH_SHA256_MAIN="${CIZEN_PATCH_SHA256_MAIN:-$PATCH_SHA256_MAIN}"
-  PATCH_SHA256_FALLBACK="${CIZEN_PATCH_SHA256_FALLBACK:-$PATCH_SHA256_FALLBACK}"
+  PATCH_SHA256_MAIN="${CIZEN_PATCH_SHA256_MAIN:-${PATCH_SHA256_MAIN:-}}"
+  PATCH_SHA256_FALLBACK="${CIZEN_PATCH_SHA256_FALLBACK:-${PATCH_SHA256_FALLBACK:-}}"
   PATCH_SHA256_VERIFY="${CIZEN_PATCH_SHA256_VERIFY:-1}"
   # Imprime el motivo si $1 difiere del pin $2 (vacío si pin válido/desactivado).
   verify_patch_sha() {

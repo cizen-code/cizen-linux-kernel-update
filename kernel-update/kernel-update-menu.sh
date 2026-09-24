@@ -127,9 +127,21 @@ while true; do
     12) exec "$SCRIPT" --changelog ;;
     13) exec "$SCRIPT" --hardened ;;
     14)
-       printf '\n  %bScheduler%b [Enter=EEVDF]: ' "$W" "$N"
+       printf '\n  %bScheduler%b (Enter usa el default; los valores de tercera parte avisan si no aplican a la rama):\n' "$W" "$N"
+       printf '    %binherit%b mantener el del perfil/último build (default → EEVDF salvo perfil)\n' "$W" "$N"
+       printf '    %beevdf%b   scheduler vanilla de mainline\n' "$W" "$N"
+       printf '    %bbore%b    BORE (el que usa este sistema; burst + interactividad)\n' "$W" "$N"
+       printf '    %bpds%b     Project C (PDS) · tercero\n' "$W" "$N"
+       printf '    %bbmq%b     BMQ · tercero\n' "$W" "$N"
+       printf '    %blfbmq%b   LF-BMQ · tercero\n' "$W" "$N"
+       printf '    %bmuqss%b   MuQSS · tercero\n' "$W" "$N"
+       printf '  %bScheduler%b [Enter=%blinherit%b]: ' "$W" "$N" "$Y" "$N"
        read -r sched
-       printf '  %bCC%b [Enter=gcc]: ' "$W" "$N"
+       printf '\n  %bCC%b (Enter usa el default):\n' "$W" "$N"
+       printf '    %bauto%b  elige según el sistema (clang si LTO/toolchain LLVM viable; si no gcc) (default)\n' "$W" "$N"
+       printf '    %bgcc%b   compilador GCC\n' "$W" "$N"
+       printf '    %bclang%b Clang/LLVM (necesario para el LTO)\n' "$W" "$N"
+       printf '  %bCC%b [Enter=%blauto%b]: ' "$W" "$N" "$Y" "$N"
        read -r cc
        args="--absorb-rebels"
        [ -n "$sched" ] && args="$args --sched $sched"

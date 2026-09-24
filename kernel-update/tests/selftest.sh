@@ -58,6 +58,8 @@ download_file_good() {
   case "$url" in
     *"/sched/0001-bore-cachy.patch") LAST_SERVED="cachy";    cp -- "$ROOT/patch-cachy.patch" "$out" 2>/dev/null; return 0 ;;
     *"/sched/0001-bore.patch")       LAST_SERVED="upstream"; cp -- "$ROOT/patch-cachy.patch" "$out" 2>/dev/null; return 0 ;;
+    *"/sched/0001-prjc-cachy.patch") LAST_SERVED="cachy";    cp -- "$ROOT/patch-bmq.patch" "$out" 2>/dev/null; return 0 ;;
+    *"/sched/0001-prjc.patch")       LAST_SERVED="upstream"; cp -- "$ROOT/patch-bmq.patch" "$out" 2>/dev/null; return 0 ;;
     *"/misc/0001-acpi-call.patch")     LAST_SERVED="upstream"; cp -- "$ROOT/patch-misc.patch" "$out" 2>/dev/null; return 0 ;;
     *"/misc/acpi-call.patch")          LAST_SERVED="upstream"; cp -- "$ROOT/patch-misc.patch" "$out" 2>/dev/null; return 0 ;;
     *"/misc/0001-rt-i915.patch")       LAST_SERVED="upstream"; cp -- "$ROOT/patch-misc.patch" "$out" 2>/dev/null; return 0 ;;
@@ -212,6 +214,8 @@ else
   rec ok "devuelve 1 (degrade a vanilla)"
   [ "$BORE_ENABLED" = false ] && rec ok "BORE_ENABLED se mantiene false" || rec fail "BORE_ENABLED no debe activarse"
 fi
+# restaurar el stub bueno (el de arriba solo valía para el test anterior)
+download_file() { download_file_good "$@"; }
 
 printf '%s\n' "== apply_patch_plugin: nombre desconocido =="
 PATCHES_APPLIED=(); BORE_ENABLED=false
@@ -255,6 +259,23 @@ case " ${PATCH_SYMBOLS[*]:-} " in
   *SCHED_MUQSS*) rec ok "MuQSS: símbolo SCHED_MUQSS" ;;
   *) rec fail "MuQSS símbolos: [${PATCH_SYMBOLS[*]:-}]" ;;
 esac
+
+printf '%s\n' "== apply_patch_plugin: plugins sin pin SHA256 (bmq) no crashean (set -u) =="
+rm -rf "$SRC/kernel/sched"; mkdir -p "$SRC"
+PATCHES_APPLIED=(); PATCH_ENABLE_ALL=(); PATCH_REBEL_ALL=(); PATCH_DISABLE_ALL=(); BORE_ENABLED=false
+unset CIZEN_PATCH_SHA256_MAIN CIZEN_PATCH_SHA256_FALLBACK
+printf 'config SCHED_BMQ\n--- a/init/Kconfig\n+++ b/init/Kconfig\n' > "$ROOT/patch-bmq.patch"
+: > "$ROOT/dl.log"
+if apply_patch_plugin bmq; then
+  rec ok "bmq (sin pin en el descriptor): flujo completo aplica sin 'unbound variable'"
+else
+  rec fail "bmq (sin pin): crasheó o degradó (regresión fix 2026-09-24)"
+fi
+case " ${PATCH_ENABLE_ALL[*]:-} " in
+  *SCHED_BMQ*) rec ok "bmq registra SCHED_BMQ en ENABLE" ;;
+  *) rec fail "bmq ENABLE: [${PATCH_ENABLE_ALL[*]:-}]" ;;
+esac
+rm -f -- "$ROOT/patch-bmq.patch"
 
 printf '%s\n' "== patch_desc: skip por versión (ntsync / fsync) =="
 VERSION_SAVE="$VERSION"
