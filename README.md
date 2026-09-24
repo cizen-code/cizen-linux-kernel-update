@@ -15,10 +15,13 @@ el borrador del siguiente release y bumpea banner + `SCRIPT_VERSION`.
 ```
 ├── CHANGELOG.md                  # Historial de versiones (v27.26.0+)
 ├── kernel-update/                 # Flujo de compilación del kernel Cizen
-│   ├── kernel-update.sh           # Motor principal (descarga→Kconfig→build→pacman→UKI)
+│   ├── kernel-update.sh           # Motor principal (descarga→Kconfig→build→paquete→UKI)
+│   ├── kernel-update-manager.sh   # Gestor de kernels instalados (list/flip/remove/backup)
+│   ├── kernel-update-rollback.sh  # Rollback al kernel previo archivado
+│   ├── cizen-uki-sync             # Sincroniza/firma el UKI (systemd-boot + sbctl)
 │   ├── podar-modulos.sh           # Poda de módulos del paquete (+ --keep-list para --lite)
 │   ├── kernel-update-notify.sh    # Notificador de releases nuevas de kernel.org
-│   ├── kernel-update-menu.sh      # Menú interactivo de modos (check/build/fast)
+│   ├── kernel-update-menu.sh      # Menú interactivo de modos (check/build/fast/…)
 │   └── profiles/                  # Perfiles + config base (linux-*-cizen-v3.config)
 ├── arch-update-checker/           # Suite de actualización de Arch Linux
 │   ├── arch-update-checker.sh     # Comprueba repos/AUR/flatpak/noticias
@@ -43,10 +46,14 @@ Cada suite vive en su propio subdirectorio de `/usr/local/bin/` (no mezclada
 con otras herramientas):
 
 ```
-/usr/local/bin/kernel-update/          # kernel-update.sh + podar-modulos.sh + notify + menu + profiles/
+/usr/local/bin/kernel-update/          # motor + manager + rollback + cizen-uki-sync + podar + notify + menu + profiles/
 /usr/local/bin/arch-update/            # los 5 scripts de la suite Arch
 /usr/local/bin/arch-open-terminal.sh   # helper compartido por ambas suites (plano)
 ```
+
+> Desde v27.30.0 la suite instala también `kernel-update-manager.sh`
+> (list/info/flip/backup/remove de kernels instalados), `kernel-update-rollback.sh`
+> y `cizen-uki-sync` (sincronización y firma del UKI para systemd-boot + sbctl).
 
 > `podar-modulos.sh` debe instalarse ejecutable junto al resto de la suite
 > (se copia igual que `kernel-update.sh`); si falta o no es ejecutable, el
@@ -82,6 +89,23 @@ con otras herramientas):
 | no-sign | `kernel-update.sh <ver> --no-sign` | No firmar la UKI (no usar con Secure Boot activo) |
 | changelog | `kernel-update.sh --changelog` | Bumpea banner + `SCRIPT_VERSION` y añade el borrador del siguiente release a `CHANGELOG.md` |
 | hardened | `kernel-update.sh --hardened` | Auditoría de endurecimiento del kernel EN EJECUCIÓN (símbolos de /proc/config.gz + knobs sysctl vivos); sin efectos laterales |
+| sched | `kernel-update.sh --sched pds` | Compila con el scheduler elegido: `eevdf`, `bore`, `pds`, `bmq`, `lfbmq`, `muqss` (los de parche descargan PRJC/CachyOS con fallback upstream). También interactivo al confirmar build/check (variante Vanilla/BORE/PDS/BMQ/LFBMQ/MuQSS) |
+| cc | `kernel-update.sh --cc clang` | Toolchain LLVM/Clang (`clang`+`lld`, requiere ambos); `gcc` o `auto` |
+| lto | `kernel-update.sh --lto-thin` | LTO thin/full con clang (`--no-lto` fuerza GCC) |
+| o3 | `kernel-update.sh --o3` | `-O3` (Kbuild) + `CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE` |
+| native | `kernel-update.sh --native` | `-march=native`; `--march=<env>` para un valor explícito (`.config` siempre envejece: se re-aplica en cada build) |
+| timer-freq | `kernel-update.sh --timer-freq 1000` | `CONFIG_HZ` |
+| ntsync | `kernel-update.sh --ntsync` | Fuerza `CONFIG_NTSYNC` (nativo ≥6.10; backport CachyOS <6.10) |
+| fsync | `kernel-update.sh --fsync` | fsync legacy (futex_waitv), solo <6.14 (excluyente con ntsync) |
+| cachy | `kernel-update.sh --cachy` | Parches misc CachyOS (`CIZEN_CACHY_PATCH_SET`, p. ej. nap-governor reflex-governor); fail-soft |
+| user-patches | `CIZEN_USER_PATCHES_DIR=/dir kernel-update.sh` | Aplica `.patch/.diff` propios en orden alfabético (fallo = aborto) |
+| frag-dir | `kernel-update.sh --frag-dir /dir` | Frags de config `.frag` (con `#include`) aplicados tras el perfil |
+| modprobed-db | `kernel-update.sh --modprobed-db` | Alimenta el build `--lite` desde la bbdd de modprobed-db (auto-descubierta) |
+| pkg-backend | `kernel-update.sh --pkg-backend deb` | Empaquetado: `arch` (pacman-pkg, default), `deb`, `rpm`, `generic`/`gentoo` (modules_install + vmlinuz directo) |
+| module-sign | `kernel-update.sh --module-sign` | Firma persistente de módulos con MOK propia (`sign-file`, claves en `/etc/cizen/kernel-sign/`) |
+| uki-backup | `kernel-update.sh --uki-backup` | Respalda el UKI previo antes de sobrescribirlo (`CIZEN_UKI_BACKUP_DIR`) |
+| luks-audit | `kernel-update.sh --luks-audit` | Avisa si la raíz LUKS no tiene parámetros de desbloqueo en el cmdline antes de regenerar el UKI |
+| manager | `kernel-update-manager.sh list` | Gestor de kernels instalados: `list`, `info`, `flip`, `backup`, `remove`, `guide` |
 
 ### Prioridad de compilación y cgroups
 

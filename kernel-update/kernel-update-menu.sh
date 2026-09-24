@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # ============================================================
 # kernel-update-menu.sh — Menú interactivo para kernel-update.sh
-# Validación, compilación, BORE, consulta y mantenimiento del motor.
+# Validación, compilación (vanilla/BORE/PDS/BMQ/LFBMQ/MuQSS, Clang/LTO,
+# NTSync, parches misc CachyOS), consulta y mantenimiento del motor.
 #
 # Uso: ./kernel-update-menu.sh [remote]
 #   remote = versión estable a mostrar (p. ej. la que pasa
 #            kernel-update-notify.sh). Sin argumento y con terminal
 #            interactiva, el menú consulta kernel.org (máx. 6 s) y
 #            muestra la stable; sin conexión indica la opción 6.
-# Opciones: 1-5 validación/build (check/checkfast/build/buildfast/force),
-# 6 check-update, 7/8 BORE (--patch bore), 9 rollback, 10 kcfg,
-# 11 selftest, 12 changelog, 0 salir.
+# Opciones: 1-4 validación/build, 5 force, 6 check-update, 7/8 BORE,
+# 14 buildvariant (scheduler/tuning), 15 ntsync, 16 cachy, 17 manager,
+# 9 rollback, 10 kcfg, 11 selftest, 12 changelog, 13 hardened, 0 salir.
 # ============================================================
 set -uo pipefail
 
@@ -93,12 +94,16 @@ opt 4 "buildfast"   "compilar + instalar · alta"
 opt 5 "force"       "recompilar con (--force)"
 opt 7 "buildbore"   "compilar con BORE · baja"
 opt 8 "buildborefast" "compilar con BORE · alta"
+opt 14 "variant"    "scheduler/tuning (interactivo)"
+opt 15 "ntsync"     "compilar con NTSync"
+opt 16 "cachy"      "compilar con misc CachyOS"
 rule
 echo "  ${W}Mantenimiento${N}"
 opt 10 "kcfg"       "editar config con menuconfig"
 opt 11 "selftest"   "autoevaluación del motor"
 opt 12 "changelog"  "bump + borrador → CHANGELOG.md"
 opt 13 "hardened"   "auditoría hardening del kernel en ejecución"
+opt 17 "manager"    "gestor de kernels instalados"
 rule
 echo "  ${W}Consulta y sistema${N}"
 opt 6 "check-update" "última stable de kernel.org"
@@ -106,7 +111,7 @@ opt 9 "rollback"    "restaurar kernel previo"
 rule
 
 while true; do
-  read -r -p "${W}  [0-13] > ${N}" choice
+  read -r -p "${W}  [0-17] > ${N}" choice
   case "$choice" in
     1) exec "$SCRIPT" --absorb-rebels --check ;;
     2) CIZEN_BUILD_PRIORITY=normal exec "$SCRIPT" --absorb-rebels --check ;;
@@ -121,6 +126,19 @@ while true; do
     11) exec "$SCRIPT" --selftest ;;
     12) exec "$SCRIPT" --changelog ;;
     13) exec "$SCRIPT" --hardened ;;
+    14)
+       printf '\n  %bScheduler%b [Enter=EEVDF]: ' "$W" "$N"
+       read -r sched
+       printf '  %bCC%b [Enter=gcc]: ' "$W" "$N"
+       read -r cc
+       args="--absorb-rebels"
+       [ -n "$sched" ] && args="$args --sched $sched"
+       [ -n "$cc" ] && args="$args --cc $cc"
+       # shellcheck disable=SC2086
+       exec "$SCRIPT" $args ;;
+    15) exec "$SCRIPT" --absorb-rebels --ntsync ;;
+    16) exec "$SCRIPT" --absorb-rebels --cachy ;;
+    17) exec /usr/local/bin/kernel-update/kernel-update-manager.sh ;;
     0) echo "  Saliendo."; exit 0 ;;
     *) printf '  %bOpción no válida: %s%b\n' "$R" "$choice" "$N" ;;
   esac

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.29.3 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.30.0 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / XFS / systemd / KVM-libvirt / QEMU-OVMF
 #
@@ -126,7 +126,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.29.3"
+SCRIPT_VERSION="27.30.0"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -214,6 +214,9 @@ declare -a PATCHES_APPLIED=()
 # Símbolos Kconfig que aportan los parches aplicados y BTF: entran en ENABLE y
 # se reconocen como rebeldes esperados (no ensucian la auditoría ni --strict).
 declare -a PATCH_ENABLE_ALL=() PATCH_REBEL_ALL=()
+# Símbolos que un parche obliga a DESACTIVAR para fijar una "choice" Kconfig
+# (p. ej. elegir SCHED_PDS exige CONFIG_SCHED_BMQ=n). Selectores de scheduler.
+declare -a PATCH_DISABLE_ALL=()
 declare -A PATCH_KCONFIG_FILTER=()   # símbolos nuevos esperados de parches/BTF
 # BTF por defecto activo (el perfil lo trae =y): systemd/bpf-restrict-fs lo
 # necesita. Se desactiva con --no-btf / CIZEN_NO_BTF=1.
@@ -317,6 +320,58 @@ else
     BUILD_PRIORITY_WRAP+=(ionice -c 3)
   fi
 fi
+
+# ============================================================
+# PERFIL DE COMPILACIÓN EXTENDIDO  —  v27.30.0
+# Compilador, optimización, scheduler, frags, modprobed-db, empaquetado y
+# firma de módulos. Los defaults NO son invasivos ("inherit"/0/auto): no
+# tocan el perfil cizen salvo que el usuario lo pida explícitamente.
+# ============================================================
+# Compilador: auto (clang si está, si no gcc) | gcc | clang. --clang == clang.
+CIZEN_CC="${CIZEN_CC:-auto}"
+# LTO únicamente con clang: 0=off (default), 1|thin=CONFIG_LTO_CLANG_THIN,
+# full=CONFIG_LTO_CLANG_FULL.
+CIZEN_LLVM_LTO="${CIZEN_LLVM_LTO:-0}"
+# Nivel de optimización de los archivos C: inherit (respetar perfil) | 2 | 3.
+# Se materializa en el par de CONFIG CC_OPTIMIZE_FOR_PERFORMANCE/O3 (choice).
+CIZEN_CFLAGS_OLEVEL="${CIZEN_CFLAGS_OLEVEL:-inherit}"
+# Arquitectura objetivo: inherit (sin -march extra) | generic | native | <march>.
+# Se añade a KCFLAGS (afecta a los .c del kernel; -march=x86-64 en generic).
+CIZEN_CPU_OPT="${CIZEN_CPU_OPT:-inherit}"
+# Frecuencia del timer (override de CONFIG_HZ del perfil): inherit | 100|250|300|500|1000.
+CIZEN_TIMER_FREQ="${CIZEN_TIMER_FREQ:-inherit}"
+# Scheduler de compilación: inherit | eevdf (vanilla) | bore | pds | bmq | lfbmq | muqss.
+CIZEN_SCHED="${CIZEN_SCHED:-inherit}"
+# Sincronización Wine (ntsync/fsync): ntsync en mainline >= 6.10 como CONFIG
+# NTSYNC; para < 6.10 se intenta el parche de CachyOS (--patch ntsync). fsync
+# legacy (serie futex_waitv) solo tiene sentido < 6.14 y es excluyente con
+# ntsync; por defecto 0.
+CIZEN_PATCH_NTSYNC="${CIZEN_PATCH_NTSYNC:-auto}"
+CIZEN_PATCH_FSYNC="${CIZEN_PATCH_FSYNC:-0}"
+# Pack misc de CachyOS (best-effort, cada parche fail-soft). Set editable vía
+# CIZEN_CACHY_PATCH_SET (nombres separados por espacio entre los soportados).
+CIZEN_CACHY_PATCHES="${CIZEN_CACHY_PATCHES:-0}"
+CIZEN_CACHY_PATCH_SET="${CIZEN_CACHY_PATCH_SET:-nap-governor reflex-governor}"
+# Parches propios del usuario: directorio con .patch/.diff que se aplican tras
+# los de terceros. Un fallo aquí es fatal (responsabilidad del usuario).
+CIZEN_USER_PATCHES_DIR="${CIZEN_USER_PATCHES_DIR:-}"
+# Frags de configuración reutilizables (.frag). Default: $CONFIG_DIR/frags.
+CIZEN_FRAGS_DIR="${CIZEN_FRAGS_DIR:-$CONFIG_DIR/frags}"
+# Modprobed-db: 0=off (default), 1=auto-descubrimiento, o ruta a la bbdd.
+# Alimenta make localmodconfig con el historial persistente de módulos.
+CIZEN_MODPROBED_DB="${CIZEN_MODPROBED_DB:-0}"
+# Empaquetado multi-backend (v27.30.0): arch (default) | deb | rpm | generic | gentoo.
+CIZEN_PKG_BACKEND="${CIZEN_PKG_BACKEND:-arch}"
+# Firma persistente de módulos estilo MOK: no (default) | yes. Las claves viven
+# en CIZEN_MODULE_SIGN_DIR (enrollment del MOK documentado en README).
+CIZEN_MODULE_SIGN="${CIZEN_MODULE_SIGN:-no}"
+CIZEN_MODULE_SIGN_DIR="${CIZEN_MODULE_SIGN_DIR:-/etc/cizen/kernel-sign}"
+# Backup del UKI anterior en cada sincronización: 1 (default) | 0.
+CIZEN_UKI_BACKUP="${CIZEN_UKI_BACKUP:-1}"
+CIZEN_UKI_BACKUP_DIR="${CIZEN_UKI_BACKUP_DIR:-/var/lib/kernel-update/uki-backups}"
+# Auditoría LUKS/FDE en cada build (integración; avisa si el root cifrado
+# carece del parámetro cryptdevice/rd.luks). No cifra nada en el arranque.
+CIZEN_LUKS_AUDIT="${CIZEN_LUKS_AUDIT:-0}"
 
 # Guarda OOM pre-build: aborta pronto y con mensaje claro si no hay memoria
 # suficiente (el enlace con BTF es el punto más hambriento, ver historial de
@@ -495,6 +550,79 @@ while [ $# -gt 0 ]; do
       DO_RENAME=true
       RENAME_PAIR="${1#--rename=}"
       shift ;;
+    --cc)
+      CIZEN_CC="${2:-}"; [ -n "$CIZEN_CC" ] || { err "--cc requiere gcc|clang|auto"; exit 1; }
+      shift 2 ;;
+    --cc=*)
+      CIZEN_CC="${1#--cc=}"; shift ;;
+    --lto-thin)
+      CIZEN_LLVM_LTO=thin; shift ;;
+    --lto-full)
+      CIZEN_LLVM_LTO=full; shift ;;
+    --no-lto)
+      CIZEN_LLVM_LTO=0; shift ;;
+    --o3)
+      CIZEN_CFLAGS_OLEVEL=3; shift ;;
+    --o2)
+      CIZEN_CFLAGS_OLEVEL=2; shift ;;
+    --native)
+      CIZEN_CPU_OPT=native; shift ;;
+    --march)
+      CIZEN_CPU_OPT="${2:-}"; [ -n "$CIZEN_CPU_OPT" ] || { err "--march requiere un valor (p. ej. native, znver4, skylake, x86-64-v3)"; exit 1; }
+      shift 2 ;;
+    --march=*)
+      CIZEN_CPU_OPT="${1#--march=}"; shift ;;
+    --timer-freq)
+      CIZEN_TIMER_FREQ="${2:-}"; [ -n "$CIZEN_TIMER_FREQ" ] || { err "--timer-freq requiere 100|250|300|500|1000"; exit 1; }
+      shift 2 ;;
+    --timer-freq=*)
+      CIZEN_TIMER_FREQ="${1#--timer-freq=}"; shift ;;
+    --sched)
+      CIZEN_SCHED="${2:-}"; [ -n "$CIZEN_SCHED" ] || { err "--sched requiere un scheduler (eevdf, bore, pds, bmq, lfbmq, muqss)"; exit 1; }
+      shift 2 ;;
+    --sched=*)
+      CIZEN_SCHED="${1#--sched=}"; shift ;;
+    --ntsync)
+      CIZEN_PATCH_NTSYNC=1; shift ;;
+    --no-ntsync)
+      CIZEN_PATCH_NTSYNC=0; shift ;;
+    --fsync)
+      CIZEN_PATCH_FSYNC=1; shift ;;
+    --no-fsync)
+      CIZEN_PATCH_FSYNC=0; shift ;;
+    --cachy)
+      CIZEN_CACHY_PATCHES=1; shift ;;
+    --no-cachy)
+      CIZEN_CACHY_PATCHES=0; shift ;;
+    --frag-dir)
+      CIZEN_FRAGS_DIR="${2:-}"; [ -n "$CIZEN_FRAGS_DIR" ] || { err "--frag-dir requiere una ruta"; exit 1; }
+      shift 2 ;;
+    --frag-dir=*)
+      CIZEN_FRAGS_DIR="${1#--frag-dir=}"; shift ;;
+    --modprobed-db)
+      CIZEN_MODPROBED_DB=1; shift ;;
+    --no-modprobed-db)
+      CIZEN_MODPROBED_DB=0; shift ;;
+    --pkg-backend)
+      CIZEN_PKG_BACKEND="${2:-}"; [ -n "$CIZEN_PKG_BACKEND" ] || { err "--pkg-backend requiere arch|deb|rpm|generic|gentoo"; exit 1; }
+      shift 2 ;;
+    --pkg-backend=*)
+      CIZEN_PKG_BACKEND="${1#--pkg-backend=}"; shift ;;
+    --user-patches)
+      CIZEN_USER_PATCHES_DIR="${2:-}"; [ -n "$CIZEN_USER_PATCHES_DIR" ] || { err "--user-patches requiere una ruta"; exit 1; }
+      shift 2 ;;
+    --user-patches=*)
+      CIZEN_USER_PATCHES_DIR="${1#--user-patches=}"; shift ;;
+    --module-sign)
+      CIZEN_MODULE_SIGN=yes; shift ;;
+    --no-module-sign)
+      CIZEN_MODULE_SIGN=no; shift ;;
+    --uki-backup)
+      CIZEN_UKI_BACKUP=1; shift ;;
+    --no-uki-backup)
+      CIZEN_UKI_BACKUP=0; shift ;;
+    --luks-audit)
+      CIZEN_LUKS_AUDIT=1; shift ;;
     --*)
       err "Opción desconocida: $1"
       exit 1 ;;
@@ -523,6 +651,66 @@ fi
 [ "${CIZEN_BTF:-0}" = "1" ] && BTF_REQUESTED=true
 [ "${CIZEN_NO_BTF:-0}" = "1" ] && BTF_REQUESTED=false
 [ "${CIZEN_CLANG:-0}" = "1" ] && CLANG_REQUESTED=true
+
+# ── Perfil de compilación extendido: validación de valores por env ──
+case "$CIZEN_CC" in auto|gcc|clang) ;; *) fatal "CIZEN_CC inválido: $CIZEN_CC (use auto, gcc o clang)." ;; esac
+case "$CIZEN_LLVM_LTO" in 0|1|thin|full) ;; *) fatal "CIZEN_LLVM_LTO inválido: $CIZEN_LLVM_LTO (use 0, 1, thin o full)." ;; esac
+# LTO solo es viable con clang+lld presentes de verdad: se decide AHORA, antes de
+# la fase de config, para no inyectar CONFIG_LTO_CLANG_* en un build que luego
+# degrade a gcc (olddefconfig los descartaría y la validación ENABLE fallaría).
+if [ "$CIZEN_LLVM_LTO" != "0" ]; then
+  if [ "$CIZEN_CC" = "gcc" ] && ! command -v clang >/dev/null 2>&1; then
+    warn "LTO (${CIZEN_LLVM_LTO}) exige clang; CIZEN_CC=gcc → se ignora el LTO."
+    CIZEN_LLVM_LTO=0
+  elif ! command -v clang >/dev/null 2>&1 || ! command -v ld.lld >/dev/null 2>&1; then
+    warn "LTO (${CIZEN_LLVM_LTO}) sin clang/lld instalados; se ignora el LTO (sudo pacman -S clang lld)."
+    CIZEN_LLVM_LTO=0
+  else
+    [ "$CIZEN_CC" = "auto" ] && CIZEN_CC=clang
+    CLANG_REQUESTED=true
+  fi
+fi
+case "$CIZEN_CFLAGS_OLEVEL" in inherit|2|3) ;; *) fatal "CIZEN_CFLAGS_OLEVEL inválido: $CIZEN_CFLAGS_OLEVEL (use inherit, 2 o 3)." ;; esac
+case "$CIZEN_CPU_OPT" in
+  inherit|generic|native) ;;
+  *) case "$CIZEN_CPU_OPT" in
+       -*|*[[:space:]]*|*/*) fatal "CIZEN_CPU_OPT inválido: $CIZEN_CPU_OPT" ;;
+     esac ;;
+esac
+case "$CIZEN_TIMER_FREQ" in inherit|100|250|300|500|1000) ;; *) fatal "CIZEN_TIMER_FREQ inválido: $CIZEN_TIMER_FREQ (use inherit, 100, 250, 300, 500 o 1000)." ;; esac
+case "$CIZEN_PATCH_NTSYNC" in auto|0|1) ;; *) fatal "CIZEN_PATCH_NTSYNC inválido: $CIZEN_PATCH_NTSYNC (auto, 0 o 1)." ;; esac
+case "$CIZEN_PATCH_FSYNC" in 0|1) ;; *) fatal "CIZEN_PATCH_FSYNC inválido: $CIZEN_PATCH_FSYNC (0 o 1)." ;; esac
+case "$CIZEN_CACHY_PATCHES" in 0|1) ;; *) fatal "CIZEN_CACHY_PATCHES inválido: $CIZEN_CACHY_PATCHES (0 o 1)." ;; esac
+case "$CIZEN_MODPROBED_DB" in
+  0|1) ;;
+  *) [ -s "$CIZEN_MODPROBED_DB" ] || fatal "CIZEN_MODPROBED_DB debe ser 0, 1 o una ruta a una base de datos existente: $CIZEN_MODPROBED_DB" ;;
+esac
+case "$CIZEN_PKG_BACKEND" in arch|deb|rpm|generic|gentoo) ;;
+  *) fatal "CIZEN_PKG_BACKEND inválido: $CIZEN_PKG_BACKEND (use arch, deb, rpm, generic o gentoo)." ;;
+esac
+case "$CIZEN_MODULE_SIGN" in yes|no) ;; *) fatal "CIZEN_MODULE_SIGN inválido: $CIZEN_MODULE_SIGN (use yes o no)." ;; esac
+if [ -n "$CIZEN_USER_PATCHES_DIR" ] && [ ! -d "$CIZEN_USER_PATCHES_DIR" ]; then
+  fatal "CIZEN_USER_PATCHES_DIR no existe o no es un directorio: $CIZEN_USER_PATCHES_DIR"
+fi
+# Compilador explícito por env sobre la auto-detección.
+[ "$CIZEN_CC" = "clang" ] && CLANG_REQUESTED=true
+[ "$CIZEN_CC" = "gcc" ] && CLANG_REQUESTED=false
+# CIZEN_SCHED como alias de --patch (evita que dedupe lo pierda).
+case "$CIZEN_SCHED" in
+  inherit|eevdf) ;;
+  bore|pds|bmq|lfbmq|muqss) PATCH_NAMES+=("$CIZEN_SCHED") ;;
+  *) fatal "CIZEN_SCHED inválido: $CIZEN_SCHED (use inherit, eevdf, bore, pds, bmq, lfbmq o muqss)." ;;
+esac
+# ntsync para kernels SIN soporte nativo (< 6.10): se pide el parche CachyOS.
+# (con $VERSION aún vacío en kcheck --check-update este atajo no se dispara y
+# el usuario puede pedir --patch ntsync a mano).
+if [ "$CIZEN_PATCH_NTSYNC" != "0" ] && [ -n "${VERSION:-}" ] && ! kernel_version_ge "$VERSION" "6.10"; then
+  case " ${PATCH_NAMES[*]:-} " in
+    *" ntsync "*) ;;
+    *) PATCH_NAMES+=(ntsync) ;;
+  esac
+fi
+
 case "$PRUNE_MODULES" in
   0|1) ;;
   *) fatal "CIZEN_PRUNE_MODULES inválido: $PRUNE_MODULES (use 0 o 1)." ;;
@@ -1084,6 +1272,13 @@ build_effective_arrays() {
     PATCH_KCONFIG_FILTER[$__ps]=1
   done
   unset __ps
+  # Símbolos que un parche desactiva para fijar una choice (SCHED_BMQ, etc.).
+  for __ps in "${PATCH_DISABLE_ALL[@]:-}"; do
+    [ -n "$__ps" ] || continue
+    add_unique disable "$__ps"
+    EXPECTED_REBEL_SET["$__ps"]=1
+  done
+  unset __ps
 
   # BTF (obligatorio por defecto): DEBUG_INFO + DEBUG_INFO_BTF =y, marcados como
   # esperados. El perfil base lo trae =y y systemd/bpf-restrict-fs lo necesita.
@@ -1154,6 +1349,9 @@ declare -A TOOL_PKG=(
   [tar]=tar           [timeout]=coreutils  [tr]=coreutils
   [umount]=util-linux [wget]=wget          [xargs]=findutils
   [xz]=xz
+  [clang]=clang          [lld]=lld          [llvm-ar]=llvm
+  [mokutil]=mokutil      [openssl]=openssl  [dpkg]=dpkg
+  [objcopy]=binutils     [readelf]=binutils
 )
 
 # Prompt sí/no interactivo siguiendo el patrón del script (leer de /dev/tty;
@@ -1959,6 +2157,124 @@ patch_desc_bore() {
   PATCH_SYMBOLS=(SCHED_BORE MIN_BASE_SLICE_NS)
   PATCH_MAGIC="config SCHED_BORE"
   PATCH_MARKERS=( "kernel/sched/bore.c:" "kernel/sched/fair.c:SCHED_BORE|burst" )
+  PATCH_SKIP_REASON=""
+}
+
+# Descriptores de los demás schedulers (v27.30.0). Todos comparten la misma
+# cadena CachyOS/kernel-patches; cambia el fichero y los símbolos Kconfig.
+# El parche define una "choice" (SCHED_ALT + SCHED_PDS/SCHED_BMQ/SCHED_LFBMQ,
+# o SCHED_MUQSS en muqss): para elegir una rama hay que desactivar la elegida
+# por defecto, por eso PATCH_CHOICE_DISABLE (via PATCH_DISABLE_ALL).
+_patch_desc_scheduler_base() {
+  local kind="$1"
+  PATCH_URL_PREFIX="https://raw.githubusercontent.com/CachyOS/kernel-patches/master"
+  PATCH_CDN_SUBDIR="sched"
+  PATCH_BRANCH="$(bore_branch_from_version "$VERSION")"
+  PATCH_SKIP_REASON=""
+  case "$kind" in
+    pds)
+      PATCH_DESC="PRJC/PDS scheduler (Piotr Gorski)"
+      PATCH_DISP_NAME="PDS"
+      PATCH_MAIN_FILE="0001-prjc-cachy.patch"
+      PATCH_FALLBACK_FILE="0001-prjc.patch"
+      PATCH_CACHE_NAME="prjc-pds"
+      PATCH_SYMBOLS=(SCHED_ALT SCHED_PDS)
+      PATCH_CHOICE_DISABLE=(SCHED_BMQ)
+      PATCH_MAGIC="config SCHED_PDS"
+      PATCH_MARKERS=( "kernel/sched/alt_core.c:" "kernel/sched/pds.h:" "kernel/sched/sched.h:SCHED_PDS" )
+      ;;
+    bmq)
+      PATCH_DESC="PRJC/BMQ scheduler (Piotr Gorski)"
+      PATCH_DISP_NAME="BMQ"
+      PATCH_MAIN_FILE="0001-prjc-cachy.patch"
+      PATCH_FALLBACK_FILE="0001-prjc.patch"
+      PATCH_CACHE_NAME="prjc-bmq"
+      PATCH_SYMBOLS=(SCHED_ALT SCHED_BMQ)
+      PATCH_CHOICE_DISABLE=(SCHED_PDS)
+      PATCH_MAGIC="config SCHED_BMQ"
+      PATCH_MARKERS=( "kernel/sched/alt_core.c:" "kernel/sched/bmq.h:" "kernel/sched/sched.h:SCHED_BMQ" )
+      ;;
+    lfbmq)
+      PATCH_DESC="PRJC/BMQ low-frequency variant (LFBMQ)"
+      PATCH_DISP_NAME="LFBMQ"
+      PATCH_MAIN_FILE="0001-prjc-cachy-lfbmq.patch"
+      PATCH_FALLBACK_FILE="0001-prjc-lfbmq.patch"
+      PATCH_CACHE_NAME="prjc-lfbmq"
+      PATCH_SYMBOLS=(SCHED_ALT SCHED_LFBMQ)
+      PATCH_CHOICE_DISABLE=(SCHED_PDS SCHED_BMQ)
+      PATCH_MAGIC="config SCHED_LFBMQ"
+      PATCH_MARKERS=( "kernel/sched/alt_core.c:" "kernel/sched/sched.h:SCHED_LFBMQ" )
+      ;;
+    muqss)
+      PATCH_DESC="MuQSS scheduler (Steven Rostedt / adaptación CachyOS)"
+      PATCH_DISP_NAME="MUQSS"
+      PATCH_MAIN_FILE="0001-muqss-cachy.patch"
+      PATCH_FALLBACK_FILE="0001-prjc-cachy.patch"
+      PATCH_CACHE_NAME="muqss"
+      PATCH_SYMBOLS=(SCHED_MUQSS)
+      PATCH_CHOICE_DISABLE=(SCHED_ALT)
+      PATCH_MAGIC="config SCHED_MUQSS"
+      PATCH_MARKERS=( "kernel/sched/build_muqss.c:" "include/linux/muqss.h:" )
+      ;;
+  esac
+}
+
+patch_desc_pds()  { PATCH_SKIP_REASON=""; _patch_desc_scheduler_base pds; }
+patch_desc_bmq()  { PATCH_SKIP_REASON=""; _patch_desc_scheduler_base bmq; }
+patch_desc_lfbmq(){ PATCH_SKIP_REASON=""; _patch_desc_scheduler_base lfbmq; }
+patch_desc_muqss(){ PATCH_SKIP_REASON=""; _patch_desc_scheduler_base muqss; }
+
+# ── Wine-sync ────────────────────────────────────────────────
+# NTSync: en mainline desde 6.10 (API completa de usuario en 6.14); para
+# kernels anteriores CachyOS publica el backport en misc/. Por encima de 6.10
+# NO se parchea: el motor fuerza CONFIG_NTSYNC=nativo en inject_build_overlay.
+patch_desc_ntsync() {
+  PATCH_DESC="NTSync (primitivas NT de sincronización para Wine)"
+  PATCH_DISP_NAME="NTSYNC"
+  PATCH_BRANCH="$(bore_branch_from_version "$VERSION")"
+  PATCH_URL_PREFIX="https://raw.githubusercontent.com/CachyOS/kernel-patches/master"
+  PATCH_CDN_SUBDIR="misc"
+  PATCH_MAIN_FILE="0001-ntsync.patch"
+  PATCH_FALLBACK_FILE="0009-ntsync.patch"
+  PATCH_SHA256_MAIN=""
+  PATCH_SHA256_FALLBACK=""
+  PATCH_CACHE_NAME="ntsync"
+  PATCH_SYMBOLS=(NTSYNC)
+  PATCH_CHOICE_DISABLE=()
+  PATCH_MAGIC="ntsync"
+  PATCH_MARKERS=( "drivers/misc/ntsync.c:" )
+  if kernel_version_ge "$VERSION" "6.10"; then
+    PATCH_SKIP_REASON="ntsync ya está en mainline ($VERSION >= 6.10); se fuerza CONFIG_NTSYNC nativo, sin parche."
+    return 0
+  fi
+  PATCH_SKIP_REASON=""
+}
+
+# Fsync: serie legacy FUTEX_WAIT_MULTIPLE (futex_waitv). NUNCA llegó a mainline
+# y su sucesor oficial es ntsync; en 6.14+ el backport deja de mantenerse.
+patch_desc_fsync() {
+  PATCH_DESC="fsync legacy (futex_waitv) para kernels < 6.14"
+  PATCH_DISP_NAME="FSYNC"
+  PATCH_BRANCH="$(bore_branch_from_version "$VERSION")"
+  PATCH_URL_PREFIX="https://raw.githubusercontent.com/Frogging-Family/linux-tkg/master/linux-tkg-patches"
+  PATCH_CDN_SUBDIR=""
+  PATCH_MAIN_FILE="0007-${PATCH_BRANCH}-fsync_legacy_via_futex_waitv.patch"
+  PATCH_FALLBACK_FILE="0007-v6.1-fsync_legacy_via_futex_waitv.patch"
+  PATCH_SHA256_MAIN=""
+  PATCH_SHA256_FALLBACK=""
+  PATCH_CACHE_NAME="fsync"
+  PATCH_SYMBOLS=()
+  PATCH_CHOICE_DISABLE=()
+  PATCH_MAGIC="FUTEX_WAIT_MULTIPLE"
+  PATCH_MARKERS=( "include/uapi/linux/futex.h:FUTEX_WAIT_MULTIPLE" )
+  if kernel_version_ge "$VERSION" "6.14"; then
+    PATCH_SKIP_REASON="fsync legacy no aplica en $VERSION (>= 6.14): usa ntsync (CONFIG_NTSYNC) en su lugar."
+    return 0
+  fi
+  if kernel_version_ge "$VERSION" "6.10"; then
+    warn "fsync y ntsync son excluyentes; ntsync está disponible en $VERSION, se recomienda ntsync."
+  fi
+  PATCH_SKIP_REASON=""
 }
 
 # Comprueba los marcadores de "árbol ya parcheado" del descriptor actual.
@@ -1985,6 +2301,10 @@ apply_patch_register() {
     PATCH_ENABLE_ALL+=("$s")
     PATCH_REBEL_ALL+=("$s")
   done
+  # Elección de variante dentro de la "choice" Kconfig del scheduler.
+  for s in "${PATCH_CHOICE_DISABLE[@]:-}"; do
+    [ -n "$s" ] && PATCH_DISABLE_ALL+=("$s")
+  done
   unset s
   if [ "$p" = "bore" ]; then
     BORE_ENABLED=true
@@ -2003,7 +2323,15 @@ apply_patch_plugin() {
     warn "Parche '$name' desconocido o sin descriptor en el motor; se omite."
     return 1
   fi
-  "patch_desc_$name"
+"patch_desc_$name"
+
+  # Un descriptor puede decidir que el parche NO aplica a esta versión (p. ej.
+  # ntsync en mainline, fsync en 6.14+): declara PATCH_SKIP_REASON y se corta
+  # aquí con aviso, sin tocar el árbol.
+  if [ -n "${PATCH_SKIP_REASON:-}" ]; then
+    warn "${PATCH_SKIP_REASON}"
+    return 1
+  fi
 
   log "Parche ${PATCH_DISP_NAME:-$name} habilitado: descargando para la rama ${PATCH_BRANCH:-?} ..."
 
@@ -2098,6 +2426,92 @@ apply_patch_plugin() {
 
   apply_patch_register "$name"
   ok "${PATCH_DESC:-${PATCH_DISP_NAME:-$name}} aplicado (${PATCH_SYMBOLS[0]:-símbolos nuevos}) sobre fuentes $VERSION."
+  return 0
+}
+
+# ============================================================
+# PARCHES DE USUARIO Y PACK MISC CACHYOS  —  v27.30.0
+# ============================================================
+# apply_user_patches(): aplica cada .patch/.diff de CIZEN_USER_PATCHES_DIR en
+# orden alfabético. Un fallo (no aplica limpio o falla el patch real) es FATAL:
+# el usuario pidió esos parches y la source debe compilar LOS con ellos.
+apply_user_patches() {
+  [ -n "$CIZEN_USER_PATCHES_DIR" ] || return 0
+  [ -d "$CIZEN_USER_PATCHES_DIR" ] || fatal "CIZEN_USER_PATCHES_DIR no existe: $CIZEN_USER_PATCHES_DIR"
+  command -v patch >/dev/null 2>&1 || fatal "No hay 'patch' para aplicar los parches de usuario (sudo pacman -S patch)."
+
+  local -a ups=()
+  local f n=0
+  shopt -s nullglob
+  while IFS= read -r -d '' f; do ups+=("$f"); done \
+    < <(find "$CIZEN_USER_PATCHES_DIR" -maxdepth 1 -type f \( -name '*.patch' -o -name '*.diff' \) -print0 2>/dev/null | sort -z || true)
+  shopt -u nullglob
+  [ "${#ups[@]}" -gt 0 ] || { info "Directorio de parches de usuario vacío: $CIZEN_USER_PATCHES_DIR"; return 0; }
+  info "Aplicando ${#ups[@]} parches de usuario desde $CIZEN_USER_PATCHES_DIR ..."
+  for f in "${ups[@]}"; do
+    if patch -p1 --dry-run -d "$SRC" < "$f" >/dev/null 2>&1; then
+      if patch -p1 -d "$SRC" < "$f" >/dev/null 2>&1; then
+        n=$((n + 1))
+        ok "Parche de usuario aplicado: ${f##*/}"
+      else
+        fatal "Fallo REAL al aplicar el parche de usuario ${f##*/} (el dry-run sí valió; árbol inconsistente)."
+      fi
+    else
+      fatal "El parche de usuario ${f##*/} no aplica limpio sobre $VERSION."
+    fi
+  done
+  [ "$n" -gt 0 ] && ok "Parches de usuario: $n aplicado(s)."
+  return 0
+}
+
+# apply_cachy_misc_single(): intenta descargar y aplicar un parche misc del pack
+# de CachyOS para la rama del kernel objetivo. Cada candidato de nombre se prueba
+# (0001-<item>.patch o <item>.patch según el repo) con download+validación
+# patch --dry-run. Devuelve 0 si aplicó.
+apply_cachy_misc_single() {
+  local br="$1" item="$2" cand tmp url applied=0
+  command -v patch >/dev/null 2>&1 || return 1
+  for cand in "0001-${item}.patch" "${item}.patch"; do
+    tmp="$(mktemp "$KERNEL_BUILD_ROOT/cachy-${item}-${br}.XXXXXX.patch" 2>/dev/null || mktemp)"
+    rm -f -- "$tmp"
+    url="https://raw.githubusercontent.com/CachyOS/kernel-patches/master/${br}/misc/${cand}"
+    if download_file "$url" "$tmp"; then
+      if [ -s "$tmp" ] && grep -Fqi "diff --git" "$tmp" && patch -p1 --dry-run -d "$SRC" < "$tmp" >/dev/null 2>&1; then
+        if patch -p1 -d "$SRC" < "$tmp" >/dev/null 2>&1; then
+          ok "CachyOS misc: $item aplicado (rama $br, $cand)."
+          applied=1
+        fi
+      fi
+    fi
+    rm -f -- "$tmp"
+    [ "$applied" = 1 ] && return 0
+  done
+  return 1
+}
+
+# apply_cachy_misc_patchset(): orquesta el pack misc best-effort. Solo parches
+# razonablemente independientes del árbol CachyOS entran en el default set
+# (governors nap/reflex); el resto (hardened, aufs, nvidia, acpi-call...) queda
+# disponible vía CIZEN_CACHY_PATCH_SET. Cada fallo es un warn, nunca fatal.
+apply_cachy_misc_patchset() {
+  [ "$CIZEN_CACHY_PATCHES" = "1" ] || return 0
+  command -v patch >/dev/null 2>&1 || { warn "pack cachy: sin 'patch' instalado; se omite."; return 0; }
+  local br="$(bore_branch_from_version "$VERSION")" item applied=0 skipped=0
+  info "Pack misc CachyOS (best-effort) para la rama $br: ${CIZEN_CACHY_PATCH_SET:-nap-governor reflex-governor} ..."
+  for item in ${CIZEN_CACHY_PATCH_SET:-nap-governor reflex-governor}; do
+    case "$item" in
+      nap-governor|reflex-governor|acpi-call|clang-polly|hardened|rt-i915)
+        if apply_cachy_misc_single "$br" "$item"; then
+          applied=$((applied + 1))
+        else
+          warn "pack cachy: '$item' no disponible/falla para la rama $br (fail-soft, se omite)."
+          skipped=$((skipped + 1))
+        fi
+        ;;
+      *) warn "pack cachy: entrada desconocida '$item' (se ignora; válidas: nap-governor reflex-governor acpi-call clang-polly hardened rt-i915)." ;;
+    esac
+  done
+  [ "$applied" -gt 0 ] && ok "Pack misc CachyOS: $applied aplicado(s)${skipped:+ (${skipped} omitido(s))}."
   return 0
 }
 
@@ -2238,6 +2652,32 @@ prepare_lite_config() {
       # Solo importa la primera columna (nombre del módulo).
       printf '%s 0 0 0 - 0\n' "$_k"
     done < <("$PRUNER_SCRIPT" --keep-list "${CIZEN_KEEP_MODULES:-}" || true)
+    # v27.30.0: historial persistente de modprobed-db (CIZEN_MODPROBED_DB).
+    # La bbdd es texto plano con un nombre de módulo por línea; se añade al
+    # LSMOD igual que hace linux-tkg (LSMOD=$db), de modo que modules que ya se
+    # cargaron alguna vez se conserven en la build lite aunque el hardware
+    # remoto/hotplug aún no los haya activado hoy.
+    if [ "${CIZEN_MODPROBED_DB}" != "0" ]; then
+      local _dbp="" _moddb
+      if [ "${CIZEN_MODPROBED_DB}" = "1" ]; then
+        for _moddb in "$HOME/.local/share/modprobed-db/modprobed.db" "$HOME/.config/modprobed.db"; do
+          [ -s "$_moddb" ] && { _dbp="$_moddb"; break; }
+        done
+      elif [ -s "$CIZEN_MODPROBED_DB" ]; then
+        _dbp="$CIZEN_MODPROBED_DB"
+      fi
+      if [ -n "$_dbp" ]; then
+        while IFS= read -r _k; do
+          [ -n "$_k" ] || continue
+          keep_lines=$((keep_lines + 1))
+          printf '%s 0 0 0 - 0\n' "$_k"
+        done < <(sed -e 's/[[:space:]].*$//' -e '/^#/d' -e '/^$/d' "$_dbp" 2>/dev/null || true)
+        log "--lite: historial modprobed-db sumado al keep-list ($_dbp)."
+      else
+        warn "--lite con modprobed-db pedido (CIZEN_MODPROBED_DB) pero sin base de datos local; se continúa solo con /proc/modules+allowlist."
+      fi
+      unset _dbp _moddb
+    fi
   } > "$keepfile"
 
   log "--lite: localmodconfig (módulos cargados + $keep_lines del allowlist)..."
@@ -2289,6 +2729,13 @@ prepare_lite_config() {
   unset rc karch ksrcarch lite_gap lite_log ARCH SRCARCH
   rm -f -- "$keepfile"
   unset _k keep_lines
+}
+
+# Comparador semántico de versiones de kernel: X.Y.Z >= W.V.U (sort -V sobre la
+# parte de versión pura, sin sufijos -cizen...). Devuelve 0 si $1 >= $2.
+kernel_version_ge() {
+  local a="${1%%-*}" b="${2%%-*}"
+  [ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | head -n1)" = "$b" ]
 }
 
 # ============================================================
@@ -2355,6 +2802,194 @@ kconfig_symbol_known() {
   local sym="$1"
   build_kconfig_symbol_index
   [ -n "${KCONFIG_SYMBOL_KNOWN[$sym]:-}" ]
+}
+
+# ============================================================
+# V27.30.0 — OVERLAY DE COMPILACIÓN SOBRE EL PERFIL
+# Las opciones de compilación (OLEVEL, HZ, LTO, ntsync, firma de módulos) NO
+# van al perfil: mutan los arrays efectivos justo antes de apply_config_requests
+# para que viajen en la misma pasada de scripts/config, se re-normalicen en la
+# auditoría (olddefconfig) y la validación los acepte como esperados.
+# ============================================================
+# Borra un símbolo de un array EFF_*0 por su valor exacto (recompacta índices).
+eff_remove() {
+  local arr="$1" val="$2" i
+  case "$arr" in
+    EFF_ENABLE)
+      for i in "${!EFF_ENABLE[@]}"; do
+        [ "${EFF_ENABLE[$i]}" = "$val" ] && unset 'EFF_ENABLE[$i]'
+      done
+      EFF_ENABLE=("${EFF_ENABLE[@]}")
+      ;;
+    EFF_DISABLE)
+      for i in "${!EFF_DISABLE[@]}"; do
+        [ "${EFF_DISABLE[$i]}" = "$val" ] && unset 'EFF_DISABLE[$i]'
+      done
+      EFF_DISABLE=("${EFF_DISABLE[@]}")
+      ;;
+  esac
+}
+
+inject_build_overlay() {
+  local o
+
+  # Frecuencia del timer: override del pin del perfil (EFF_SETVAL[HZ]).
+  if [ "$CIZEN_TIMER_FREQ" != "inherit" ]; then
+    EFF_SETVAL["HZ"]="$CIZEN_TIMER_FREQ"
+    EXPECTED_REBEL_SET["HZ"]=1
+    info "Overlay: CONFIG_HZ=$CIZEN_TIMER_FREQ (override del perfil)."
+  fi
+
+  # Nivel de optimización (choice): 3 activa CC_OPTIMIZE_FOR_PERFORMANCE_O3 y
+  # suelta CC_OPTIMIZE_FOR_PERFORMANCE; 2 lo inverso.
+  case "$CIZEN_CFLAGS_OLEVEL" in
+    3)
+      eff_remove EFF_ENABLE CC_OPTIMIZE_FOR_PERFORMANCE
+      eff_remove EFF_ENABLE CC_OPTIMIZE_FOR_SIZE
+      add_unique enable "CC_OPTIMIZE_FOR_PERFORMANCE_O3"
+      add_unique disable "CC_OPTIMIZE_FOR_PERFORMANCE"
+      add_unique disable "CC_OPTIMIZE_FOR_SIZE"
+      EXPECTED_REBEL_SET[CC_OPTIMIZE_FOR_PERFORMANCE_O3]=1
+      EXPECTED_REBEL_SET[CC_OPTIMIZE_FOR_PERFORMANCE]=1
+      EXPECTED_REBEL_SET[CC_OPTIMIZE_FOR_SIZE]=1
+      PATCH_KCONFIG_FILTER[CC_OPTIMIZE_FOR_PERFORMANCE_O3]=1
+      info "Overlay: compilación de rendimiento -O3."
+      ;;
+    2)
+      eff_remove EFF_ENABLE CC_OPTIMIZE_FOR_PERFORMANCE_O3
+      add_unique enable "CC_OPTIMIZE_FOR_PERFORMANCE"
+      add_unique disable "CC_OPTIMIZE_FOR_PERFORMANCE_O3"
+      EXPECTED_REBEL_SET[CC_OPTIMIZE_FOR_PERFORMANCE]=1
+      EXPECTED_REBEL_SET[CC_OPTIMIZE_FOR_PERFORMANCE_O3]=1
+      PATCH_KCONFIG_FILTER[CC_OPTIMIZE_FOR_PERFORMANCE]=1
+      info "Overlay: compilación de rendimiento -O2."
+      ;;
+  esac
+
+  # LTO (clang): enlazar módulo-con-módulo al armar el kernel. Solo inyecta si
+  # la sanidad temprana (parser de args) dejó CIZEN_LLVM_LTO!=0 con clang real.
+  case "$CIZEN_LLVM_LTO" in
+    thin|full)
+      o="LTO_CLANG_${CIZEN_LLVM_LTO^^}"
+      add_unique enable "$o"
+      add_unique disable "LTO_CLANG_FULL"
+      add_unique disable "LTO_CLANG_THIN"
+      add_unique disable "LTO_NONE"
+      EXPECTED_REBEL_SET["$o"]=1
+      EXPECTED_REBEL_SET[LTO_CLANG_FULL]=1
+      EXPECTED_REBEL_SET[LTO_CLANG_THIN]=1
+      EXPECTED_REBEL_SET[LTO_NONE]=1
+      PATCH_KCONFIG_FILTER["$o"]=1
+      info "Overlay: LTO de Clang ${CIZEN_LLVM_LTO^^}."
+      ;;
+    0)
+      add_unique enable "LTO_NONE"
+      add_unique disable "LTO_CLANG_THIN"
+      add_unique disable "LTO_CLANG_FULL"
+      EXPECTED_REBEL_SET[LTO_NONE]=1
+      EXPECTED_REBEL_SET[LTO_CLANG_THIN]=1
+      EXPECTED_REBEL_SET[LTO_CLANG_FULL]=1
+      ;;
+  esac
+
+  # NTSYNC: en mainline >= 6.10 es un CONFIG nativo (drivers/misc/ntsync.c).
+  # Para kernels más viejos se pide el parche (patch_desc_ntsync) y aquí no se
+  # fuerza símbolo alguno (el parche lo aporta).
+  if [ "$CIZEN_PATCH_NTSYNC" != "0" ] && kernel_version_ge "$VERSION" "6.10"; then
+    add_unique enable "NTSYNC"
+    EXPECTED_REBEL_SET[NTSYNC]=1
+    PATCH_KCONFIG_FILTER[NTSYNC]=1
+  fi
+
+  # Firma persistente de módulos (MODULE_SIG=y; las claves MOK se instalan tras
+  # el build y se firman los módulos en el árbol de módulos instalado).
+  if [ "$CIZEN_MODULE_SIGN" = "yes" ]; then
+    add_unique enable "MODULE_SIG"
+    EXPECTED_REBEL_SET[MODULE_SIG]=1
+    PATCH_KCONFIG_FILTER[MODULE_SIG]=1
+    info "Overlay: firma de módulos del kernel (MODULE_SIG=yes)."
+  fi
+
+  unset o
+}
+
+# ============================================================
+# V27.30.0 — FRAGS DE CONFIGURACIÓN REUTILIZABLES (.frag)
+# Un frag es un mini-perfil portable con líneas CONFIG_X=y|m|n, valores y
+# cadenas, o "# CONFIG_X is not set". Soporta "#include otro.frag" (relativo al
+# directorio). Se aplican DESPUÉS del perfil (y del overlay), así que permiten
+# afinar sin tocar el perfil; no pueden contradecir símbolos que el perfil
+# exige (la validación lo detecta igualmente).
+# ============================================================
+process_frag_file() {
+  local f="$1" line inc
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ ^[[:space:]]*#include[[:space:]]+([^[:space:]]+)[[:space:]]*$ ]]; then
+      inc="$CIZEN_FRAGS_DIR/${BASH_REMATCH[1]}"
+      if [ -f "$inc" ] && process_frag_file "$inc"; then
+        :
+      else
+        warn "frag: include no encontrado: ${BASH_REMATCH[1]}"
+      fi
+      continue
+    fi
+    printf '%s\n' "$line"
+  done < "$f"
+}
+
+apply_config_fragments() {
+  [ -d "$CIZEN_FRAGS_DIR" ] || return 0
+
+  local -a __frags=() __args=()
+  local f line k v parsed got=0
+  shopt -s nullglob
+  while IFS= read -r -d '' f; do __frags+=("$f"); done \
+    < <(find "$CIZEN_FRAGS_DIR" -maxdepth 1 -type f -name '*.frag' -print0 2>/dev/null || true)
+  shopt -u nullglob
+  [ "${#__frags[@]}" -gt 0 ] || return 0
+
+  while IFS= read -r f; do
+    __args=()
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        '') continue ;;
+        '# CONFIG_'*' is not set')
+          k="${line#\# }"; k="${k%% is not set*}"
+          __args+=(--disable "${k#CONFIG_}") ;;
+        '#'*) continue ;;
+        CONFIG_*=*)
+          k="${line%%=*}"; v="${line#*=}"
+          case "$v" in
+            y) __args+=(--enable "${k#CONFIG_}") ;;
+            m) __args+=(--module "${k#CONFIG_}") ;;
+            n) __args+=(--disable "${k#CONFIG_}") ;;
+            *)
+              if [[ "$v" =~ ^\"(.*)\"$ ]]; then
+                __args+=(--set-str "${k#CONFIG_}" "${BASH_REMATCH[1]}")
+              else
+                __args+=(--set-val "${k#CONFIG_}" "$v")
+              fi
+              ;;
+          esac
+          ;;
+        *)
+          warn "frag ${f##*/}: línea ignorada: $line" ;;
+      esac
+    done < <(process_frag_file "$f")
+
+    [ "${#__args[@]}" -gt 0 ] || continue
+    if ( cd "$SRC" && scripts/config "${__args[@]}" ) >/dev/null 2>&1; then
+      got=$((got + 1))
+      info "Frag aplicado: ${f##*/} ($(( ${#__args[@]} / 2 )) directivas)"
+    else
+      warn "El frag ${f##*/} no se pudo aplicar; build continúa sin él."
+    fi
+  done < <(printf '%s\n' "${__frags[@]}" | sort -V)
+
+  if [ "$got" -gt 0 ]; then
+    ok "Frags de configuración: $got aplicado(s) desde $CIZEN_FRAGS_DIR (se re-normalizan en la auditoría)."
+  fi
+  return 0
 }
 
 apply_config_requests() {
@@ -4610,6 +5245,14 @@ if [ "${#PATCH_NAMES[@]}" -gt 0 ]; then
   unset __patch
 fi
 
+# Parches propios del usuario (v27.30.0): .patch/.diff propios sobre el árbol
+# vanilla. Fallo = fatal: es el usuario quien los firmó.
+apply_user_patches
+
+# Pack misc de CachyOS (v27.30.0): island patches best-effort (fail-soft por
+# parche). No rompen nunca la build: si no aplican, se avisa y se sigue.
+apply_cachy_misc_patchset
+
 # Config Cizen primero; /proc/config.gz o /boot/config como fallback.
 choose_base_config
 
@@ -4622,8 +5265,10 @@ prepare_lite_config
 # Crear marcador justo antes de aplicar/configurar/compilar.
 touch "$BUILD_MARKER"
 
-# Aplicar perfil.
+# Aplicar perfil (con overlay de compilación inyectado en los arrays efectivos).
+inject_build_overlay
 apply_config_requests || fatal "Falló scripts/config al aplicar el perfil."
+apply_config_fragments || fatal "Falló scripts/config al aplicar los frags."
 
 # Auditoría oficial Kconfig.
 run_kconfig_audit || fatal "Auditoría Kconfig fallida."
@@ -4755,8 +5400,37 @@ confirm_build_after_check() {
 # el parche en este punto y re-valida la config (olddefconfig + perfil +
 # auditoría + validación) para que la compilación arranque con una configuración
 # coherente; la base promovida tras el check queda alineada con la variante.
+# Aplica un parche concreto y re-corre la cadena completa olddefconfig +
+# perfil (overlay) + frags + auditoría + validación, tras materializar los
+# símbolos del parche en los arrays efectivos. V27.30.0: generaliza la cadena
+# que antes solo sabía de BORE para soportar PDS/BMQ/LFBMQ/MUQSS.
+apply_patch_and_recheck() {
+  local __pn="$1"
+  if ! apply_patch_plugin "$__pn"; then
+    return 1
+  fi
+  build_effective_arrays
+  check_profile_contradictions
+  log "Reconfigurando con ${PATCH_DISP_NAME:-$__pn} aplicado (olddefconfig + perfil + auditoría + validación)..."
+  if ! make olddefconfig; then
+    err "olddefconfig falló tras aplicar ${PATCH_DISP_NAME:-$__pn}."
+    return 1
+  fi
+  inject_build_overlay
+  apply_config_requests || { err "scripts/config falló al re-aplicar el perfil con ${PATCH_DISP_NAME:-$__pn}."; return 1; }
+  apply_config_fragments || { err "frags fallaron tras ${PATCH_DISP_NAME:-$__pn}."; return 1; }
+  run_kconfig_audit || { err "Auditoría Kconfig tras aplicar ${PATCH_DISP_NAME:-$__pn} fallida."; return 1; }
+  validate_config || {
+    local rc=$?
+    err "Re-validación tras aplicar ${PATCH_DISP_NAME:-$__pn} fallida (rc=$rc)."
+    return 1
+  }
+  ok "${PATCH_DISP_NAME:-$__pn} aplicado y configuración re-validada."
+  return 0
+}
+
 choose_build_variant_after_check() {
-  local choice
+  local choice __pn=""
 
   if [ "${#PATCH_NAMES[@]}" -gt 0 ]; then
     log "Variante ya solicitada explícitamente (${PATCH_NAMES[*]}); se omite la pregunta."
@@ -4769,45 +5443,32 @@ choose_build_variant_after_check() {
   fi
 
   echo
-  printf '  1) Vanilla\n  2) Bore\n'
+  printf '  1) Vanilla (EEVDF)\n  2) BORE\n  3) PDS (prjc)\n  4) BMQ (prjc)\n  5) LFBMQ (prjc)\n  6) MuQSS\n'
   while true; do
     read -r -t 300 -p "  Elija la variante de compilación [1] > " choice < /dev/tty || choice=""
     case "${choice:-1}" in
-      1|vanilla|Vanilla|v|V)
+      1|vanilla|Vanilla|v|V|eevdf|EEVDF)
         ok "Variante Vanilla (scheduler EEVDF estándar)."
         return 0
         ;;
-      2|bore|Bore|b|B)
-        break
-        ;;
+      2|bore|Bore|b|B)              __pn="bore";   break ;;
+      3|pds|PDS|p|P)                __pn="pds";    break ;;
+      4|bmq|BMQ|q|Q)                __pn="bmq";    break ;;
+      5|lfbmq|LFBMQ|l|L)            __pn="lfbmq";  break ;;
+      6|muqss|Muqss|MUQSS|m|M)      __pn="muqss";  break ;;
       *)
-        warn "Respuesta no válida. Responda 1 (Vanilla), 2 (Bore) o Enter (Vanilla)."
+        warn "Respuesta no válida. Responda 1-6, un nombre (b/p/q/l/m) o Enter para Vanilla."
         ;;
     esac
   done
 
-  # BORE elegido aquí: aplicar el parche sobre el árbol ya validado y volver a
-  # pasar la cadena perfil+auditoría+validación. Los símbolos nuevos
-  # (SCHED_BORE/MIN_BASE_SLICE_NS) se materializan en olddefconfig; PATCH_*_ALL
-  # (via build_effective_arrays) los fuerza a =y y los registra como esperados.
-  PATCH_NAMES+=(bore)
-  if apply_patch_plugin bore; then
-    build_effective_arrays
-    check_profile_contradictions
-    log "Reconfigurando con BORE aplicado (olddefconfig + perfil + auditoría + validación)..."
-    if ! make olddefconfig; then
-      err "olddefconfig falló tras aplicar BORE."
-      fatal "No se puede continuar: la configuración no es coherente con el parche BORE."
+  if [ -n "$__pn" ]; then
+    PATCH_NAMES+=("$__pn")
+    if apply_patch_and_recheck "$__pn"; then
+      ok "Se compilará con el scheduler ${PATCH_DISP_NAME:-$__pn}."
+    else
+      warn "No se pudo aplicar '$__pn'; se continúa compilando Vanilla (EEVDF)."
     fi
-    apply_config_requests || fatal "Falló scripts/config al re-aplicar el perfil con BORE."
-    run_kconfig_audit || fatal "Auditoría Kconfig tras aplicar BORE fallida."
-    validate_config || {
-      rc=$?
-      fatal "Re-validación tras aplicar BORE fallida (rc=$rc)."
-    }
-    ok "BORE aplicado y configuración re-validada; se compilará con el scheduler BORE."
-  else
-    warn "No se pudo aplicar el parche BORE; se continúa compilando Vanilla."
   fi
   return 0
 }
@@ -4832,6 +5493,10 @@ fi
 # compilación (build directo o transformado desde --check). En auto se pregunta
 # si hay sbctl y Secure Boot desactivado; con SB activo se firma siempre.
 resolve_sign_uki
+
+# Auditoría de disco cifrado (opción --luks-audit): avisa antes de construir el
+# UKI si la raíz LUKS no tiene parámetros de desbloqueo en el cmdline.
+luks_fde_audit
 
 # ============================================================
 # COMPILACIÓN
@@ -4863,6 +5528,28 @@ fi
 
 export KCFLAGS="${KCFLAGS:--pipe}"
 
+# Perfil de compilación extendido: arquitectura objetivo en KCFLAGS
+# (processor_opt). generic = baseline x86-64; native = -march=native; cualquier
+# otro valor válido (znver4, skylake, x86-64-v3, ...) se pasa tal cual. Solo
+# afecta a código C del kernel: -O3/HZ/LTO se gestionan vía CONFIG.
+case "$CIZEN_CPU_OPT" in
+  inherit)
+    :
+    ;;
+  generic)
+    export KCFLAGS="${KCFLAGS:--pipe} -march=x86-64"
+    ok "Optimización de CPU: baseline x86-64 (generic)."
+    ;;
+  native)
+    export KCFLAGS="${KCFLAGS:--pipe} -march=native"
+    ok "Optimización de CPU: -march=native (el build solo será portable en ESTA máquina)."
+    ;;
+  *)
+    export KCFLAGS="${KCFLAGS:--pipe} -march=$CIZEN_CPU_OPT"
+    ok "Optimización de CPU: -march=$CIZEN_CPU_OPT"
+    ;;
+esac
+
 # Build con LLVM/Clang (--clang): Kbuild aplica LLVM=1 (CC=clang, ld.lld,
 # llvm-ar/nm, etc.). Si clang o ld.lld no están, se degrada a GCC (fatal suave).
 CLANG_BUILD=false
@@ -4893,10 +5580,28 @@ BUILD_TIMEOUT="${BUILD_TIMEOUT:-3600}"
 [[ "$BUILD_TIMEOUT" =~ ^[0-9]+$ ]] || fatal "BUILD_TIMEOUT inválido: $BUILD_TIMEOUT (use segundos enteros)."
 (( BUILD_TIMEOUT > 0 )) || fatal "BUILD_TIMEOUT debe ser > 0 segundos."
 
-determine_pkgrel
-prepare_package_identity_override
-prepare_package_revision_override
-prepare_package_pruning_override
+# v27.30.0: empaquetado multi-backend. El flujo pacman/makepkg (pkgrel,
+# overrides del PKGBUILD, poda, identity) es específico de Arch; los demás
+# backends generan el artefacto nativo de su formato.
+case "$CIZEN_PKG_BACKEND" in
+  arch)
+    determine_pkgrel
+    prepare_package_identity_override
+    prepare_package_revision_override
+    prepare_package_pruning_override
+    ;;
+  *)
+    PKGVER_BASE="${VERSION}-cizen-v3"
+    PKGREL=1
+    info "Backend $CIZEN_PKG_BACKEND: pkgrel fijado a 1 (el contador de pkgrel es específico de pacman)."
+    ;;
+esac
+case "$CIZEN_PKG_BACKEND" in
+  arch) PKG_MAKE_TARGET="pacman-pkg" ;;
+  deb)  PKG_MAKE_TARGET="deb-pkg"    ;;
+  rpm)  PKG_MAKE_TARGET="rpm-pkg"    ;;
+  generic|gentoo) PKG_MAKE_TARGET="targz-pkg" ;;
+esac
 
 log "Compilando con $JOBS hilos (pkgrel=$PKGREL)..."
 START="$(date +%s)"
@@ -4967,7 +5672,7 @@ notify_desktop() {
 # solo sus argumentos. SCOPE_RUNNER siempre está declarado (arriba), así que
 # set -u no dispara.
 if time "${SCOPE_RUNNER[@]}" timeout --foreground --signal=TERM --kill-after=60s "$BUILD_TIMEOUT" \
-    make -j"$JOBS" "${MAKE_CC_OPTS[@]}" KBUILD_REVISION="$PKGREL" pacman-pkg; then
+    make -j"$JOBS" "${MAKE_CC_OPTS[@]}" KBUILD_REVISION="$PKGREL" "$PKG_MAKE_TARGET"; then
   :
 else
   build_rc=$?
@@ -4997,33 +5702,38 @@ sudo -v
 # Snapshot btrfs readonly del root (feature 4). Red de seguridad opcional.
 create_btrfs_snapshot
 
-copy_packages_from_build || fatal "No se pudo identificar/verificar el paquete generado."
-validate_split_package_transition_metadata
-
-# Evitar reinstalar exactamente el mismo paquete si ya está instalado.
-# copy_packages_from_build() ya validó la metadata interna del paquete.
-if pacman -Q "$PKG_NAME" >/dev/null 2>&1; then
-  INSTALLED_VERSION="$(pacman -Q "$PKG_NAME" | awk 'NR==1 {print $2}')"
-else
-  INSTALLED_VERSION=""
+collect_build_artifact || fatal "No se pudo identificar/verificar el artefacto generado."
+if [ "$CIZEN_PKG_BACKEND" = "arch" ]; then
+  validate_split_package_transition_metadata
 fi
 
-installed_rel=0
-if [ -n "$INSTALLED_VERSION" ] && [[ "$INSTALLED_VERSION" == "$PKGVER_BASE-"* ]]; then
-  if [[ "$INSTALLED_VERSION" =~ ^${PKGVER_BASE}-([0-9]+)$ ]]; then
-    installed_rel="${BASH_REMATCH[1]:-0}"
-    if (( PKGREL <= installed_rel )); then
-      # Único efecto real de --force en todo el script: permitir reinstalar
-      # un pkgrel igual o menor al ya instalado. No afecta ninguna
-      # validación crítica de Kconfig ni de auditoría (esas nunca se pueden
-      # saltar, con o sin --force).
-      if [ "$FORCE" = true ]; then
-        warn "El pkgrel generado ($PKGREL) no es superior al instalado ($installed_rel) para $PKGVER_BASE; se continúa por --force."
-      else
-        fatal "El pkgrel generado ($PKGREL) no es superior al instalado ($installed_rel) para $PKGVER_BASE. Se aborta para no instalar un paquete más viejo (usa --force para omitir esta comprobación)."
+# Evitar reinstalar exactamente el mismo paquete si ya está instalado.
+if [ "$CIZEN_PKG_BACKEND" = "arch" ]; then
+  if pacman -Q "$PKG_NAME" >/dev/null 2>&1; then
+    INSTALLED_VERSION="$(pacman -Q "$PKG_NAME" | awk 'NR==1 {print $2}')"
+  else
+    INSTALLED_VERSION=""
+  fi
+
+  installed_rel=0
+  if [ -n "$INSTALLED_VERSION" ] && [[ "$INSTALLED_VERSION" == "$PKGVER_BASE-"* ]]; then
+    if [[ "$INSTALLED_VERSION" =~ ^${PKGVER_BASE}-([0-9]+)$ ]]; then
+      installed_rel="${BASH_REMATCH[1]:-0}"
+      if (( PKGREL <= installed_rel )); then
+        # Único efecto real de --force en todo el script: permitir reinstalar
+        # un pkgrel igual o menor al ya instalado. No afecta ninguna
+        # validación crítica de Kconfig ni de auditoría (esas nunca se pueden
+        # saltar, con o sin --force).
+        if [ "$FORCE" = true ]; then
+          warn "El pkgrel generado ($PKGREL) no es superior al instalado ($installed_rel) para $PKGVER_BASE; se continúa por --force."
+        else
+          fatal "El pkgrel generado ($PKGREL) no es superior al instalado ($installed_rel) para $PKGVER_BASE. Se aborta para no instalar un paquete más viejo (usa --force para omitir esta comprobación)."
+        fi
       fi
     fi
   fi
+else
+  check_installed_release_generic
 fi
 
 log "Instalando $PKG_NAME-$PKG_VERSION ..."
@@ -5186,14 +5896,190 @@ install_kernel_package() {
   return 1
 }
 
-# El lock se comprueba antes de iniciar pacman y, si aparece durante el
-# intento, se considera potencialmente causado por la propia transacción.
+# v27.30.0: detecta el artefacto generado segun el backend. Para arch fija
+# PKG/PKG_NAME/PKG_VERSION con copy_packages_from_build (metadatos .PKGINFO);
+# para el resto localiza el artefacto nativo (o deja PKG vacío en los
+# backends sin paquete, que instalan directo desde el árbol).
+collect_build_artifact() {
+  local newest f
+  case "$CIZEN_PKG_BACKEND" in
+    arch)
+      copy_packages_from_build || return 1
+      ;;
+    deb)
+      newest=""
+      while IFS= read -r -d '' f; do newest="$f"; done < <(
+        find "$TMPFS_ROOT" -maxdepth 2 -type f \( -name 'linux-image-*.deb' -o -name 'linux-*.deb' \) -print0 2>/dev/null || true)
+      if [ -z "$newest" ]; then
+        err "No se encontró ningún .deb tras make deb-pkg en $TMPFS_ROOT."
+        return 1
+      fi
+      PKG="$newest"; PKG_NAME="linux-image-cizen"; PKG_VERSION="$VERSION-cizen-v3"
+      ok "Artefacto .deb detectado: $(basename "$PKG")"
+      ;;
+    rpm)
+      newest=""
+      while IFS= read -r -d '' f; do newest="$f"; done < <(
+        find "$TMPFS_ROOT" -maxdepth 2 -type f -name 'linux-*.rpm' -print0 2>/dev/null || true)
+      if [ -z "$newest" ]; then
+        err "No se encontró ningún .rpm tras make rpm-pkg en $TMPFS_ROOT."
+        return 1
+      fi
+      PKG="$newest"; PKG_NAME="linux-cizen"; PKG_VERSION="$VERSION-cizen-v3"
+      ok "Artefacto .rpm detectado: $(basename "$PKG")"
+      ;;
+    generic|gentoo)
+      PKG=""
+      PKG_NAME="linux-cizen-v3"
+      PKG_VERSION="$VERSION-cizen-v3"
+      ok "Backend $CIZEN_PKG_BACKEND: sin paquete; se instala desde el árbol (modules_install + vmlinuz)."
+      ;;
+  esac
+  [ -n "$PKG" ] || [ "$CIZEN_PKG_BACKEND" = "generic" ] || [ "$CIZEN_PKG_BACKEND" = "gentoo" ]
+}
+
+# Comprueba que el release generado no esté ya instalado con un pkgrel igual o
+# mayor que el del build actual (analogo al control pacman, para backends sin
+# pacman mediante ras tronco de /usr/lib/modules).
+check_installed_release_generic() {
+  local rel
+  rel="$(make -C "$SRC" -s kernelrelease 2>/dev/null || echo "$VERSION-cizen-v3")"
+  if [ -d "/usr/lib/modules/$rel" ]; then
+    warn "El release $rel ya está instalado en /usr/lib/modules."
+    if [ "$FORCE" = true ]; then
+      warn "Se continúa por --force (reinstalando sobre el release existente)."
+    else
+      fatal "Ya existe /usr/lib/modules/$rel; se aborta (usa --force para reinstalar igual)."
+    fi
+  fi
+  return 0
+}
+
+# v27.30.0 (feature LinuxLocker): respalda el UKI previo a sobrescribirlo.
+uki_backup_prev() {
+  [ "$CIZEN_UKI_BACKUP" = "1" ] || return 0
+  local tgt dst rel n
+  rel="$VERSION-cizen-v3"
+  if [ ! -d "$CIZEN_UKI_BACKUP_DIR" ]; then
+    sudo mkdir -p "$CIZEN_UKI_BACKUP_DIR" || { warn "No se pudo crear $CIZEN_UKI_BACKUP_DIR; se omite el backup del UKI."; return 0; }
+  fi
+  while IFS= read -r tgt; do
+    [ -s "$tgt" ] || continue
+    dst="$CIZEN_UKI_BACKUP_DIR/$(basename "$tgt").before-$rel-$(date +%Y%m%d-%H%M%S)"
+    if sudo cp -f "$tgt" "$dst" 2>/dev/null; then
+      ok "UKI previo respaldado en $dst"
+    fi
+  done < <(find_cizen_uki_targets 2>/dev/null || true)
+  # Poda defensiva: conservar solo las 8 copias mas recientes por nombre.
+  for f in $(sudo find "$CIZEN_UKI_BACKUP_DIR" -type f -name '*.efi.before-*' 2>/dev/null || true); do
+    n=1
+    for older in $(sudo find "$CIZEN_UKI_BACKUP_DIR" -maxdepth 1 -type f -name "$(basename "$f")*" 2>/dev/null | sort | head -n -8); do
+      [ "$older" = "$f" ] && n=0 && break
+    done
+    [ "$n" = 0 ] || sudo rm -f -- "$f" 2>/dev/null || true
+  done
+  return 0
+}
+
+# v27.30.0 (feature Arch-SKM): firma persistente de los módulos instalados con
+# una MOK propia (claves en CIZEN_MODULE_SIGN_DIR), lista para enrollar con
+# mokutil. Requiere CONFIG_MODULE_SIG (inyectada por el overlay del build).
+module_sign_installed() {
+  [ "$CIZEN_MODULE_SIGN" = "yes" ] || return 0
+  command -v openssl >/dev/null 2>&1 || { warn "module-sign: falta openssl; se omite la firma."; return 0; }
+  [ -x "$SRC/scripts/sign-file" ] || { warn "module-sign: no hay scripts/sign-file en $SRC; se omite."; return 0; }
+  local rel key crt der n f
+  rel="$(make -C "$SRC" -s kernelrelease 2>/dev/null || echo "$VERSION-cizen-v3")"
+  key="$CIZEN_MODULE_SIGN_DIR/kernel-signing.key"
+  crt="$CIZEN_MODULE_SIGN_DIR/kernel-signing.crt"
+  der="$CIZEN_MODULE_SIGN_DIR/kernel-signing.der"
+  if [ ! -s "$crt" ]; then
+    log "module-sign: generando claves persistentes en $CIZEN_MODULE_SIGN_DIR (estilo MOK)..."
+    sudo mkdir -p "$CIZEN_MODULE_SIGN_DIR"
+    sudo openssl req -new -x509 -newkey rsa:4096 -keyout "$key" -out "$crt" -days 10000 -nodes \
+        -subj "/CN=Cizen kernel module signing" >/dev/null 2>&1 \
+      || { warn "module-sign: falló generar las claves; se omite la firma."; return 0; }
+    sudo openssl x509 -inform PEM -outform DER -in "$crt" -out "$der" 2>/dev/null || true
+    if [ "$SECURE_BOOT" = true ] && command -v mokutil >/dev/null 2>&1; then
+      warn "module-sign: enrolla la MOK en el firmware (y reinicia) con:"
+      warn "  sudo mokutil --import $der"
+    fi
+  fi
+  n=0
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    sudo "$SRC/scripts/sign-file" sha256 "$key" "$crt" "$f" >/dev/null 2>&1 && n=$((n + 1))
+  done < <(find "/usr/lib/modules/$rel" -type f -name '*.ko' 2>/dev/null || true)
+  ok "module-sign: $n módulos firmados en /usr/lib/modules/$rel (MOK: $CIZEN_MODULE_SIGN_DIR)."
+  return 0
+}
+
+# v27.30.0: auditoría de disco cifrado (LUKS2) para advertir de cmdline sin
+# parámetros de desbloqueo antes de regenerar el UKI.
+luks_fde_audit() {
+  [ "$CIZEN_LUKS_AUDIT" = "1" ] || return 0
+  command -v lsblk >/dev/null 2>&1 || return 0
+  local fs
+  fs="$(lsblk -rio FSTYPE,MOUNTPOINT 2>/dev/null | awk '$2=="/"{print $1; exit}')"
+  case "$fs" in
+    crypto_LUKS)
+      if ! grep -Eq 'cryptdevice=|rd\.luks\.uuid=|rd\.luks=' /proc/cmdline 2>/dev/null; then
+        warn "LUKS/FDE: la raíz está cifrada pero /proc/cmdline no trae cryptdevice/rd.luks. "
+        warn "El UKI heredará ese cmdline; si no arranca tras reiniciar, añade los parámetros de desbloqueo al kernel y regenera el UKI."
+      else
+        ok "LUKS/FDE: raíz cifrada con parámetros de desbloqueo presentes en el cmdline."
+      fi
+      ;;
+    *)
+      info "LUKS/FDE: la raíz no es LUKS; sin requisitos especiales."
+      ;;
+  esac
+  return 0
+}
+
 PACMAN_INSTALL_START_EPOCH="$(date +%s)"
 PACMAN_PREINSTALL_LOCK_MTIME="$(pacman_lock_mtime)"
 
-recover_pacman_lock
-install_kernel_package || fatal "No se pudo instalar $PKG_NAME-$PKG_VERSION con pacman." 
-ok "Paquete instalado: $PKG_NAME-$PKG_VERSION"
+case "$CIZEN_PKG_BACKEND" in
+  arch)
+    recover_pacman_lock
+    install_kernel_package || fatal "No se pudo instalar $PKG_NAME-$PKG_VERSION con pacman."
+    ok "Paquete instalado: $PKG_NAME-$PKG_VERSION"
+    ;;
+  deb)
+    if command -v dpkg >/dev/null 2>&1; then
+      sudo dpkg -i "$PKG" || fatal "No se pudo instalar $PKG_NAME con dpkg."
+      ok "Paquete instalado: $(basename "$PKG") (dpkg)"
+    else
+      warn "dpkg no disponible en este sistema; el .deb queda en $(dirname "$PKG") para instalación manual."
+    fi
+    ;;
+  rpm)
+    if command -v rpm >/dev/null 2>&1; then
+      sudo rpm -Uvh "$PKG" || fatal "No se pudo instalar $PKG_NAME con rpm."
+      ok "Paquete instalado: $(basename "$PKG") (rpm)"
+    else
+      warn "rpm no disponible en este sistema; el .rpm queda en $(dirname "$PKG") para instalación manual."
+    fi
+    ;;
+  generic|gentoo)
+    log "Backend $CIZEN_PKG_BACKEND: -- make modules_install + vmlinuz a /usr/lib/modules"
+    if ! sudo make -C "$SRC" modules_install; then
+      fatal "modules_install falló (backend $CIZEN_PKG_BACKEND)."
+    fi
+    rel__cgeb="$(make -C "$SRC" -s kernelrelease 2>/dev/null || echo "$VERSION-cizen-v3")"
+    uname_m="$(uname -m | sed 's/x86_64/x86/;s/aarch64/arm64/;s/i686/x86/')"
+    uname_arch="$(uname -m)"
+    if [ "$uname_arch" = "x86_64" ] || [ "$uname_arch" = "i686" ]; then bzfile="arch/x86/boot/bzImage"; else bzfile="arch/$uname_m/boot/Image"; fi
+    bzpath="$SRC/$bzfile"
+    [ -f "$bzpath" ] || fatal "No se encontró la imagen del kernel ($bzfile) en $SRC para instalar."
+    sudo install -Dm644 "$bzpath" "/usr/lib/modules/$rel__cgeb/vmlinuz" || fatal "No se pudo instalar vmlinuz en /usr/lib/modules/$rel__cgeb."
+    ok "Kernel instalado desde el árbol: /usr/lib/modules/$rel__cgeb/vmlinuz"
+    ;;
+esac
+
+# Firma persistente de módulos con MOK propia (feature Arch-SKM).
+module_sign_installed
 
 log "Sincronizando UKI..."
 declare -a UKI_SYNC_ARGS=()
@@ -5202,6 +6088,8 @@ if [ "$DO_SIGN_UKI" = true ]; then
 else
   UKI_SYNC_ARGS+=(--no-sign)
 fi
+# Respaldo del UKI previo antes de sobrescribirlo (feature LinuxLocker).
+uki_backup_prev
 sudo cizen-uki-sync "${UKI_SYNC_ARGS[@]}"
 ensure_cizen_efi_updated
 ok "UKI sincronizado"
@@ -5214,7 +6102,9 @@ if [ "$DO_SIGN_UKI" = true ]; then
 fi
 FULL_PIPELINE_OK=true
 
-prune_stale_packages
+if [ "$CIZEN_PKG_BACKEND" = "arch" ]; then
+  prune_stale_packages
+fi
 
 # Firma del build para el verificador post-boot (feature 2).
 write_verify_signature
@@ -5225,8 +6115,11 @@ promote_base_config .config "$FINAL_CONFIG"
 ok "Configuración final guardada: $FINAL_CONFIG"
 
 # Repo local pacman (--publish-repo): copia el paquete instalado a un repositorio
-# de archivos servible a las VMs libvirt / otros hosts.
-publish_repo_package
+# de archivos servible a las VMs libvirt / otros hosts. Solo tiene sentido con
+# el backend arch/pacman.
+if [ "$CIZEN_PKG_BACKEND" = "arch" ]; then
+  publish_repo_package
+fi
 
 T_END="$(date +%s)"
 
@@ -5275,8 +6168,10 @@ Perfil      : $PROFILE
   CC          : $([ "$CLANG_BUILD" = true ] && echo 'LLVM/Clang' || echo 'GCC')
 ${PUBLISH_REPO_MSG:+  ${PUBLISH_REPO_MSG}}
   Hilos       : $JOBS
- Build prio  : $BUILD_PRIORITY_LABEL (CIZEN_BUILD_PRIORITY=normal para máxima velocidad)
- Paquete     : $(basename "$PKG")
+Build prio  : $BUILD_PRIORITY_LABEL (CIZEN_BUILD_PRIORITY=normal para máxima velocidad)
+  Backend     : $CIZEN_PKG_BACKEND
+  Paquete     : ${PKG:+$(basename "$PKG")}${PKG:---sin paquete (modules_install)}
+  Mod-firma   : $([ "$CIZEN_MODULE_SIGN" = "yes" ] && echo 'sí (MOK persistente)' || echo 'no')
  Config base : $FINAL_CONFIG
  Build tmpfs : $TMPFS_ROOT (size=$TMPFS_SIZE)
  Podar       : $([ "${CIZEN_PRUNE_MODULES:-$PRUNE_MODULES}" = "1" ] && echo 'sí (solo módulos de este hardware)' || echo 'no')

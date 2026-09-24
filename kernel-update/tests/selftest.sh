@@ -16,6 +16,7 @@
 set -u
 MOTOR="${1:-/usr/local/bin/kernel-update/kernel-update.sh}"
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/cizen-selftest.XXXXXX")"
+export ROOT
 trap 'rm -rf "$ROOT"' EXIT
 
 PASS=0
@@ -66,11 +67,19 @@ cp -- "$ROOT/patch-cachy.patch" "$ROOT/patch-upstream.patch"
 
 # --- extraer funciones del motor -------------------------------------
 extract() { # $1 = nombre de función (hasta el `}` inicial en columna 0)
-  sed -n "/^$1() {/,/^}/p" "$MOTOR"
+  sed -n "/^[[:space:]]*$1() {/,/^}/p" "$MOTOR"
 }
 {
   extract bore_branch_from_version
   extract patch_desc_bore
+  extract _patch_desc_scheduler_base
+  # descriptores compactos de una línea (pds/bmq/lfbmq/muqss)
+  sed -n '/^patch_desc_\(pds\|bmq\|lfbmq\|muqss\)()[[:space:]]*{/p' "$MOTOR"
+  extract patch_desc_ntsync
+  extract patch_desc_fsync
+  extract kernel_version_ge
+  extract process_frag_file
+  extract apply_config_fragments
   extract patch_markers_hit
   extract apply_patch_register
   extract apply_patch_plugin
@@ -200,6 +209,118 @@ if apply_patch_plugin foo; then
 else
   rec ok "devuelve 1"
 fi
+
+# ============================================================
+# v27.30.0 — schedulers alternativos, skip por versión y frags
+# ============================================================
+printf '%s\n' "== kernel_version_ge (v27.30.0) =="
+kernel_version_ge 6.10 6.10 && rec ok "6.10 >= 6.10" || rec fail "6.10>=6.10"
+kernel_version_ge 7.2.6 6.8 && rec ok "7.2.6 >= 6.8" || rec fail "7.2.6>=6.8"
+! kernel_version_ge 6.1.77 6.2 && rec ok "6.1.77 < 6.2" || rec fail "6.1.77>=6.2"
+! kernel_version_ge 5.15 6.1 && rec ok "5.15 < 6.1" || rec fail "5.15>=6.1"
+
+printf '%s\n' "== patch_desc: schedulers alternativos =="
+patch_desc_pds
+[ "$PATCH_MAIN_FILE" = "0001-prjc-cachy.patch" ] && rec ok "PDS: MAIN=prjc-cachy" || rec fail "PDS MAIN: $PATCH_MAIN_FILE"
+[ "$PATCH_FALLBACK_FILE" = "0001-prjc.patch" ] && rec ok "PDS: FALLBACK=prjc" || rec fail "PDS FALLBACK: $PATCH_FALLBACK_FILE"
+case " ${PATCH_CHOICE_DISABLE[*]:-} " in
+  *SCHED_BMQ*) rec ok "PDS deshabilita SCHED_BMQ (choice Kconfig)" ;;
+  *) rec fail "PDS choice-disable: [${PATCH_CHOICE_DISABLE[*]:-}]" ;;
+esac
+PATCHES_APPLIED=(); PATCH_DISABLE_ALL=()
+apply_patch_register pds
+case " ${PATCH_DISABLE_ALL[*]:-} " in
+  *SCHED_BMQ*) rec ok "register 'pds' -> PATCH_DISABLE_ALL acumula SCHED_BMQ" ;;
+  *) rec fail "PATCH_DISABLE_ALL tras pds: [${PATCH_DISABLE_ALL[*]:-}]" ;;
+esac
+case " ${PATCH_ENABLE_ALL[*]:-} " in
+  *SCHED_ALT*SCHED_PDS*) rec ok "PDS registra SCHED_ALT y SCHED_PDS en ENABLE" ;;
+  *) rec fail "PDS ENABLE: [${PATCH_ENABLE_ALL[*]:-}]" ;;
+esac
+
+patch_desc_muqss
+[ "$PATCH_MAIN_FILE" = "0001-muqss-cachy.patch" ] && rec ok "MuQSS: MAIN=muqss-cachy" || rec fail "MuQSS MAIN: $PATCH_MAIN_FILE"
+case " ${PATCH_SYMBOLS[*]:-} " in
+  *SCHED_MUQSS*) rec ok "MuQSS: símbolo SCHED_MUQSS" ;;
+  *) rec fail "MuQSS símbolos: [${PATCH_SYMBOLS[*]:-}]" ;;
+esac
+
+printf '%s\n' "== patch_desc: skip por versión (ntsync / fsync) =="
+VERSION_SAVE="$VERSION"
+VERSION=7.2.6
+patch_desc_ntsync
+[ -n "${PATCH_SKIP_REASON:-}" ] && rec ok "ntsync 7.2 -> skip (mainline nativo)" || rec fail "ntsync 7.2 debía saltar"
+VERSION=6.1.77
+patch_desc_ntsync
+[ -z "${PATCH_SKIP_REASON:-}" ] && rec ok "ntsync 6.1 -> aplica backport (sin skip)" || rec fail "ntsync 6.1 no debía saltar"
+patch_desc_fsync
+[ -z "${PATCH_SKIP_REASON:-}" ] && rec ok "fsync 6.1 -> aplica (futex_waitv)" || rec fail "fsync 6.1 saltó sin motivo"
+VERSION=6.13
+patch_desc_fsync
+[ -z "${PATCH_SKIP_REASON:-}" ] && rec ok "fsync 6.13 -> aplica (últimos soportados)" || rec fail "fsync 6.13 saltó sin motivo"
+patch_desc_ntsync
+[ -n "${PATCH_SKIP_REASON:-}" ] && rec ok "ntsync 6.13 -> skip (mainline nativo)" || rec fail "ntsync 6.13 debía saltar"
+VERSION=6.14
+patch_desc_fsync
+[ -n "${PATCH_SKIP_REASON:-}" ] && rec ok "fsync 6.14 -> skip (recomienda ntsync)" || rec fail "fsync 6.14 debía saltar"
+VERSION="$VERSION_SAVE"
+
+printf '%s\n' "== apply_patch_plugin: skip por versión (sin descargar, sin registrar) =="
+VERSION=6.14
+PATCHES_APPLIED=(); PATCH_DISABLE_ALL=(); DL_CALLED=0
+if apply_patch_plugin ntsync; then
+  rec fail "ntsync >= 6.10 debía degradar vanilla"
+else
+  [ "$DL_CALLED" = 0 ] && rec ok "ntsync: skip sin llamar a download_file" || rec fail "ntsync descargó pese a skip (DL_CALLED=$DL_CALLED)"
+  [ "${PATCHES_APPLIED[*]:-}" = "" ] && rec ok "ntsync: no se registró" || rec fail "ntsync se registró"
+fi
+if apply_patch_plugin fsync; then
+  rec fail "fsync >= 6.14 debía degradar vanilla"
+else
+  rec ok "fsync >= 6.14 degrada a vanilla (PATCHES_APPLIED=${PATCHES_APPLIED[*]:-})"
+fi
+VERSION="$VERSION_SAVE"
+
+printf '%s\n' "== process_frag_file / apply_config_fragments (.frag v27.30.0) =="
+export CIZEN_FRAGS_DIR="$ROOT/frags"
+mkdir -p "$CIZEN_FRAGS_DIR" "$SRC/scripts"
+cat > "$SRC/scripts/config" <<'FRAGCC_STUB'
+#!/usr/bin/env bash
+# stub de scripts/config: registra los argumentos y devuelve 0.
+# Se ejecuta con cd al árbol, así que el log queda en $PWD (=$SRC).
+printf '%s\n' "$*" >> scripts-config.log
+exit 0
+FRAGCC_STUB
+chmod +x "$SRC/scripts/config"
+cat > "$CIZEN_FRAGS_DIR/base.frag" <<'FRAG_BASE'
+CONFIG_FOO=y
+CONFIG_BAR=m
+# CONFIG_BAZ is not set
+CONFIG_ZAP=42
+FRAG_BASE
+: > "$SRC/scripts-config.log"
+apply_config_fragments
+grep -q -- '--enable FOO' "$SRC/scripts-config.log" 2>/dev/null \
+  && rec ok "frag: CONFIG_FOO=y -> --enable FOO" || rec fail "FOO=y no aplicado"
+grep -q -- '--module BAR' "$SRC/scripts-config.log" 2>/dev/null \
+  && rec ok "frag: CONFIG_BAR=m -> --module BAR" || rec fail "BAR=m no aplicado"
+grep -q -- '--disable BAZ' "$SRC/scripts-config.log" 2>/dev/null \
+  && rec ok "frag: '# CONFIG_BAZ is not set' -> --disable BAZ" || rec fail "BAZ no deshabilitado"
+grep -q -- '--set-val ZAP 42' "$SRC/scripts-config.log" 2>/dev/null \
+  && rec ok "frag: CONFIG_ZAP=42 -> --set-val ZAP 42" || rec fail "ZAP no como valor"
+cat > "$CIZEN_FRAGS_DIR/main.frag" <<'FRAG_MAIN'
+#include base.frag
+CONFIG_EXTRA=y
+FRAG_MAIN
+: > "$SRC/scripts-config.log"
+apply_config_fragments
+grep -q -- '--enable EXTRA' "$SRC/scripts-config.log" 2>/dev/null \
+  && rec ok "frag: include resuelto desde CIZEN_FRAGS_DIR" || rec fail "include base.frag no se resolvió"
+grep -q -- '--enable FOO' "$SRC/scripts-config.log" 2>/dev/null \
+  && rec ok "frag: directivas del include aplicadas" || rec fail "directivas del include ausentes"
+export CIZEN_FRAGS_DIR="$ROOT/no-existe"
+apply_config_fragments && rec ok "frag: sin directorio -> no-op rc=0" || rec fail "sin frag-dir debía ser no-op"
+unset CIZEN_FRAGS_DIR
 
 # --- resumen ---
 echo

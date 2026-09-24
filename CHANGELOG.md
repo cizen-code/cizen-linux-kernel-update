@@ -5,6 +5,57 @@ changelog vive en este archivo (no en la cabecera del motor);
 `kernel-update.sh --changelog` añade aquí el borrador del siguiente
 release. Formato inspirado en [Keep a Changelog](https://keepachangelog.com/es/1.1.0/).
 
+## [27.30.0] - 2026-09-24
+
+funciones nuevas de los proyectos referentes (linux-tkg, CachyOS, Arch-SKM,
+ukibak, LinuxLocker): schedulers alternativos, Clang/LLVM+LTO, modprobed-db,
+frags, parches de usuario/CachyOS, NTSync/fsync, empaquetado multi-backend,
+gestor multi-kernel, firma persistente de módulos y UKI backup
+
+- **Perfil de compilación extendido**: bloque de opciones
+  `--cc (gcc|clang|auto)`, `--lto-thin/--lto-full/--no-lto`, `--o3/--o2`,
+  `--native/--march=<env>`, `--timer-freq`, `--sched (eevdf|bore|pds|bmq|
+  lfbmq|muqss)`, `--ntsync/--no-ntsync`, `--fsync/--no-fsync`,
+  `--cachy/--no-cachy`, `--frag-dir`, `--modprobed-db/--no-modprobed-db`,
+  `--pkg-backend (arch|deb|rpm|generic|gentoo)`,
+  `--module-sign/--no-module-sign`, `--uki-backup/--no-uki-backup`,
+  `--luks-audit`; todas con variable `CIZEN_*` equivalente y validación de
+  entorno.
+- **Schedulers alternativos**: soporte de PDS, BMQ, LFBMQ y MuQSS (parches
+  PRJC/CachyOS con fallback upstream), nuevas entradas en el menú interactivo
+  de `choose_build_variant_after_check` y descriptor por scheduler con
+  `PATCH_CHOICE_DISABLE` (choice Kconfig) y `PATCH_DISABLE_ALL`.
+- **Wine sync**: NTSync nativo (≥6.10, `CONFIG_NTSYNC` forzado) o backport
+  CachyOS (<6.10); fsync legacy (futex_waitv) solo <6.14.
+- **Clang/LLVM + LTO**: `CC=clang`, `LLVM=1`, `LD=lld` (requiere clang+lld);
+  LTO thin/full con `LTO_NONE`/`CLANG_THIN`/`CLANG_FULL` y validación temprana.
+- **-O3 / CONFIG_HZ / -march / timer**: overlay de compilación
+  (`inject_build_overlay`) aplicado en ambas cadenas de config; `-mtune`
+  heredado del perfil.
+- **modprobed-db**: feed automático de `prepare_lite_config` desde
+  `~/.local/share/modprobed-db/modprobed.db` o `~/.config/modprobed.db`.
+- **Frags de configuración**: mini-perfiles `.frag` en `CIZEN_FRAGS_DIR`
+  (con `#include`), aplicados tras el overlay, con directivas
+  enable/module/disable/set-val/set-str.
+- **Parches de usuario + misc CachyOS**: `apply_user_patches` (fatal si un
+  `.patch/.diff` de `CIZEN_USER_PATCHES_DIR` falla) y
+  `apply_cachy_misc_patchset` (fail-soft: nap-governor, reflex-governor, etc.).
+- **Empaquetado multi-backend**: `--pkg-backend` con `arch/pacman-pkg`,
+  `deb/deb-pkg`(+dpkg), `rpm/rpm-pkg`(+rpm), `generic|gentoo`/targz-pkg con
+  `modules_install`+vmlinuz directo; pkgrel y guards pacman solo en arch.
+- **`kernel-update-manager.sh`**: list/info/flip/backup/remove + guía SCX;
+  integrado en el menú (opción 17).
+- **Firma persistente de módulos (MOK)**: claves kernel-signing en
+  `CIZEN_MODULE_SIGN_DIR` e `sign-file` sobre los `.ko` instalados
+  (`--module-sign`).
+- **UKI backup**: respaldo del UKI previo a sobrescribirlo en
+  `CIZEN_UKI_BACKUP_DIR` con poda del más antiguo (`--uki-backup`).
+- **Auditoría LUKS/FDE**: `--luks-audit` avisa si la raíz cifrada no lleva
+  parámetros de desbloqueo en el cmdline antes de regenerar el UKI.
+- **Harness ampliado**: tests de `kernel_version_ge`, descriptores de
+  schedulers, skip por versión (ntsync/fsync), frags y PATCH_DISABLE_ALL
+  (50 checks, 0 fallos).
+
 ## [27.29.3] - 2026-09-24
 
 memoria de la decisión de firma + guía de BIOS para los pasos manuales
