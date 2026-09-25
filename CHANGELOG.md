@@ -1,3 +1,51 @@
+## [27.31.18] - 2026-09-25
+
+El motor ya no ofrece compilar una versión que no puede compilar (cierra la
+contradicción de la opción 14 con pds/bmq/lfbmq/muqss).
+
+Lo que pasaba: el menú (v27.31.16) ofrece correctamente la release del fork
+cuando el scheduler solo existe allí —aceptabas 7.2.7 y el motor arrancaba— pero
+enseguida el motor hacía su **otra** pregunta, la de kernel.org:
+
+    ✓ Nueva release (stable) detectada: 7.2.7 → 7.2.8
+      Hay una release estable más nueva de kernel.org: 7.2.7 → 7.2.8
+      ¿Deseas compilar la versión más nueva (7.2.8)? [S/n]
+
+Con `S` no empezaba el build: `resolve_cachyos_release 7.2.8` abortaba porque el
+fork no la tiene. Dos preguntando por lo mismo, en sitios distintos, y la
+segunda deshacía lo acordado en la primera.
+
+- `cachyos_release_tagrel <ver>`: la consulta al fork (API de releases + sondeo
+  de `.asc`) separada de `resolve_cachyos_release`, que se queda con la
+  resolución y su `fatal`. La nueva **no aborta nunca**: deja el tagrel en
+  `CACHYOS_TAGREL` y el contexto en `CACHYOS_API_OK`, `CACHYOS_SEEN_TAGS` y
+  `CACHYOS_LATEST_MINOR` (última X.Y.Z de la misma línea, vía `sort -V`).
+  Una sola fuente de verdad: si el fork no tiene la versión, ahora lo dicen el
+  aviso y el fatal por la misma llamada.
+- `confirm_newer_release` consulta al fork **solo** si el árbol es `cachyos`:
+  - el fork no la publica → no se pregunta; se explica («aún no publica 7.2.8 y
+    este build compila contra su árbol») y, si la última de esa línea es
+    distinta de la pedida, se recuerda (no si ya ibas a esa).
+  - el fork sí la publica → la oferta se mantiene y se dice que es compilable.
+  - la consulta falla (red, rate-limit) → **fail-open**: no se afirma una
+    ausencia que no se ha podido comprobar y la oferta sigue como antes.
+  Con árbol `vanilla` no se toca la red: 7.2.8 sí se puede compilar.
+- `resolve_kernel_tree` se llama **antes** de la pregunta (es pura e
+  idempotente, depende solo de `CIZEN_KERNEL_TREE` y `PATCH_NAMES`): sin eso
+  `KERNEL_TREE` seguía valiendo `auto` y la comprobación no podía hacerse.
+
+Tests: 11 nuevos (no ofrecer lo que el fork no tiene, el consejo accionable
+7.2.7, no repetirlo si ya la pediste, vanilla sin tocar la red, oferta intacta
+si el fork sí la tiene, fail-open sin red, la consulta no pisa `CACHYOS_TAGREL`,
+dos guardas estáticas, y la consulta al fork por separado: tagrel máximo,
+versión ausente con `CACHYOS_API_OK=1` y `CACHYOS_LATEST_MINOR`). Selftest
+**162 → 173, 0 fail**; `shellcheck` sin avisos nuevos. Además, con el motor
+entero y la red simulada (kernel.org 7.2.8, fork solo hasta 7.2.7):
+
+    kernel-update.sh 7.2.7 --sched bmq  → ⚠ aún no publica 7.2.8 … se conserva 7.2.7
+    kernel-update.sh 7.2.6 --sched bmq  → ⚠ + • su última 7.2.x publicada es 7.2.7
+    kernel-update.sh 7.2.7 --sched eevdf → sin cambios, no consulta al fork
+
 ## [27.31.17] - 2026-09-25
 
 Desmontaje inteligente: el tmpfs de compilación deja de arrastrar árboles que

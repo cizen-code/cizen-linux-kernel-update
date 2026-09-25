@@ -108,7 +108,9 @@ extract() { # $1 = nombre de función (hasta el `}` inicial en columna 0)
   extract kernel_version_ge
   extract _resolve_cc_compiler
   extract resolve_kernel_tree
+  extract cachyos_release_tagrel
   extract resolve_cachyos_release
+  extract confirm_newer_release
   extract process_frag_file
   extract apply_config_fragments
   extract patch_markers_hit
@@ -485,6 +487,164 @@ if grep -q '^TAGREL=2$' "$ROOT/probe.out" 2>/dev/null; then
   rec ok "fork con esa versión: la guarda '|| true' no rompe la resolución"
 else
   rec fail "con la guarda '|| true' dejó de resolver (rc=$_probe_rc; rastro: $(cat "$ROOT/probe.out" 2>/dev/null || echo ninguno))"
+fi
+
+# ============================================================
+printf '%s\n' "== confirm_newer_release (v27.31.18): no ofrecer lo que el fork no tiene =="
+# El harness también corre contra motores antiguos (para verlos en rojo), donde
+# estas funciones no existen: se inicializan los globales que leen los tests
+# para que la ausencia se traduzca en FAIL y no en un `set -u` que mata la
+# suite entera.
+CACHYOS_TAGREL=""; CACHYOS_API_OK=""; CACHYOS_SEEN_TAGS=""
+CACHYOS_LATEST_MINOR=""; CACHYOS_FOUND_VIA=""
+KERNEL_TREE=""; TREE_FORCE_NOTE=""
+# El menú (v27.31.16) ofrece la release del fork cuando el scheduler es de los
+# que solo viven allí, pero el motor volvía a preguntar por la stable de
+# kernel.org: el usuario aceptaba 7.2.7 y acto seguido le ofrecía 7.2.8, que con
+# bmq aborta en resolve_cachyos_release. Aquí se comprueba que la pregunta se
+# consulta al fork y, si no tiene la versión, NO se formula.
+# El harness no tiene TTY, así que la rama que llega a read es indistinguible de
+# la que aborta antes; lo que se comprueba es qué se imprime y si se consultó
+# la red: la versión no compilable se detecta por el aviso, sin llegar a read.
+capture_warn() { warn() { printf 'WARN: %s\n' "$*" >> "$ROOT/ui.log"; }; }
+capture_info() { info() { printf 'INFO: %s\n' "$*" >> "$ROOT/ui.log"; }; }
+fork_json_missing_728() {
+  cat > "$1" <<'JSON'
+[
+  {"tag_name": "cachyos-7.2.7-1", "draft": false},
+  {"tag_name": "cachyos-7.2.6-2", "draft": false},
+  {"tag_name": "cachyos-7.3-rc4-1", "draft": false}
+]
+JSON
+}
+download_file() {
+  local url="$1" out="$2"
+  case "$url" in
+    *"releases?per_page=20") fork_json_missing_728 "$out"; return 0 ;;
+  esac
+  return 1
+}
+# 1) bmq + stable 7.2.8 sin publicar en el fork -> no pregunta y lo explica.
+#    Se pide 7.2.6 para que además aparezca la pista accionable: la última 7.2.x
+#    del fork (7.2.7) es distinta de la solicitada, y con la 7.2.7 ya pedida esa
+#    línea sería ruido (la cubre el mensaje del llamante).
+rm -f "$ROOT/ui.log"; capture_warn; capture_info
+KERNEL_TREE=cachyos; TREE_FORCE_NOTE="lo fuerza el parche/scheduler 'bmq'"
+CACHYOS_TAGREL=""
+confirm_newer_release 7.2.6 7.2.8 >/dev/null 2>&1
+if grep -q "aún no publica 7.2.8" "$ROOT/ui.log" 2>/dev/null; then
+  rec ok "bmq sin 7.2.8 en el fork: avisa en vez de ofrecer la que aborta"
+else
+  rec fail "no avisó de que el fork no tiene 7.2.8 (log: $(cat "$ROOT/ui.log" 2>/dev/null || echo vacío))"
+fi
+if grep -q "Su última 7.2.x publicada es 7.2.7" "$ROOT/ui.log" 2>/dev/null; then
+  rec ok "el aviso nombra la última 7.2.x del fork (7.2.7), accionable"
+else
+  rec fail "el aviso no nombró la última 7.2.x del fork (log: $(cat "$ROOT/ui.log" 2>/dev/null || echo vacío))"
+fi
+# 1b) Si lo solicitado ES la última del fork, no se repite el consejo.
+rm -f "$ROOT/ui.log"; capture_warn; capture_info
+confirm_newer_release 7.2.7 7.2.8 >/dev/null 2>&1
+if grep -q "aún no publica 7.2.8" "$ROOT/ui.log" 2>/dev/null \
+   && ! grep -q "Su última 7.2.x" "$ROOT/ui.log" 2>/dev/null; then
+  rec ok "ya se pidió la última del fork: avisa sin repetir el consejo"
+else
+  rec fail "aconsejó de nuevo la versión ya solicitada (log: $(cat "$ROOT/ui.log" 2>/dev/null || echo vacío))"
+fi
+# 2) Con vanilla no se pregunta nada al fork (el árbol sí admite 7.2.8).
+rm -f "$ROOT/ui.log"; capture_warn; capture_info
+KERNEL_TREE=vanilla; TREE_FORCE_NOTE=""
+: > "$ROOT/dl.log"
+CACHYOS_TAGREL=""
+confirm_newer_release 7.2.7 7.2.8 >/dev/null 2>&1
+if [ "$(wc -l < "$ROOT/dl.log")" = "0" ] \
+   && grep -q "release estable más nueva" "$ROOT/ui.log" 2>/dev/null; then
+  rec ok "vanilla: la release más nueva se ofrece sin preguntar al fork"
+else
+  rec fail "vanilla se saltó la oferta o consultó el fork (log: $(cat "$ROOT/ui.log" 2>/dev/null || echo vacío))"
+fi
+# 3) Si el fork SÍ tiene la versión, la oferta sigue en pie (no la esconde).
+download_file() {
+  local url="$1" out="$2"
+  case "$url" in
+    *"releases?per_page=20") releases_json > "$out"; return 0 ;;
+  esac
+  return 1
+}
+rm -f "$ROOT/ui.log"; capture_warn; capture_info
+KERNEL_TREE=cachyos; TREE_FORCE_NOTE="lo fuerza el parche/scheduler 'bmq'"
+CACHYOS_TAGREL="1"
+confirm_newer_release 7.2.7 7.2.8 >/dev/null 2>&1
+if grep -q "sí publica 7.2.8 (cachyos-7.2.8-1)" "$ROOT/ui.log" 2>/dev/null \
+   && ! grep -q "aún no publica" "$ROOT/ui.log" 2>/dev/null; then
+  rec ok "fork con 7.2.8: la oferta sigue disponible y avisa de que es compilable"
+else
+  rec fail "con 7.2.8 en el fork se saltó la oferta (log: $(cat "$ROOT/ui.log" 2>/dev/null || echo vacío))"
+fi
+# 4) Check inconcluso (sin red): fail-open, no se esconde la opción.
+download_file() { return 1; }
+rm -f "$ROOT/ui.log"; capture_warn; capture_info
+CACHYOS_TAGREL="1"
+confirm_newer_release 7.2.7 7.2.8 >/dev/null 2>&1
+if grep -q "No se pudo comprobar en el fork" "$ROOT/ui.log" 2>/dev/null \
+   && ! grep -q "aún no publica" "$ROOT/ui.log" 2>/dev/null; then
+  rec ok "fork inalcanzable: check inconcluso, no se afirma una ausencia falsa"
+else
+  rec fail "sin red: se afirmó la ausencia sin poder comprobarla (log: $(cat "$ROOT/ui.log" 2>/dev/null || echo vacío))"
+fi
+# 5) La consulta al fork no puede arrastrar su tagrel al flujo posterior.
+if [ "$CACHYOS_TAGREL" = "1" ]; then
+  rec ok "la consulta al fork no pisa CACHYOS_TAGREL del flujo principal"
+else
+  rec fail "CACHYOS_TAGREL quedó como '$CACHYOS_TAGREL' tras la consulta"
+fi
+# 6) Guardia estática: la comprobación no se puede volver a borrar en silencio.
+if grep -q 'cachyos_release_tagrel "\$latest"' "$MOTOR" \
+   && awk '/^confirm_newer_release\(\)/,/^}/' "$MOTOR" | grep -q 'KERNEL_TREE:-}" = "cachyos"'; then
+  rec ok "confirm_newer_release sigue consultando al fork cuando el árbol es cachyos"
+else
+  rec fail "confirm_newer_release ya no consulta al fork antes de ofrecer la release"
+fi
+# 7) El árbol se decide antes de la pregunta (si no, KERNEL_TREE valdría "auto").
+if awk '/^# v27.31.18: el árbol se decide ANTES/,0' "$MOTOR" \
+     | sed -n '1,/^if \[ -n "\$VERSION" \]; then$/p' \
+     | grep -q '^resolve_kernel_tree$'; then
+  rec ok "resolve_kernel_tree se llama antes de preguntar por la release nueva"
+else
+  rec fail "resolve_kernel_tree ya no se decide antes de confirm_newer_release"
+fi
+
+printf '%s\n' "== cachyos_release_tagrel (v27.31.18): consulta sin abortar =="
+download_file() {
+  local url="$1" out="$2"
+  case "$url" in
+    *"releases?per_page=20") releases_json > "$out"; return 0 ;;
+  esac
+  return 1
+}
+if cachyos_release_tagrel 7.2.7; then
+  [ "$CACHYOS_TAGREL" = "2" ] && [ "$CACHYOS_LATEST_MINOR" = "7.2.8" ] \
+    && rec ok "consulta: tagrel máximo 2 y última de la línea 7.2.8 (sort -V, no la 7.2.7)" \
+    || rec fail "consulta: tagrel=$CACHYOS_TAGREL latest=$CACHYOS_LATEST_MINOR"
+else
+  rec fail "consulta: 7.2.7 está en el JSON y no se resolvió"
+fi
+download_file() {
+  local url="$1" out="$2"
+  case "$url" in
+    *"releases?per_page=20") fork_json_missing_728 "$out"; return 0 ;;
+  esac
+  return 1
+}
+if cachyos_release_tagrel 7.2.8; then
+  rec fail "consulta: 7.2.8 no está en el fixture ausente y aun así se resolvió"
+else
+  if [ -z "$CACHYOS_TAGREL" ] && [ "$CACHYOS_FOUND_VIA" = "" ] && [ "$CACHYOS_API_OK" = "1" ] \
+     && [ "$CACHYOS_LATEST_MINOR" = "7.2.7" ]; then
+    rec ok "consulta: versión ausente -> rc=1, sin tagrel, sin fatal, última 7.2.x=7.2.7"
+  else
+    rec fail "consulta ausente: tagrel='$CACHYOS_TAGREL' via='$CACHYOS_FOUND_VIA' api='$CACHYOS_API_OK' latest='$CACHYOS_LATEST_MINOR'"
+  fi
 fi
 
 printf '%s\n' "== apply_patch_plugin: guardia de árbol del fork (bmq sobre vanilla) =="

@@ -134,7 +134,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.17"
+SCRIPT_VERSION="27.31.18"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -1096,14 +1096,27 @@ resolve_kernel_tree() {
 #      (patrón cachyos-$VERSION-[0-9]+).
 #   2) Fallback sin depender de rate limits ni paginación: sondeo directo del
 #      .asc de los tags cachyos-$VERSION-1..8 (asset mínimo; 404 = tag ausente).
-resolve_cachyos_release() {
-  local ver="$1" i cand_url probes seen api_ok=0
+# ¿El fork CachyOS/linux ha publicado ya <ver>?
+#
+# Mitad "consulta" de resolve_cachyos_release, separada para poder preguntar por
+# la EXISTENCIA de un release sin abortar nunca. Deja el tagrel en
+# CACHYOS_TAGREL (vacío = el fork no lo tiene) y el contexto del sondeo en
+# CACHYOS_API_OK / CACHYOS_SEEN_TAGS / CACHYOS_LATEST_MINOR para que el fatal
+# pueda explicar. No imprime nada (solo deja resultados; el que llama informa).
+# v27.31.18: confirm_newer_release la usa para no ofrecer una stable de
+# kernel.org que este build no puede compilar porque el fork va con retraso.
+cachyos_release_tagrel() {
+  local ver="$1" i cand_url probes
   CACHYOS_TAGREL=""
+  CACHYOS_API_OK=0
+  CACHYOS_SEEN_TAGS=""
+  CACHYOS_LATEST_MINOR=""
+  CACHYOS_FOUND_VIA=""
   probes="$KERNEL_BUILD_ROOT/.cizen-cachy-probe-$$"
   rm -f -- "$probes"
 
   if download_small_file "https://api.github.com/repos/CachyOS/linux/releases?per_page=20" "$probes" >/dev/null 2>&1; then
-    api_ok=1
+    CACHYOS_API_OK=1
     # v27.31.15: `|| true` en la tubería. Sin él, cuando el fork aún no publicó
     # la versión (p. ej. stable 7.2.8 recién salida en kernel.org) el último
     # grep se queda sin entrada y devuelve 1; con `set -Eeuo pipefail` + trap
@@ -1117,11 +1130,18 @@ resolve_cachyos_release() {
       | sort -n | tail -n1 || true
     )"
     # Últimos tags vistos, para el diagnóstico final si esta versión no existe.
-    seen="$(grep -oE '"tag_name": *"cachyos-[^"]+"' "$probes" 2>/dev/null \
+    CACHYOS_SEEN_TAGS="$(grep -oE '"tag_name": *"cachyos-[^"]+"' "$probes" 2>/dev/null \
       | sed -E 's/.*"(cachyos-[^"]+)"/\1/' | head -6 | tr '\n' ' ' || true)"
+    # Última X.Y.Z publicada en la MISMA línea de la versión consultada (los tags
+    # -rc de otra línea no cuentan). Sirve para decir "su última 7.2.x es 7.2.7".
+    CACHYOS_LATEST_MINOR="$(
+      grep -oE '"tag_name": *"cachyos-'"${ver%.*}"'\.[0-9]+-[0-9]+"' "$probes" 2>/dev/null \
+      | sed -E 's/.*cachyos-([0-9]+\.[0-9]+\.[0-9]+)-.*/\1/' \
+      | sort -V -u | tail -n1 || true
+    )"
     rm -f -- "$probes"
     if [ -n "$CACHYOS_TAGREL" ]; then
-      ok "Release CachyOS detectado (API): cachyos-${ver}-${CACHYOS_TAGREL}"
+      CACHYOS_FOUND_VIA="api"
       return 0
     fi
   fi
@@ -1133,23 +1153,35 @@ resolve_cachyos_release() {
     if download_small_file "$cand_url" "$probes" >/dev/null 2>&1; then
       CACHYOS_TAGREL="$i"
       rm -f -- "$probes"
-      ok "Release CachyOS detectado (sondeo): cachyos-${ver}-${CACHYOS_TAGREL}"
+      CACHYOS_FOUND_VIA="sondeo"
       return 0
     fi
   done
   rm -f -- "$probes"
+  CACHYOS_FOUND_VIA=""
+  return 1
+}
 
-  # v27.31.15: diagnóstico accionable. Lo normal es que kernel.org ya tenga la
-  # release y el fork CachyOS todavía no (los tags van con retraso): decirlo
-  # claro evita que parezca un fallo de red.
-  err "El fork CachyOS/linux no tiene ningún release para ${ver}."
-  if [ "$api_ok" = 1 ] && [ -n "$seen" ]; then
-    err "Últimos tags publicados por el fork: ${seen}"
+resolve_cachyos_release() {
+  local ver="$1"
+  cachyos_release_tagrel "$ver" || {
+    # v27.31.15: diagnóstico accionable. Lo normal es que kernel.org ya tenga la
+    # release y el fork CachyOS todavía no (los tags van con retraso): decirlo
+    # claro evita que parezca un fallo de red.
+    err "El fork CachyOS/linux no tiene ningún release para ${ver}."
+    if [ "$CACHYOS_API_OK" = 1 ] && [ -n "$CACHYOS_SEEN_TAGS" ]; then
+      err "Últimos tags publicados por el fork: ${CACHYOS_SEEN_TAGS}"
+    else
+      warn "No se pudo consultar la API de releases del fork (¿red?)."
+    fi
+    err "Los schedulers/tuning del proyecto (pds/bmq/lfbmq/muqss) solo existen en el fork CachyOS."
+    fatal "Opciones: compila una versión que el fork sí tenga publicado (p. ej. la estable del fork) con --version <VER>, o usa un scheduler de mainline (eevdf) que sí puede compilar ${ver} vanilla desde kernel.org."
+  }
+  if [ "$CACHYOS_FOUND_VIA" = "api" ]; then
+    ok "Release CachyOS detectado (API): cachyos-${ver}-${CACHYOS_TAGREL}"
   else
-    warn "No se pudo consultar la API de releases del fork (¿red?)."
+    ok "Release CachyOS detectado (sondeo): cachyos-${ver}-${CACHYOS_TAGREL}"
   fi
-  err "Los schedulers/tuning del proyecto (pds/bmq/lfbmq/muqss) solo existen en el fork CachyOS."
-  fatal "Opciones: compila una versión que el fork sí tenga publicado (p. ej. la estable del fork) con --version <VER>, o usa un scheduler de mainline (eevdf) que sí puede compilar ${ver} vanilla desde kernel.org."
 }
 
 # ============================================================
@@ -8119,7 +8151,36 @@ changelog_bump() {
 # DECISIÓN SOBRE RELEASE MÁS NUEVA
 # ============================================================
 confirm_newer_release() {
-  local requested="$1" latest="$2" answer
+  local requested="$1" latest="$2" answer saved_tagrel="${CACHYOS_TAGREL:-}"
+
+  # v27.31.18: no ofrezcas una versión que este build no puede compilar. Con
+  # pds/bmq/lfbmq/muqss (o --tree cachyos) el árbol de fuentes es el fork, y el
+  # fork va con retraso respecto a kernel.org: el menú acababa de ofrecer su
+  # release (7.2.7) y acto seguido el motor preguntaba otra vez por la stable
+  # (7.2.8). Aceptar solo servía para morir más tarde en resolve_cachyos_release,
+  # ya descargada la config y montado el preámbulo. Ahora se consulta al fork y,
+  # si no tiene esa versión, se explica y se conserva la solicitada.
+  if [ "${KERNEL_TREE:-}" = "cachyos" ]; then
+    if cachyos_release_tagrel "$latest"; then
+      info "El fork CachyOS/linux sí publica $latest (cachyos-${latest}-${CACHYOS_TAGREL}): se puede compilar."
+      CACHYOS_TAGREL="$saved_tagrel"
+    elif [ "$CACHYOS_API_OK" = 1 ]; then
+      # Respuesta real del fork ("no lo tiene") + ningún .asc candidato: aquí
+      # sí se puede afirmar la ausencia, que es lo que hace útil el aviso.
+      warn "El fork CachyOS/linux aún no publica $latest y este build compila contra su árbol (${TREE_FORCE_NOTE:---tree cachyos}); no se ofrece porque la compilación abortaría."
+      if [ -n "$CACHYOS_LATEST_MINOR" ] && [ "$CACHYOS_LATEST_MINOR" != "$requested" ]; then
+        info "Su última ${latest%.*}.x publicada es $CACHYOS_LATEST_MINOR: pide esa con este scheduler, o usa eevdf para compilar $latest vanilla desde kernel.org."
+      fi
+      CACHYOS_TAGREL="$saved_tagrel"
+      return 1
+    else
+      # Check inconcluso (red/rate-limit): no se puede afirmar la ausencia, así
+      # que no se esconde la opción; si el fork no la tiene, lo dirá después
+      # resolve_cachyos_release con su diagnóstico.
+      info "No se pudo comprobar en el fork CachyOS/linux si publica $latest; se ofrece igualmente."
+      CACHYOS_TAGREL="$saved_tagrel"
+    fi
+  fi
 
   if ! [ -t 0 ] && ! [ -t 1 ]; then
     warn "Hay una release estable más nueva: $requested → $latest, pero no hay terminal interactiva; se conserva la versión solicitada."
@@ -8196,6 +8257,13 @@ if [ "$BTF_REQUESTED" = true ]; then
   build_effective_arrays
 fi
 
+# v27.31.18: el árbol se decide ANTES de preguntar por la release más nueva,
+# porque de él depende si esa versión se puede compilar: con pds/bmq/lfbmq/muqss
+# (o --tree cachyos) solo vale lo que el fork haya publicado, y ofrecer la stable
+# de kernel.org cuando el fork va con retraso terminaba en fatal. La función es
+# pura (CIZEN_KERNEL_TREE + PATCH_NAMES) e idempotente: aquí y más abajo.
+resolve_kernel_tree
+
 # Con una versión explícita, kernel.org se consulta antes de descargar.
 # Si existe una stable posterior, se pregunta una sola vez y la respuesta
 # determina VERSION. A partir de ese punto todo el flujo usa esa versión.
@@ -8248,7 +8316,9 @@ if [ -z "$VERSION" ]; then
 # tiene soporte nativo (v27.31.17; antes se decidiría antes de que existiría la
 # función que compara versiones).
 auto_add_ntsync_patch
-resolve_kernel_tree
+# v27.31.18: el árbol ya se decidió antes de preguntar por la release más nueva
+# (resolve_kernel_tree es idempotente) y aquí toca resolver el tag del fork para
+# la versión definitiva.
 if [ "$KERNEL_TREE" = "cachyos" ]; then
   resolve_cachyos_release "$VERSION"
 fi
