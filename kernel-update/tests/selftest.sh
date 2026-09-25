@@ -71,6 +71,9 @@ download_file_good() {
   return 1
 }
 download_file() { download_file_good "$@"; }
+# El probe de releases usa download_small_file (un hilo); en el harness se
+# sirve con el mismo stub de download_file para no tocar la red.
+download_small_file() { download_file "$@"; }
 
 # parches de prueba (contienen el PATCH_MAGIC que exige el motor)
 printf 'config SCHED_BORE\n--- a/init/Kconfig\n+++ b/init/Kconfig\n' > "$ROOT/patch-cachy.patch"
@@ -335,7 +338,7 @@ releases_json() {
 download_file() {
   local url="$1" out="$2"
   case "$url" in
-    *"releases?per_page=100") printf '%s\n' "$(releases_json)" > "$out"; return 0 ;;
+    *"releases?per_page=20") printf '%s\n' "$(releases_json)" > "$out"; return 0 ;;
   esac
   return 1
 }

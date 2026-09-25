@@ -128,7 +128,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.3"
+SCRIPT_VERSION="27.31.4"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -1041,8 +1041,10 @@ resolve_kernel_tree() {
 # Determina el tagrel del release del fork CachyOS/linux para $VERSION. Los
 # releases se publican como cachyos-<VERSION>-<N> (p. ej. cachyos-7.2.7-1, con
 # assets .tar.gz + .tar.gz.asc firmados por los mantenedores). Resolución:
-#   1) API de releases (cacho de 100, más recientes primero): se queda con el
-#      mayor tagrel para la versión (patrón cachyos-$VERSION-[0-9]+).
+#   1) API de releases (cacho de 20, más recientes primero; basta para la
+#      estable actual y ahorra el ~2MB de per_page=100 que GitHub sirve a
+#      menudo a <100KB/s): se queda con el mayor tagrel para la versión
+#      (patrón cachyos-$VERSION-[0-9]+).
 #   2) Fallback sin depender de rate limits ni paginación: sondeo directo del
 #      .asc de los tags cachyos-$VERSION-1..8 (asset mínimo; 404 = tag ausente).
 resolve_cachyos_release() {
@@ -1051,7 +1053,7 @@ resolve_cachyos_release() {
   probes="$KERNEL_BUILD_ROOT/.cizen-cachy-probe-$$"
   rm -f -- "$probes"
 
-  if download_file "https://api.github.com/repos/CachyOS/linux/releases?per_page=100" "$probes" >/dev/null 2>&1; then
+  if download_small_file "https://api.github.com/repos/CachyOS/linux/releases?per_page=20" "$probes" >/dev/null 2>&1; then
     CACHYOS_TAGREL="$(
       grep -oE 'cachyos-'"$ver"'-[-A-Za-z0-9.]+' "$probes" \
       | sed -E 's/^cachyos-'"$ver"'-([0-9]+)$/\1/' \
@@ -1069,7 +1071,7 @@ resolve_cachyos_release() {
   rm -f -- "$probes"
   for i in $(seq 1 8); do
     cand_url="https://github.com/CachyOS/linux/releases/download/cachyos-${ver}-${i}/cachyos-${ver}-${i}.tar.gz.asc"
-    if download_file "$cand_url" "$probes" >/dev/null 2>&1; then
+    if download_small_file "$cand_url" "$probes" >/dev/null 2>&1; then
       CACHYOS_TAGREL="$i"
       rm -f -- "$probes"
       ok "Release CachyOS detectado (sondeo): cachyos-${ver}-${CACHYOS_TAGREL}"
@@ -2126,6 +2128,23 @@ verify_tarball_signature() {
 tarball_fingerprint() {
   local tarball="$1" sig="$2"
   printf '%s:%s' "$(stat -c '%s:%Y' "$tarball" 2>/dev/null)" "$(stat -c '%s:%Y' "$sig" 2>/dev/null)"
+}
+
+# Descarga pequeña de metadatos (JSON de releases, .asc de sondeo): SIEMPRE de
+# un solo hilo y con timeout duro. La API de GitHub no atiende múltiples
+# conexiones/descargas parciales fiablemente, y aria2c --split=4 contra esos
+# endpoints abortaba con "Size mismatch" y (con --max-tries=5) se quedaba
+# reintentando durante minutos sin salir — el cuelgue de v27.31.3 al elegir
+# un árbol CachyOS. Aquí el punto es velocidad determinista, no throughput.
+download_small_file() {
+  local url="$1" out="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 15 --max-time 45 -o "$out" "$url"
+  elif command -v wget >/dev/null 2>&1; then
+    wget --timeout=20 --tries=3 -q -O "$out" "$url"
+  else
+    return 2
+  fi
 }
 
 # Descarga con un hilo (wget clásico) o con conexiones paralelas (aria2c) si

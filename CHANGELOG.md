@@ -1,3 +1,18 @@
+## [27.31.4] - 2026-09-24
+
+Arreglado un cuelgue del motor al resolver el release del fork CachyOS (elección
+de un scheduler PRJC/MuQSS o `--tree cachyos` con la versión ya instalada).
+
+- El probe de `resolve_cachyos_release` (JSON de releases de la API de GitHub y
+  sondeo de `.asc`) usaba `download_file`, que con aria2c lanzaba `--split=4` +
+  `--max-tries=5` contra `api.github.com`; la API no atiende descargas parciales
+  fiables y terminaba con "Size mismatch" y reintentos eternos (el archivo se
+  descendía entero pero aria2c no salía). Se añade `download_small_file()`
+  (curl con `--connect-timeout 15 --max-time 45`, o wget) de UN solo hilo,
+  usado por el probe de releases y el sondeo `.asc`.
+- La API se consulta con `per_page=20` en vez de 100: payload ~330KB (12s)
+  frente a ~2MB a <100KB/s que agotaba el timeout.
+
 ## [27.31.3] - 2026-09-24
 
 Arreglado un aborto del motor al resolver el árbol de fuentes del fork CachyOS.
