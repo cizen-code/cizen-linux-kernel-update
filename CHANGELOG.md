@@ -1,3 +1,22 @@
+## [27.31.13] - 2026-09-25
+
+Fix de validación FATAL en la opción 14: `SETVAL CONFIG_HID_PLAYSTATION
+esperado=m real=missing`. Causa raíz: v27.31.10 metió `LEDS_CLASS_MULTICOLOR` en
+`OPTS_DISABLE`, pero el driver de mandos PS4/PS5 (`HID_PLAYSTATION=m`, exigido
+por el perfil) tiene `depends on LEDS_CLASS_MULTICOLOR` — al desactivarlo el
+símbolo no podía resolverse y la auditoría abortaba. Perfil **v5.12.0 → v5.12.1**:
+`LEDS_CLASS_MULTICOLOR` sale de la poda (DISABLE 264→263); el allowlist del
+podador ya conserva `hid_playstation hid_sony hid_nintendo hid_steam xpad joydev
+uhid hidp`, así que los mandos siguen compilándose aunque ahora mismo no haya
+ninguno conectado. Verificado en el árbol 7.2.7: con `LEDS_CLASS_MULTICOLOR=m`,
+`HID_PLAYSTATION=m` se resuelve con `olddefconfig`.
+Nota: los 16 avisos de códecs que "Kconfig conserva" (ALC260…ALC882, HDMI_*,
+TDX_HOST_SERVICES, WATCHDOG_PRETIMEOUT_GOV_SEL) son NO fatales — esos `=m` solo
+se pueden desactivar con `CONFIG_EXPERT=y` (ni el config base ni CachyOS lo
+activan); el ahorro real de v27.31.10 viene de ASoC/SOF/SST, sí efectivo.
+Deploy con paridad sha256 del perfil (repo==instalado, `374617ff…`). El motor no
+cambia (sigue v27.31.12).
+
 ## [27.31.12] - 2026-09-25
 
 Fix del arranque del motor cuando el perfil se instaló con `sudo` (propietario
