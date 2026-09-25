@@ -40,6 +40,10 @@ err() { :; }
 # fatal en el motor hace exit 1; en el harness NO debe matar el selftest, solo
 # señalizar el fallo con rc=1 a la función que lo invocó.
 fatal(){ return 1; }
+# build_effective_arrays llama a resolve_symbol (mapa de renames). Sin mapa en
+# el harness: identidad.
+declare -A RENAME_MAP=()
+resolve_symbol() { printf '%s' "$1"; }
 
 # stub de patch(1): no se aplica nada real. Como el motor usa `patch ... < f`,
 # el fichero llega por stdin (no por argumento); la decisión se toma con la
@@ -110,6 +114,9 @@ extract() { # $1 = nombre de función (hasta el `}` inicial en columna 0)
   extract patch_markers_hit
   extract apply_patch_register
   extract apply_patch_plugin
+  extract add_unique
+  extract build_effective_arrays
+  extract check_profile_contradictions
   extract _misc_extract_kconfig_symbols
   extract apply_cachy_misc_symbols
   extract apply_cachy_misc_single
@@ -736,6 +743,77 @@ if grep -q "'CC=ccache gcc'"; then
   rec fail "queda hardcode 'CC=ccache gcc' (debería ser $CC_LAUNCHER)"
 else
   rec ok "no queda hardcode 'CC=ccache gcc' en la emisión de make"
+fi
+
+if grep -q 'declare -a PATCH_RETIRED_ALL=()' "$MOTOR"; then
+  rec ok "motor declara PATCH_RETIRED_ALL (símbolos imposibles con SCHED_ALT)"
+else
+  rec fail "motor: falta 'PATCH_RETIRED_ALL'"
+fi
+if grep -q 'PATCH_RETIRED_SYMBOLS=()' "$MOTOR"; then
+  rec ok "_patch_desc_scheduler_base declara PATCH_RETIRED_SYMBOLS vacío por defecto"
+else
+  rec fail "_patch_desc_scheduler_base: falta PATCH_RETIRED_SYMBOLS por defecto"
+fi
+if grep -q 'PATCH_RETIRED_SYMBOLS=(PSI PSI_DEFAULT_DISABLED SCHED_AUTOGROUP NUMA_BALANCING SCHED_CACHE)' "$MOTOR"; then
+  rec ok "bmq/pds/lfbmq retiran PSI/PSI_DEFAULT_DISABLED/SCHED_AUTOGROUP/NUMA_BALANCING/SCHED_CACHE"
+else
+  rec fail "descriptor bmq/pds/lfbmq: falta la lista de símbolos retirados"
+fi
+
+if grep -q '\$\{[A-Za-z0-9_]*\[@\]:-' "$MOTOR"; then
+  rec fail "motor: hay bad substitution \${#arr[@]:-...} (no válido en bash; usó culpa en validate_config v27.31.6)"
+else
+  rec ok "motor sin bad substitution \${#arr[@]:-...} (pattern detectado en v27.31.6)"
+fi
+
+printf '%s\n' "== build_effective_arrays: símbolos retirados por el scheduler alternativo (v27.31.6) =="
+declare -a EFF_ENABLE=() EFF_DISABLE=() EFF_CRITICAL=()
+declare -A EFF_SETVAL=() EFF_SETSTR=()
+declare -A APPLIED_RENAMES=()
+declare -A SEEN_ENABLE=() SEEN_DISABLE=() SEEN_CRITICAL=()
+OPTS_ENABLE=(DEBUG_INFO SCHED_AUTOGROUP)
+CRITICAL_OPTS=(SCHED_AUTOGROUP X86_NATIVE_CPU)
+unset OPTS_SETVAL OPTS_SETSTR OPTS_DISABLE
+declare -A OPTS_SETVAL=([PSI]="y" [PSI_DEFAULT_DISABLED]="n" [HZ]="1000")
+declare -A OPTS_SETSTR=()
+declare -A EXPECTED_REBEL_SET=()
+declare -A PATCH_KCONFIG_FILTER=()
+PATCH_DISABLE_ALL=()
+PATCH_RETIRED_ALL=(PSI PSI_DEFAULT_DISABLED SCHED_AUTOGROUP)
+PATCH_ENABLE_ALL=()
+PATCH_REBEL_ALL=()
+BTF_REQUESTED=false
+build_effective_arrays
+_contains_ok=true
+for __x in PSI PSI_DEFAULT_DISABLED SCHED_AUTOGROUP; do
+  case " ${EFF_ENABLE[*]:-} ${EFF_CRITICAL[*]:-} ${!EFF_SETVAL[*]:-} ${!EFF_SETSTR[*]:-} " in
+    *" $__x "*) _contains_ok=false;;
+  esac
+done
+unset __x
+if [ "$_contains_ok" = true ]; then
+  rec ok "símbolos retirados desaparecen de EFF_ENABLE/EFF_CRITICAL/EFF_SETVAL"
+else
+  rec fail "un símbolo retirado sigue exigido en los arrays efectivos"
+fi
+unset _contains_ok
+if [ "${#EFF_CRITICAL[@]}" = 1 ] && [ "${EFF_CRITICAL[0]}" = X86_NATIVE_CPU ]; then
+  rec ok "EFF_CRITICAL conserva solo el símbolo realizable (SCHED_AUTOGROUP retirado)"
+else
+  rec fail "EFF_CRITICAL inesperado tras retiro: ${EFF_CRITICAL[*]:-}"
+fi
+# _contains_ok=${#...}; retirados de SETVAL
+if [ -z "${EFF_SETVAL[PSI]+x}" ] && [ -z "${EFF_SETVAL[PSI_DEFAULT_DISABLED]+x}" ]; then
+  rec ok "PSI y PSI_DEFAULT_DISABLED retirados de EFF_SETVAL"
+else
+  rec fail "SETVAL mantiene símbolos retirados: ${!EFF_SETVAL[*]}"
+fi
+# check_profile_contradictions no debe fatal con el retiro
+if check_profile_contradictions 2>/dev/null; then
+  rec ok "check_profile_contradictions tolera el retiro (sin falsa contradicción)"
+else
+  rec fail "check_profile_contradictions rompió tras retirar símbolos"
 fi
 
 # --- resumen ---

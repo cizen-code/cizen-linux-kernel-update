@@ -128,7 +128,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.5"
+SCRIPT_VERSION="27.31.6"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -219,6 +219,11 @@ declare -a PATCH_ENABLE_ALL=() PATCH_REBEL_ALL=()
 # Símbolos que un parche obliga a DESACTIVAR para fijar una "choice" Kconfig
 # (p. ej. elegir SCHED_PDS exige CONFIG_SCHED_BMQ=n). Selectores de scheduler.
 declare -a PATCH_DISABLE_ALL=()
+# Símbolos que un scheduler alternativo (SCHED_ALT) RETIRA del kernel: su
+# Kconfig los hace imposibles (`depends on !SCHED_ALT`). Si el perfil los
+# exigía (CRITICAL/SETVAL/ENABLE), build_effective_arrays los excluye de la
+# exigencia y la validación los reporta como retirados por diseño del parche.
+declare -a PATCH_RETIRED_ALL=()
 declare -A PATCH_KCONFIG_FILTER=()   # símbolos nuevos esperados de parches/BTF
 # BTF por defecto activo (el perfil lo trae =y): systemd/bpf-restrict-fs lo
 # necesita. Se desactiva con --no-btf / CIZEN_NO_BTF=1.
@@ -1397,6 +1402,28 @@ build_effective_arrays() {
     [ -n "$__ps" ] || continue
     add_unique disable "$__ps"
     EXPECTED_REBEL_SET["$__ps"]=1
+  done
+  unset __ps
+
+  # Símbolos que el scheduler alternativo RETIRA del kernel (dependen de
+  # !SCHED_ALT): son imposibles de habilitar por diseño del parche, aunque el
+  # perfil los exija como CRITICAL/SETVAL/ENABLE. Se eliminan de todas las
+  # exigencias efectivas para que la validación degenere a aviso informativo en
+  # lugar de un FATAL (v27.31.6: BMQ/PDS/LFBMQ con SCHED_ALT sobre cachyos-7.2).
+  for __ps in "${PATCH_RETIRED_ALL[@]:-}"; do
+    [ -n "$__ps" ] || continue
+    local __n=() __v
+    for __v in "${EFF_ENABLE[@]}"; do
+      [ "$__v" != "$__ps" ] && __n+=("$__v")
+    done
+    EFF_ENABLE=("${__n[@]}")
+    __n=()
+    for __v in "${EFF_CRITICAL[@]}"; do
+      [ "$__v" != "$__ps" ] && __n+=("$__v")
+    done
+    EFF_CRITICAL=("${__n[@]}")
+    unset "EFF_SETVAL[$__ps]" "EFF_SETSTR[$__ps]"
+    unset "EXPECTED_REBEL_SET[$__ps]" "SEEN_ENABLE[$__ps]" "SEEN_CRITICAL[$__ps]"
   done
   unset __ps
 
@@ -4738,6 +4765,12 @@ _patch_desc_scheduler_base() {
   # select GENERIC_ALLOCATOR en SCHED_CLASS_EXT). Se prueba DESPUÉS del main y
   # ANTES del fallback upstream, siempre validado por dry-run contra $SRC.
   PATCH_EMBED_B64=""
+  # Símbolos que este scheduler alternativo retira del kernel (deben poder
+  # mantenerse en OPTS_* del perfil sin bloquear la validación): con SCHED_ALT
+  # activo, init/Kconfig los hace imposibles vía `depends on !SCHED_ALT`.
+  # BMQ/PDS/LFBMQ activan SCHED_ALT (PSI, NUMA_BALANCING, SCHED_CACHE y
+  # SCHED_AUTOGROUP quedan fuera; PSI_DEFAULT_DISABLED cae por depender de PSI).
+  PATCH_RETIRED_SYMBOLS=()
   # PRJC/MuQSS solo se publican como parches -cachy que aplican sobre el árbol
   # del fork CachyOS/linux, nunca sobre la release vanilla de kernel.org.
   PATCH_TREE_REQUIRED="cachyos"
@@ -4751,6 +4784,7 @@ _patch_desc_scheduler_base() {
       PATCH_EMBED_B64="$(patch_embed_b64_prjc_cachy)"
       PATCH_SYMBOLS=(SCHED_ALT SCHED_PDS)
       PATCH_CHOICE_DISABLE=(SCHED_BMQ)
+      PATCH_RETIRED_SYMBOLS=(PSI PSI_DEFAULT_DISABLED SCHED_AUTOGROUP NUMA_BALANCING SCHED_CACHE)
       PATCH_MAGIC="config SCHED_PDS"
       PATCH_MARKERS=( "kernel/sched/alt_core.c:" "kernel/sched/pds.h:" "kernel/sched/sched.h:SCHED_PDS" )
       ;;
@@ -4763,6 +4797,7 @@ _patch_desc_scheduler_base() {
       PATCH_EMBED_B64="$(patch_embed_b64_prjc_cachy)"
       PATCH_SYMBOLS=(SCHED_ALT SCHED_BMQ)
       PATCH_CHOICE_DISABLE=(SCHED_PDS)
+      PATCH_RETIRED_SYMBOLS=(PSI PSI_DEFAULT_DISABLED SCHED_AUTOGROUP NUMA_BALANCING SCHED_CACHE)
       PATCH_MAGIC="config SCHED_BMQ"
       PATCH_MARKERS=( "kernel/sched/alt_core.c:" "kernel/sched/bmq.h:" "kernel/sched/sched.h:SCHED_BMQ" )
       ;;
@@ -4774,6 +4809,7 @@ _patch_desc_scheduler_base() {
       PATCH_CACHE_NAME="prjc-lfbmq"
       PATCH_SYMBOLS=(SCHED_ALT SCHED_LFBMQ)
       PATCH_CHOICE_DISABLE=(SCHED_PDS SCHED_BMQ)
+      PATCH_RETIRED_SYMBOLS=(PSI PSI_DEFAULT_DISABLED SCHED_AUTOGROUP NUMA_BALANCING SCHED_CACHE)
       PATCH_MAGIC="config SCHED_LFBMQ"
       PATCH_MARKERS=( "kernel/sched/alt_core.c:" "kernel/sched/sched.h:SCHED_LFBMQ" )
       ;;
@@ -4876,6 +4912,11 @@ apply_patch_register() {
   # Elección de variante dentro de la "choice" Kconfig del scheduler.
   for s in "${PATCH_CHOICE_DISABLE[@]:-}"; do
     [ -n "$s" ] && PATCH_DISABLE_ALL+=("$s")
+  done
+  # Símbolos retirados por el parche (dependen de !SCHED_ALT): build_effective_
+  # arrays los quita de CRITICAL/SETVAL/ENABLE (no son posibles de habilitar).
+  for s in "${PATCH_RETIRED_SYMBOLS[@]:-}"; do
+    [ -n "$s" ] && PATCH_RETIRED_ALL+=("$s")
   done
   unset s
   if [ "$p" = "bore" ]; then
@@ -5883,6 +5924,11 @@ validate_config() {
   if [ "${#DISABLE_WARN[@]}" -gt 0 ]; then
     warn "Hay ${#DISABLE_WARN[@]} desactivaciones que Kconfig NO resolvió como se esperaba:"
     for x in "${DISABLE_WARN[@]}"; do warn "    $x"; done
+  fi
+
+  if [ "${#PATCH_RETIRED_ALL[@]}" -gt 0 ]; then
+    info "Símbolos retirados por el scheduler alternativo activo (dependen de !SCHED_ALT; los pidió el perfil pero este kernel no puede habilitarlos):"
+    for x in "${PATCH_RETIRED_ALL[@]:-}"; do info "    $x"; done
   fi
 
   if [ "${#APPLIED_RENAMES[@]}" -gt 0 ]; then

@@ -1,3 +1,30 @@
+## [27.31.6] - 2026-09-24
+
+Al compilar un kernel del fork CachyOS con scheduler alternativo (bmq/pds/lfbmq,
+`SCHED_ALT=y`), los símbolos CFS que `init/Kconfig` hace dependientes de
+`!SCHED_ALT` (PSI, PSI_DEFAULT_DISABLED, NUMA_BALANCING, SCHED_CACHE y
+SCHED_AUTOGROUP) son **imposibles** de habilitar: `olddefconfig` los deja fuera y
+la validación del perfil los bloqueaba con FATAL aunque el usuario no los hubiera
+pedido mal.
+
+- Nuevo mecanismo `PATCH_RETIRED_SYMBOLS`: cada descriptor de scheduler declara
+  qué símbolos retira (`_patch_desc_scheduler_base`; bmq/pds/lfbmq). Al
+  registrarse el parche, `apply_patch_register` los acumula en `PATCH_RETIRED_ALL`
+  y `build_effective_arrays` los elimina de EFF_ENABLE/EFF_CRITICAL/EFF_SETVAL/
+  EFF_SETSTR (incluidos SEEN y EXPECTED_REBEL_SET), de modo que la validación deja
+  de exigirlos y pasa a informarlos como "retirados por el scheduler alternativo".
+- El perfil `cizen-optiplex7050` (que exige PSI=y, PSI_DEFAULT_DISABLED=n y
+  SCHED_AUTOGROUP) ya no rompe el build de 7.2.7+bmq/clang con los 3 fallos FATAL
+  de config; ahora son un aviso informativo.
+- Bash-ism robusto: la reconstrucción de arrays usa `local` correcto y no deja
+  referencias a variables del bucle; `bash -n` y selftest 112/112 OK.
+- Fix: el reporte informativo de retirados usaba `${#PATCH_RETIRED_ALL[@]:-0}`, que
+  es bad substitution de bash (no válido con `${#arr[@]}`; `:-0` no aplica). El
+  run real de la opción 14 (bmq/clang) abortó ahí tras pasar toda la validación
+  (VALIDACIÓN 38/38… SETSTR 2/2). Corregido a `${#PATCH_RETIRED_ALL[@]}` con la
+  guarda `-gt 0`; se añadió al harness un test que detecta el patrón
+  `${#arr[@]:-...}` en el motor. Selftest 113/113 OK (repo e instalado).
+
 ## [27.31.5] - 2026-09-24
 
 Compila los kernels del fork CachyOS con su scheduler PRJC (bmq/pds) incluso cuando
