@@ -907,6 +907,12 @@ else
   rec fail "modprobed-db: falta la exención explícita (--no-modprobed-db)"
 fi
 
+if grep -qE '"\$_pf_uid" = "0"' "$MOTOR"; then
+  rec ok "perfil: acepta propietario root o del usuario actual (instalación con sudo)"
+else
+  rec fail "perfil: el check sigue exigiendo solo el uid del usuario actual"
+fi
+
 # --- resumen ---
 echo
 printf 'Totales: %d ok, %d fail\n' "$PASS" "$FAIL"

@@ -1,3 +1,14 @@
+## [27.31.12] - 2026-09-25
+
+Fix del arranque del motor cuando el perfil se instaló con `sudo` (propietario
+root uid 0): el perfil se ejecuta con `source` y el chequeo de confianza exigía
+`_pf_uid == id -u`, abortando para el usuario normal incluso con una instalación
+de sistema legítima. Ahora se acepta también **root (uid 0)**; el otro criterio
+sigue intacto (no escribible por grupo u otros usuarios, `mode` sin 2/3/6/7).
+Un perfil root `755` es de mayor confianza, no menor: solo root puede
+modificarlo. Selftest 129→130 (test del nuevo chequeo). Deploy con paridad
+sha256 (motor `f0c84d62…`, selftest `19a877e3…`).
+
 ## [27.31.11] - 2026-09-25
 
 `modprobed-db` deja de ser opt-in: el motor pasa a **auto-descubrimiento por

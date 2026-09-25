@@ -128,7 +128,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.11"
+SCRIPT_VERSION="27.31.12"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -1320,10 +1320,12 @@ load_profile() {
 [ -f "$PROFILE_FILE" ] || fatal "No existe el perfil Cizen: $PROFILE_FILE"
 
 # El perfil externo se ejecuta con `source`, así que debe estar bajo control
-# del usuario actual y no ser escribible por grupo u otros usuarios.
+# del usuario actual (o de root en una instalación de sistema vía sudo) y no
+# ser escribible por grupo u otros usuarios.
 _pf_uid="$(stat -c '%u' "$PROFILE_FILE" 2>/dev/null || echo -1)"
 _pf_mode="$(stat -c '%a' "$PROFILE_FILE" 2>/dev/null || echo 000)"
-[ "$_pf_uid" = "$(id -u)" ] || fatal "El perfil '$PROFILE_FILE' no pertenece al usuario actual (uid=$_pf_uid)."
+[ "$_pf_uid" = "$(id -u)" ] || [ "$_pf_uid" = "0" ] || \
+  fatal "El perfil '$PROFILE_FILE' no pertenece al usuario actual ni a root (uid=$_pf_uid)."
 case "${_pf_mode: -2}" in
   *[2367]*) fatal "El perfil '$PROFILE_FILE' es escribible por grupo u otros usuarios (mode=$_pf_mode)." ;;
 esac
