@@ -123,6 +123,17 @@ extract() { # $1 = nombre de función (hasta el `}` inicial en columna 0)
   extract apply_cachy_misc_single
   extract apply_cachy_misc_patchset
   extract secure_boot_guided_setup
+  # v27.31.17: identidad del árbol de fuentes y desmontaje inteligente
+  extract source_tree_valid
+  extract source_tree_kind
+  extract tree_identity
+  extract tmpfs_is_mounted
+  extract tmpfs_umount_all
+  extract auto_add_ntsync_patch
+  extract tree_usable_for
+  extract source_tree_reusable
+  extract write_tree_meta
+  extract reconcile_tmpfs_trees
 } > "$ROOT/fns.sh"
 
 if [ ! -s "$ROOT/fns.sh" ]; then
@@ -417,6 +428,63 @@ if resolve_cachyos_release 7.2.7; then
     || rec fail "sondeo: tagrel=$CACHYOS_TAGREL (esperado 3)"
 else
   rec fail "resolve_cachyos_release falló en el camino de sondeo directo"
+fi
+
+printf '%s\n' "== resolve_cachyos_release (v27.31.15): versión sin publicar en el fork bajo set -Eeuo pipefail =="
+# El motor corre con `set -Eeuo pipefail` + trap ERR. Si el fork todavía no
+# publicó la versión (la recién salida en kernel.org), el último grep de la
+# tubería se quedaba sin entrada y devolvía 1: con pipefail eso MATABA la run
+# ("Error 1 en línea N: tail -n1") sin llegar al sondeo directo ni al fatal
+# explicativo. Aquí se reproduce ese marco y el marcador solo se escribe si la
+# función llega a su propio fatal.
+# OJO: el marco va en un subshell SIN `||`/`&&` alrededor; una sustitución de
+# comandos metida en una lista `||` hereda errexit desactivado y el test
+# pasaría siempre (falso verde). Los marcadores van a un fichero.
+probe_cachyos() { # $1 = versión -> rastro en $ROOT/probe.out, rc en $_probe_rc
+  rm -f -- "$ROOT/probe.out"
+  (
+    set -Eeuo pipefail
+    fatal() { printf 'REACHED-FATAL\n' >> "$ROOT/probe.out"; return 1; }
+    CACHYOS_TAGREL=""
+    resolve_cachyos_release "$1"
+    printf 'TAGREL=%s\n' "$CACHYOS_TAGREL" >> "$ROOT/probe.out"
+  )
+  _probe_rc=$?
+  return 0
+}
+download_file() {
+  local url="$1" out="$2"
+  case "$url" in
+    *"releases?per_page=20") cat > "$out" <<'JSON'
+[
+  {"tag_name": "cachyos-7.2.7-1", "draft": false},
+  {"tag_name": "cachyos-7.3-rc4-1", "draft": false},
+  {"tag_name": "cachyos-7.2.6-1", "draft": false}
+]
+JSON
+      return 0 ;;
+  esac
+  return 1
+}
+probe_cachyos 7.2.8
+if grep -q REACHED-FATAL "$ROOT/probe.out" 2>/dev/null; then
+  rec ok "fork sin esa versión: la tubería no aborta la run (llega a su fatal)"
+else
+  rec fail "fork sin esa versión: la tubería aborta antes del fatal (rc=$_probe_rc; rastro: $(cat "$ROOT/probe.out" 2>/dev/null || echo ninguno))"
+fi
+# Y el camino feliz no se rompe por el `|| true` de la guarda.
+download_file() {
+  local url="$1" out="$2"
+  case "$url" in
+    *"releases?per_page=20") printf '%s\n' "$(releases_json)" > "$out"; return 0 ;;
+  esac
+  return 1
+}
+probe_cachyos 7.2.7
+if grep -q '^TAGREL=2$' "$ROOT/probe.out" 2>/dev/null; then
+  rec ok "fork con esa versión: la guarda '|| true' no rompe la resolución"
+else
+  rec fail "con la guarda '|| true' dejó de resolver (rc=$_probe_rc; rastro: $(cat "$ROOT/probe.out" 2>/dev/null || echo ninguno))"
 fi
 
 printf '%s\n' "== apply_patch_plugin: guardia de árbol del fork (bmq sobre vanilla) =="
@@ -912,6 +980,346 @@ if grep -qE '"\$_pf_uid" = "0"' "$MOTOR"; then
 else
   rec fail "perfil: el check sigue exigiendo solo el uid del usuario actual"
 fi
+
+# Orden de definiciones: bash ejecuta el archivo secuencialmente, así que una
+# llamada top-level a una función definida más abajo aborta con "orden no
+# encontrada" aunque `bash -n` pase. Pasó dos veces: v27.31.13 con
+# collect_build_artifact y v27.31.17 con kernel_version_ge (además dentro de un
+# `! ...`, donde el 127 no abortaba pero invertía la decisión: ntsync se
+# añadía a TODOS los kernels). Texto en dos pasadas: definiciones, luego
+# llamadas del flujo principal. Se examina toda la línea, no solo $1, para
+# pillar también las llamadas dentro de condiciones (`if ! f ...`, `x && f`).
+find_late_calls() {
+  # sq = comilla simple (el programa awk va entrecomillado simple: no puede
+  # llevar comillas simples dentro).
+  local sq="'"
+  awk -v sq="$sq" '
+    FNR == NR {
+      if ($0 ~ /^[A-Za-z_][A-Za-z0-9_]*\(\)[ \t]*\{/) {
+        n = $0; sub(/\(\)[ \t]*\{.*$/, "", n)
+        if (!(n in def)) def[n] = FNR
+      }
+      next
+    }
+    $0 ~ /^#/ || $0 ~ /^[[:space:]]/ { next }
+    {
+      line = $0
+      gsub(/"[^"]*"/, "", line); gsub(sq "[^" sq "]*" sq, "", line)   # fuera las cadenas
+      # Solo interesan los nombres que SON funciones definidas en el fichero
+      # (así no hay falsos positivos con cualquier palabra) y solo si la
+      # definición está por debajo. En shell una llamada no lleva paréntesis:
+      # `! kernel_version_ge "$v" 6.10` es una llamada igual que `f(x)`.
+      for (name in def) {
+        if (FNR >= def[name]) continue
+        if (line ~ ("(^|[^A-Za-z0-9_])" name "([^A-Za-z0-9_]|$)"))
+          print name " (línea " FNR ", def " def[name] ")"
+      }
+    }
+  ' "$1" "$1" | sort -u
+}
+_late_calls="$(find_late_calls "$MOTOR")"
+if [ -z "$_late_calls" ]; then
+  rec ok "orden de funciones: ninguna llamada top-level anterior a su definición"
+else
+  rec fail "orden de funciones: llamadas top-level antes de su def -> $(printf '%s; ' $_late_calls)"
+fi
+# El detector no puede ser vacuo: con el mismo análisis, un fichero que llama
+# antes de definir SÍ tiene que aparecer.
+printf 'tope() {\n  :\n}\nif ! helper; then\n  tope\nfi\nhelper() {\n  :\n}\n' > "$ROOT/late.sh"
+if [ -n "$(find_late_calls "$ROOT/late.sh")" ]; then
+  rec ok "detector de orden: detecta también llamadas dentro de condiciones"
+else
+  rec fail "detector de orden: no ve una llamada claramente tardía (test inútil)"
+fi
+# Y el ntsync automático: solo para kernels sin soporte nativo.
+declare -a _pn=()
+PATCH_NAMES=(); VERSION=7.2.7; CIZEN_PATCH_NTSYNC=0; auto_add_ntsync_patch
+[ "${PATCH_NAMES[*]:-}" = "" ] && rec ok "ntsync: 7.2.7 (soporte nativo) no añade el parche" \
+  || rec fail "ntsync: 7.2.7 añadió '${PATCH_NAMES[*]:-}'"
+CIZEN_PATCH_NTSYNC=1
+PATCH_NAMES=(); VERSION=6.9.1; auto_add_ntsync_patch
+[ "${PATCH_NAMES[*]:-}" = "ntsync" ] && rec ok "ntsync: 6.9.1 (sin soporte nativo) añade el parche" \
+  || rec fail "ntsync: 6.9.1 no añadió el parche"
+PATCH_NAMES=(bmq); VERSION=6.9.1; auto_add_ntsync_patch
+[ "${PATCH_NAMES[*]:-}" = "bmq ntsync" ] && rec ok "ntsync: se añade sin pisar el scheduler elegido" \
+  || rec fail "ntsync: '${PATCH_NAMES[*]:-}'"
+PATCH_NAMES=(ntsync); VERSION=6.9.1; auto_add_ntsync_patch
+[ "${PATCH_NAMES[*]:-}" = "ntsync" ] && rec ok "ntsync: no se duplica si ya está pedido" \
+  || rec fail "ntsync: duplicado ('${PATCH_NAMES[*]:-}')"
+PATCH_NAMES=(); VERSION=6.9.1; CIZEN_PATCH_NTSYNC=0; auto_add_ntsync_patch
+[ "${PATCH_NAMES[*]:-}" = "" ] && rec ok "ntsync: CIZEN_PATCH_NTSYNC=0 lo desactiva" \
+  || rec fail "ntsync: CIZEN_PATCH_NTSYNC=0 no lo desactiva"
+PATCH_NAMES=(); VERSION=""; CIZEN_PATCH_NTSYNC=0; auto_add_ntsync_patch
+[ "${PATCH_NAMES[*]:-}" = "" ] && rec ok "ntsync: sin VERSION (--check-update) no decide nada" \
+  || rec fail "ntsync: sin VERSION añadió '${PATCH_NAMES[*]:-}'"
+
+# --- kernel-update-menu.sh: aviso de versión ausente en el fork (v27.31.16) ---
+# El menú avisa antes de compilar cuando la stable de kernel.org todavía no
+# está publicada en CachyOS/linux (ahí es donde viven pds/bmq/lfbmq/muqss).
+MENU="$(dirname "$MOTOR")/kernel-update-menu.sh"
+if [ -r "$MENU" ]; then
+  bash -n "$MENU" 2>/dev/null \
+    && rec ok "menú: bash -n limpio" \
+    || rec fail "menú: no pasa bash -n"
+  sed -n '/^load_fork_tags() {/,/^}/p; /^fork_tagrel() {/,/^}/p; /^fork_latest_minor() {/,/^}/p' \
+    "$MENU" > "$ROOT/menufns.sh"
+  if [ -s "$ROOT/menufns.sh" ]; then
+    # shellcheck disable=SC1090,SC1091
+    source "$ROOT/menufns.sh"
+    _ft() { FORK_TAGS="$1"; shift; "$@" 2>/dev/null; }
+    _tags_real='cachyos-7.2.7-1
+cachyos-7.2.7-2
+cachyos-7.3-rc4-1
+cachyos-7.2.6-1
+cachyos-6.18.52-1'
+    if [ -z "$(_ft "$_tags_real" fork_tagrel 7.2.8)" ] \
+       && [ "$(_ft "$_tags_real" fork_tagrel 7.2.7)" = "2" ]; then
+      rec ok "menú fork: 7.2.8 no existe (vacío) y 7.2.7 da el tagrel mayor (2)"
+    else
+      rec fail "menú fork: tagrel mal calculado (7.2.8='$(_ft "$_tags_real" fork_tagrel 7.2.8)' 7.2.7='$(_ft "$_tags_real" fork_tagrel 7.2.7)')"
+    fi
+    if [ "$(_ft "$_tags_real" fork_latest_minor 7.2.8)" = "7.2.7" ] \
+       && [ -z "$(_ft "$_tags_real" fork_latest_minor 7.3.1)" ]; then
+      rec ok "menú fork: fallback de la línea 7.2.x = 7.2.7 y 7.3 (solo rc) no inventa release"
+    else
+      rec fail "menú fork: fallback incorrecto (7.2.8 -> '$(_ft "$_tags_real" fork_latest_minor 7.2.8)', 7.3.1 -> '$(_ft "$_tags_real" fork_latest_minor 7.3.1)')"
+    fi
+    if [ -z "$(_ft "$_tags_real
+cachyos-7.2.80-1" fork_tagrel 7.2.8)" ]; then
+      rec ok "menú fork: 7.2.80 no se confunde con 7.2.8 (regex anclada)"
+    else
+      rec fail "menú fork: 7.2.80 se confundió con 7.2.8"
+    fi
+  else
+    rec fail "menú: no se pudieron extraer load_fork_tags/fork_tagrel/fork_latest_minor"
+  fi
+  # Sin red el menú no debe avisar ni bloquear (fail-open), y la pregunta de la
+  # versión alternativa solo se hace en terminal.
+  if grep -q '\[ -n "\$tags" \] || return 1' "$MENU" \
+     && grep -q 'CIZEN_MENU_SKIP_FORK_CHECK' "$MENU" \
+     && grep -q 'FORK_TAGS_TTL' "$MENU" \
+     && grep -q '\[ -t 0 \]' "$MENU"; then
+    rec ok "menú fork: fail-open sin red, caché con TTL y pregunta solo en TTY"
+  else
+    rec fail "menú fork: falta el fail-open, la caché con TTL o la guarda de TTY"
+  fi
+else
+  printf '  (sin %s: se omiten los tests del menú)\n' "$MENU"
+fi
+
+# --- identidad del árbol de fuentes y desmontaje inteligente (v27.31.17) ---
+# El directorio del árbol solo lleva la versión, así que dos builds con
+# distinto parche/scheduler (vanilla vs cachyos) o distinta versión pueden
+# acabar en el mismo camino. Reutilizar el equivocado no falla de forma
+# visible: o compila el kernel que no es, o revienta con ENOSPC a mitad.
+printf '%s\n' "== source_tree_kind / tree_identity / source_tree_reusable =="
+TREE_META_NAME=".cizen-tree"
+CIZEN_KEEP_TMPFS=0
+CIZEN_SMART_UMOUNT=1
+TREE_FORCE_NOTE=""
+TMPFS_MOUNTED=true
+TMPFS_CREATED_BY_SCRIPT=false
+TMPFS_ROOT="$ROOT/tmpfs"
+rm -rf "$TMPFS_ROOT"; mkdir -p "$TMPFS_ROOT"
+# El estado del "tmpfs" vive en ficheros, no en variables del shell: las
+# funciones del motor lo consultan dentro de tuberías (subshell) y un contador
+# en variable se perdería en cada "|".
+MOUNTED_FLAG="$ROOT/tmpfs.mounted"
+STACKED_FLAG="$ROOT/tmpfs.stacked"
+BUSY_FLAG="$ROOT/tmpfs.busy"
+: > "$MOUNTED_FLAG"; rm -f "$STACKED_FLAG" "$BUSY_FLAG"
+findmnt() { # stub del tmpfs de pruebas: -M TARGET/FSTYPE, como findmnt -M real
+  case "$*" in
+    *FSTYPE*) [ -f "$MOUNTED_FLAG" ] || return 1; printf 'tmpfs\n'; return 0 ;;
+    *TARGET*) [ -f "$MOUNTED_FLAG" ] || return 1
+              local n i
+              n="$(cat "$STACKED_FLAG" 2>/dev/null || echo 1)"
+              i=0; while [ "$i" -lt "$n" ]; do printf '%s\n' "$TMPFS_ROOT"; i=$((i + 1)); done
+              return 0 ;;
+  esac
+  command findmnt "$@"
+}
+sudo() { # stub: registra la llamada y "desmonta" de verdad (baja un montaje)
+  case "$*" in
+    *umount*) printf '%s\n' "$*" >> "$ROOT/umount.log"
+              if [ -f "$BUSY_FLAG" ]; then return 1; fi
+              if [ -f "$STACKED_FLAG" ]; then
+                local n; n="$(cat "$STACKED_FLAG")"
+                if [ "$n" -gt 1 ]; then echo $((n - 1)) > "$STACKED_FLAG"
+                else rm -f "$STACKED_FLAG" "$MOUNTED_FLAG"; fi
+              else
+                rm -f "$MOUNTED_FLAG"
+              fi ;;
+  esac
+  return 0
+}
+
+_mktree() { # $1=versión $2=tipo -> crea el árbol con su testigo
+  local d="$TMPFS_ROOT/linux-$1" k="$2"
+  mkdir -p "$d/kernel/sched"
+  : > "$d/Makefile"; : > "$d/kernel/Makefile"
+  [ "$k" = "cachyos" ] && : > "$d/kernel/sched/poc_selector.c"
+  printf 'version=%s\nkind=%s\n' "$1" "$k" > "$d/$TREE_META_NAME"
+  printf '%s' "$d"
+}
+SRC="$(_mktree 7.2.7 cachyos)"
+VERSION=7.2.7
+KERNEL_TREE=cachyos
+source_tree_reusable && rec ok "árbol cachyos 7.2.7 reutilizable para un build cachyos 7.2.7" \
+  || rec fail "árbol cachyos 7.2.7 debería ser reutilizable"
+[ "$(tree_identity "$SRC")" = "7.2.7|cachyos" ] \
+  && rec ok "identidad leída del testigo .cizen-tree" || rec fail "identidad: $(tree_identity "$SRC")"
+
+VERSION=7.2.7; KERNEL_TREE=vanilla
+! source_tree_reusable \
+  && rec ok "el MISMO árbol no se reutiliza para un build vanilla (bmq es lo que fuerza cachyos)" \
+  || rec fail "un árbol cachyos se reutilizó para vanilla: mezcla de árboles"
+VERSION=7.2.8; KERNEL_TREE=cachyos
+! source_tree_reusable && rec ok "otra versión tampoco es reutilizable" || rec fail "versión distinta reutilizada"
+VERSION=7.2.7; KERNEL_TREE=cachyos
+source_tree_reusable || rec fail "el árbol propio dejó de ser reutilizable"
+
+# Sin testigo (árbol de una versión anterior de la herramienta): la identidad
+# se deduce del árbol (kernel/sched/poc_selector.c = cachyos).
+SRC="$TMPFS_ROOT/linux-7.2.9"; mkdir -p "$SRC/kernel/sched"
+: > "$SRC/Makefile"; : > "$SRC/kernel/Makefile"
+: > "$SRC/kernel/sched/poc_selector.c"
+VERSION=7.2.9; KERNEL_TREE=cachyos
+if [ "$(tree_identity "$SRC")" = "7.2.9|cachyos" ] && source_tree_reusable; then
+  rec ok "árbol sin testigo: la identidad se deduce del propio árbol"
+else
+  rec fail "árbol sin testigo mal identificado: $(tree_identity "$SRC")"
+fi
+VERSION=7.2.7; KERNEL_TREE=cachyos
+
+printf '%s\n' "== reconcile_tmpfs_trees: purga y desmontaje inteligente =="
+# El caso real del usuario: hay un vanilla 7.2.8 en el tmpfs y se va a
+# compilar 7.2.7 del fork (bmq). No se mezcla: se descarta y, como no queda
+# nada aprovechable y el tmpfs no guarda nada más, se desmonta entero.
+rm -rf "$TMPFS_ROOT"; mkdir -p "$TMPFS_ROOT"
+: > "$MOUNTED_FLAG"; rm -f "$STACKED_FLAG" "$ROOT/umount.log"
+SRC="$TMPFS_ROOT/linux-7.2.7"
+_mktree 7.2.8 vanilla >/dev/null
+TREE_FORCE_NOTE="lo fuerza el parche/scheduler 'bmq' (solo existe en el fork CachyOS/linux)"
+reconcile_tmpfs_trees
+if [ ! -d "$TMPFS_ROOT/linux-7.2.8" ] && grep -q '^umount ' "$ROOT/umount.log" \
+   && [ "$TMPFS_MOUNTED" = false ] && [ ! -f "$MOUNTED_FLAG" ]; then
+  rec ok "árbol vanilla incompatible: descartado y tmpfs desmontado (RAM devuelta)"
+else
+  rec fail "no se descartó/desmontó como se esperaba (umount.log: $(tr '\n' ' ' < "$ROOT/umount.log" 2>/dev/null))"
+fi
+
+# Con algo más que conservar en el tmpfs (p. ej. un paquete) NO se desmonta:
+# solo se purgan los árboles que no sirven.
+: > "$MOUNTED_FLAG"; TMPFS_MOUNTED=true; : > "$ROOT/umount.log"
+_mktree 7.2.8 vanilla >/dev/null
+: > "$TMPFS_ROOT/linux-7.2.7-cizen-v3-1-x86_64.pkg.tar.zst"
+reconcile_tmpfs_trees
+if [ ! -d "$TMPFS_ROOT/linux-7.2.8" ] && [ -f "$TMPFS_ROOT/linux-7.2.7-cizen-v3-1-x86_64.pkg.tar.zst" ] \
+   && [ ! -s "$ROOT/umount.log" ] && [ "$TMPFS_MOUNTED" = true ]; then
+  rec ok "con un paquete en el tmpfs: se purga el árbol pero no se desmonta"
+else
+  rec fail "no se respetó el paquete del tmpfs (umount.log: $(tr '\n' ' ' < "$ROOT/umount.log" 2>/dev/null))"
+fi
+
+# Si el árbol de este build es correcto, no se toca nada ni se desmonta.
+rm -f "$TMPFS_ROOT"/*.pkg.tar.zst; : > "$ROOT/umount.log"; TMPFS_MOUNTED=true
+SRC="$(_mktree 7.2.7 cachyos)"; _mktree 7.2.8 vanilla >/dev/null
+reconcile_tmpfs_trees
+if [ -d "$TMPFS_ROOT/linux-7.2.7" ] && [ ! -d "$TMPFS_ROOT/linux-7.2.8" ] \
+   && [ ! -s "$ROOT/umount.log" ] && [ "$TMPFS_MOUNTED" = true ]; then
+  rec ok "árbol propio reutilizable: se conserva y se purga el ajeno, sin desmontar"
+else
+  rec fail "el árbol reutilizable no se conservó (umount.log: $(tr '\n' ' ' < "$ROOT/umount.log" 2>/dev/null))"
+fi
+
+# CIZEN_SMART_UMOUNT=0 y CIZEN_KEEP_TMPFS=1: se purga dentro, sin desmontar.
+for v in CIZEN_SMART_UMOUNT=0 CIZEN_KEEP_TMPFS=1; do
+  rm -rf "$TMPFS_ROOT"; mkdir -p "$TMPFS_ROOT"
+  : > "$MOUNTED_FLAG"; TMPFS_MOUNTED=true
+  SRC="$TMPFS_ROOT/linux-7.2.7"; _mktree 7.2.8 vanilla >/dev/null
+  : > "$ROOT/umount.log"
+  if [ "$v" = "CIZEN_SMART_UMOUNT" ]; then CIZEN_SMART_UMOUNT=0; else CIZEN_KEEP_TMPFS=1; fi
+  reconcile_tmpfs_trees
+  if [ ! -d "$TMPFS_ROOT/linux-7.2.8" ] && [ ! -s "$ROOT/umount.log" ] && [ "$TMPFS_MOUNTED" = true ]; then
+    rec ok "$v: purga en sitio sin desmontar"
+  else
+    rec fail "$v: comportamiento inesperado (umount.log: $(tr '\n' ' ' < "$ROOT/umount.log" 2>/dev/null))"
+  fi
+  unset "$v"
+done
+CIZEN_SMART_UMOUNT=1; CIZEN_KEEP_TMPFS=0
+
+# Un árbol a medias (extracción interrumpida: tiene Makefile y su identidad,
+# pero el testigo de "extrayéndose" sigue vivo) NO es reutilizable: si lo fuera,
+# la siguiente build compilaría contra un árbol incompleto.
+rm -rf "$TMPFS_ROOT"; mkdir -p "$TMPFS_ROOT"
+: > "$MOUNTED_FLAG"; TMPFS_MOUNTED=true
+SRC="$(_mktree 7.2.7 cachyos)"
+VERSION=7.2.7; KERNEL_TREE=cachyos
+source_tree_reusable || rec fail "el árbol completo dejó de ser reutilizable"
+: > "$TMPFS_ROOT/.cizen-extracting-7.2.7"
+! source_tree_reusable \
+  && rec ok "árbol a medias (testigo de extracción vivo): no se reutiliza" \
+  || rec fail "un árbol a medio extraer se reutilizaría"
+: > "$ROOT/umount.log"
+reconcile_tmpfs_trees
+if [ ! -d "$TMPFS_ROOT/linux-7.2.7" ] && grep -q '^umount ' "$ROOT/umount.log" \
+   && [ ! -e "$TMPFS_ROOT/.cizen-extracting-7.2.7" ]; then
+  rec ok "el árbol a medias se descarta, se desmonta el tmpfs y vanish su testigo"
+else
+  rec fail "el árbol a medias no se descartó limpiamente (umount.log: $(tr '\n' ' ' < "$ROOT/umount.log" 2>/dev/null))"
+fi
+
+# El tmpfs sin montar no se toca (lo montará prepare_tmpfs_build).
+rm -f "$MOUNTED_FLAG" "$ROOT/umount.log"; TMPFS_MOUNTED=false
+mkdir -p "$TMPFS_ROOT/linux-7.2.8"; : > "$TMPFS_ROOT/linux-7.2.8/Makefile"
+reconcile_tmpfs_trees
+if [ ! -s "$ROOT/umount.log" ] && [ -d "$TMPFS_ROOT/linux-7.2.8" ]; then
+  rec ok "tmpfs no montado: la reconciliación no toca nada"
+else
+  rec fail "la reconciliación actuó sin tmpfs montado"
+fi
+
+# El motor llama a la reconciliación antes del chequeo de espacio, y el margen
+# de espacio se decide por identidad real, no por [ -d $SRC ].
+if grep -q '^reconcile_tmpfs_trees$' "$MOTOR" \
+   && [ "$(grep -c 'if source_tree_reusable; then' "$MOTOR")" -ge 3 ]; then
+  rec ok "el motor reconcilia antes de check_build_memory y usa source_tree_reusable en los 3 márgenes de espacio"
+else
+  rec fail "faltan la llamada a reconcile_tmpfs_trees o el uso de source_tree_reusable en los márgenes de espacio"
+fi
+
+# --- montajes apilados: el umount tiene que devolver toda la RAM ---------
+# Un umount interrumpido (proceso usando el tmpfs) deja montajes APILADOS en el
+# mismo punto. findmnt -M devuelve una línea por montaje, así que sin head -n1
+# las comparaciones veían "tmpfs\ntmpfs" y el motor se paraba con un error
+# ilegible; y un solo umount no devolvía la RAM, que es justo lo que se busca.
+: > "$MOUNTED_FLAG"; TMPFS_MOUNTED=true
+echo 3 > "$STACKED_FLAG"
+: > "$ROOT/umount.log"
+if tmpfs_umount_all && [ ! -f "$MOUNTED_FLAG" ] && [ "$(grep -c '^umount ' "$ROOT/umount.log")" -eq 3 ]; then
+  rec ok "tmpfs_umount_all: desmonta también los apilados (3 umount, tmpfs limpio)"
+else
+  rec fail "tmpfs_umount_all: log=$(tr '\n' ' ' < "$ROOT/umount.log" 2>/dev/null) stacked=$(cat "$STACKED_FLAG" 2>/dev/null || echo 0) montado=$([ -f "$MOUNTED_FLAG" ] && echo sí || echo no)"
+fi
+: > "$MOUNTED_FLAG"; TMPFS_MOUNTED=true; : > "$ROOT/umount.log"; : > "$BUSY_FLAG"
+if ! tmpfs_umount_all && [ -f "$MOUNTED_FLAG" ]; then
+  rec ok "tmpfs_umount_all: si está ocupado devuelve error en vez de forzar (-l)"
+else
+  rec fail "tmpfs_umount_all: no detectó el tmpfs ocupado"
+fi
+rm -f "$BUSY_FLAG"
+# Y el resto de consultas a findmnt del tmpfs toman solo la primera línea.
+_n_m="$(grep -c 'findmnt -n -M "\$TMPFS_ROOT"' "$MOTOR")"
+_n_h="$(grep 'findmnt -n -M "\$TMPFS_ROOT"' "$MOTOR" | grep -c 'head -n1\|grep -c\|grep -q')"
+if [ "$_n_m" = "$_n_h" ]; then
+  rec ok "findmnt: las $_n_m consultas del TMPFS_ROOT toleran montajes apilados"
+else
+  rec fail "findmnt: $_n_h de $_n_m consultas del TMPFS_ROOT toman solo la primera línea"
+fi
+unset -f findmnt sudo
+
 
 # --- resumen ---
 echo

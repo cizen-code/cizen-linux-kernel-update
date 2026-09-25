@@ -35,6 +35,7 @@ else
   C=""; G=""; Y=""; H=""; W=""; N=""
 fi
 R=$'\033[0;31m'     # error (se muestra tras una opción inválida)
+Y2=$'\033[1;31m'    # avisos deavailability (rojo)
 
 # ── Auto-descubrimiento de la última stable ───────────────────
 discover_remote() {
@@ -50,6 +51,60 @@ discover_remote() {
   printf '%s\n' "$latest"
 }
 
+# ── Estado del fork CachyOS ─────────────────────────────────────
+# v27.31.16: la stable que anuncia kernel.org va por delante de los releases del
+# fork CachyOS/linux (los schedulers pds/bmq/lfbmq/muqss SOLO existen ahí, así
+# que pedir la recién salida con uno de ellos aborta). El menú avisa antes, en
+# lugar de dejar que el build reviente a mitad.
+# Reglas: fail-open (sin red o API caída => no se avisa de nada y el menú sigue
+# igual), con caché para no pagar el sondeo en cada apertura, y nunca más de
+# unos segundos de espera.
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/kernel-update"
+FORK_TAGS_CACHE="${CIZEN_FORK_TAGS_CACHE:-$STATE_DIR/cachyos-fork-tags.cache}"
+FORK_TTL="${CIZEN_FORK_TAGS_TTL:-21600}"   # 6 h
+FORK_API="${CIZEN_FORK_RELEASES_API:-https://api.github.com/repos/CachyOS/linux/releases?per_page=20}"
+FORK_TAGS=""        # tags del fork conocidos (cachyos-<ver>-<tagrel>)
+
+load_fork_tags() {
+  [ "${CIZEN_MENU_SKIP_FORK_CHECK:-0}" = "1" ] && return 1
+  local now ts json tags
+  now="$(date +%s)"
+  if [ -r "$FORK_TAGS_CACHE" ]; then
+    ts="$(head -n1 "$FORK_TAGS_CACHE" 2>/dev/null || echo 0)"
+    case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
+    if [ "$ts" -gt 0 ] && [ "$(( now - ts ))" -lt "$FORK_TTL" ]; then
+      FORK_TAGS="$(tail -n +2 "$FORK_TAGS_CACHE" 2>/dev/null)"
+      if [ -n "$FORK_TAGS" ]; then return 0; fi
+    fi
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    json="$(curl -fsS --max-time 5 "$FORK_API" 2>/dev/null || true)"
+  elif command -v wget >/dev/null 2>&1; then
+    json="$(wget -qO- --timeout=5 --tries=1 "$FORK_API" 2>/dev/null || true)"
+  else
+    return 1
+  fi
+  tags="$(printf '%s' "$json" \
+    | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"cachyos-[^"]+"' \
+    | sed -E 's/.*"(cachyos-[^"]+)"/\1/' | sort -u)"
+  [ -n "$tags" ] || return 1        # sin red / API caída: no se avisa (fail-open)
+  FORK_TAGS="$tags"
+  if mkdir -p -- "$STATE_DIR" 2>/dev/null; then
+    { printf '%s\n' "$now"; printf '%s\n' "$tags"; } > "$FORK_TAGS_CACHE" 2>/dev/null || true
+  fi
+  return 0
+}
+
+fork_tagrel() { # $1=versión -> tagrel mayor de cachyos-$1-N (vacío si no existe)
+  printf '%s\n' "$FORK_TAGS" | sed -n "s/^cachyos-$1-\([0-9][0-9]*\)$/\1/p" | sort -n | tail -n1
+}
+
+fork_latest_minor() { # $1=7.2.8 -> última X.Y.Z del fork de esa línea X.Y
+  local minor="${1%.*}"
+  printf '%s\n' "$FORK_TAGS" | sed -n "s/^cachyos-\($minor\.[0-9][0-9]*\)-[0-9][0-9]*$/\1/p" \
+    | sort -V | tail -n1
+}
+
 REMOTE="${1:-}"
 if [ -z "$REMOTE" ] && [ -t 0 ]; then
   REMOTE="$(discover_remote 2>/dev/null || true)"
@@ -58,6 +113,20 @@ fi
 LOCAL="$(uname -r)"
 MOTOR_VER="$(awk -F'"' '/^SCRIPT_VERSION=/{print $2; exit}' "$SCRIPT" 2>/dev/null || true)"
 [ -n "$MOTOR_VER" ] && MOTOR_VER="v$MOTOR_VER"
+
+# ¿La stable que anuncia kernel.org existe ya en el fork CachyOS? Solo se
+# consulta con una versión con forma de versión (nada de redirigir el sondeo a
+# otra cosa) y nunca se bloquea el menú por ello.
+FORK_MISSING=0
+FORK_FALLBACK=""
+FORK_MINOR=""
+if [ -n "$REMOTE" ] && [[ "$REMOTE" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] && load_fork_tags; then
+  if [ -z "$(fork_tagrel "$REMOTE")" ]; then
+    FORK_MISSING=1
+    FORK_FALLBACK="$(fork_latest_minor "$REMOTE")"
+    FORK_MINOR="${REMOTE%.*}.x"
+  fi
+fi
 
 # ── Regla separadora (ASCII) y fila de columnas del encabezado ─
 RULE="$(printf '%*s' 55 '' | tr ' ' '-')"
@@ -80,6 +149,22 @@ fi
 rule
 rule
 
+# Aviso preventivo: la stable de kernel.org todavía no está en el fork.
+if [ "$FORK_MISSING" = 1 ]; then
+  if [ -n "$FORK_FALLBACK" ]; then
+    printf '  %b⚠  La stable %s aún NO está en el fork CachyOS (su última %s es %s).%b\n' \
+      "$Y2" "$REMOTE" "$FORK_MINOR" "$FORK_FALLBACK" "$N"
+    printf '     pds/bmq/lfbmq/muqss solo existen en el fork: con %s abortarán (opción 14).\n' "$REMOTE"
+    printf '     Opción 14: se te ofrecerá %s al elegir uno de ellos, o usa eevdf para %s vanilla.\n' \
+      "$FORK_FALLBACK" "$REMOTE"
+  else
+    printf '  %b⚠  La stable %s aún NO está en el fork CachyOS.%b\n' "$Y2" "$REMOTE" "$N"
+    printf '     pds/bmq/lfbmq/muqss solo existen en el fork: con %s abortarán (opción 14).\n' "$REMOTE"
+    printf '     Para %s vanilla usa el scheduler eevdf; volverán cuando el fork la publique.\n' "$REMOTE"
+  fi
+  rule
+fi
+
 opt() { # $1=número $2=nombre $3=descripción
   printf '%b%5s%b)  %-13s %s\n' "$C" "$1" "$N" "$2" "$3"
 }
@@ -94,7 +179,11 @@ opt 4 "buildfast"   "compilar + instalar · alta"
 opt 5 "force"       "recompilar con (--force)"
 opt 7 "buildbore"   "compilar con BORE · baja"
 opt 8 "buildborefast" "compilar con BORE · alta"
-opt 14 "variant"    "scheduler/tuning (interactivo)"
+if [ "$FORK_MISSING" = 1 ]; then
+  opt 14 "variant"    "scheduler/tuning (interactivo) ⚠"
+else
+  opt 14 "variant"    "scheduler/tuning (interactivo)"
+fi
 opt 15 "ntsync"     "compilar con NTSync"
 opt 16 "cachy"      "compilar con misc CachyOS"
 rule
@@ -127,6 +216,11 @@ while true; do
     12) exec "$SCRIPT" --changelog ;;
     13) exec "$SCRIPT" --hardened ;;
     14)
+       if [ "$FORK_MISSING" = 1 ]; then
+         printf '\n  %bAviso:%b la stable %s no está en el fork CachyOS' "$Y2" "$N" "$REMOTE"
+         [ -n "$FORK_FALLBACK" ] && printf ' (su última %s es %s)' "$FORK_MINOR" "$FORK_FALLBACK"
+         printf '.\n'
+       fi
        printf '\n  %bScheduler%b (Enter usa el default; los valores de tercera parte avisan si no aplican a la rama):\n' "$W" "$N"
        printf '    %binherit%b mantener el del perfil/último build (default → EEVDF salvo perfil)\n' "$W" "$N"
        printf '    %beevdf%b   scheduler vanilla de mainline\n' "$W" "$N"
@@ -144,7 +238,29 @@ while true; do
        printf '    %botro%b  teclea TU compilador (p. ej. gcc-14, clang-17 o una ruta). Se exigirá como dependencia si falta.\n' "$W" "$N"
        printf '  %bCC%b [Enter=%blauto%b]: ' "$W" "$N" "$Y" "$N"
        read -r cc
+       # v27.31.16: si el scheduler elegido solo existe en el fork y la versión
+       # no está publicada allí, se ofrece la última del fork de esa línea en
+       # lugar de dejar que el build aborte. Sin TTY (o sin fallback) se sigue
+       # con la versión pedida: el motor explica la causa con claridad.
+       use_version=""
+       case "$sched" in
+         pds|bmq|lfbmq|muqss)
+           if [ "$FORK_MISSING" = 1 ] && [ -n "$FORK_FALLBACK" ] \
+              && [ "$FORK_FALLBACK" != "$REMOTE" ] && [ -t 0 ]; then
+             printf '\n  %bEl fork CachyOS no tiene %s; su última release es %s.%b\n' \
+               "$Y" "$REMOTE" "$FORK_FALLBACK" "$N"
+             printf '  ¿Compilar %s en su lugar? [S/n]: ' "$FORK_FALLBACK"
+             read -r _ans
+             case "${_ans:-S}" in
+               [SsYy]*) use_version="$FORK_FALLBACK" ;;
+             esac
+             [ -n "$use_version" ] \
+               && printf '  %bOK: %s + %s.%b\n' "$W" "$use_version" "$sched" "$N"
+           fi
+           ;;
+       esac
        args="--absorb-rebels"
+       [ -n "$use_version" ] && args="$use_version $args"
        [ -n "$sched" ] && args="$args --sched $sched"
        [ -n "$cc" ] && args="$args --cc $cc"
        # shellcheck disable=SC2086

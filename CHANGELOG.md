@@ -1,3 +1,171 @@
+## [27.31.17] - 2026-09-25
+
+Desmontaje inteligente: el tmpfs de compilación deja de arrastrar árboles que
+no sirven para el build que va a salir, y se desmonta entero (devolviendo la
+RAM) cuando no queda nada aprovechable.
+
+El problema de fondo: el directorio del árbol solo lleva la versión
+(`$TMPFS_ROOT/linux-X.Y.Z`), así que "reutilizar el árbol" **mezclaba** sin
+avisar:
+
+- Un vanilla conservado se reutilizaba para un build del fork de la **misma**
+  versión. Los parches `-cachy` no aplican sobre vanilla, y el fallo no aparece
+  como error de parche sino como kernel equivocado.
+- El margen de espacio se decidía con `[ -d "$SRC" ]`: un árbol del tipo
+  equivocado contaba como reutilizable, así que el motor aplicaba el margen
+  incremental (2048 MB) y luego `extract_tarball` lo borraba para extraer
+  4-5 GB de cero → `ENOSPC` a mitad de la extracción.
+- Un build interrumpido dejaba el árbol a medias (con `Makefile` y todo) y el
+  siguiente lo reutilizaba tal cual.
+
+- `tree_usable_for <dir> <versión> <tipo>`: fuente única de verdad de si un
+  árbol sirve. El tipo lo fija el parche/scheduler (`pds|bmq|lfbmq|muqss` →
+  `cachyos`), que es la dimensión que hace que dos árboles no sean
+  intercambiables; los parches de terceros se aplican en cada build y no
+  invalidan nada.
+- `reconcile_tmpfs_trees`, antes del chequeo de espacio: clasifica cada
+  `linux-*` del tmpfs (reutilizable / otro tipo / otra versión / a medias),
+  **descarta siempre** lo que no sirve y, si no queda nada aprovechable y no hay
+  nada más que preservar (paquetes, artefactos), **desmonta el tmpfs entero**
+  para devolver la RAM de golpe y montar limpio. `CIZEN_SMART_UMOUNT=0` o
+  `CIZEN_KEEP_TMPFS=1` purgan sin desmontar.
+- `source_tree_reusable` sustituye a `[ -d "$SRC" ]` en los tres puntos donde
+  se decidía el margen de espacio (`check_build_memory`, `prepare_tmpfs_build`,
+  `liberate_tmpfs_space`), que es donde el bug se traducía en ENOSPC.
+- Testigo `.cizen-extracting-<versión>` en la raíz del tmpfs mientras se extrae:
+  una extracción interrumpida deja el árbol a medias y ya no cuenta como
+  reutilizable. Vive fuera del árbol para no interferir con la extracción ni
+  con el renombrado del tarball del fork (que extrae en `cachyos-X.Y.Z-N`).
+- Testigo `.cizen-tree` (version + kind) en cada árbol recién extraído, para
+  que la reconciliación no tenga que deducir la identidad del `Makefile`. Los
+  árboles anteriores se deducen igual (`kernel/sched/poc_selector.c` = fork).
+- Montajes **apilados** tolerados: un `umount` interrumpido deja varios tmpfs en
+  el mismo punto y `findmnt -M` devuelve una línea por montaje, así que las
+  comparaciones veían `tmpfs\ntmpfs` y el motor se paraba con un error
+  ilegible. Todas las consultas toman la primera línea, se avisa de la pila y
+  `tmpfs_umount_all` desmonta todos los niveles (uno solo no devuelve la RAM).
+- Corregido de paso `ntsync`: la decisión de añadir el parche para kernels sin
+  soporte nativo (< 6.10) estaba en un bloque top-level que llamaba a
+  `kernel_version_ge`, definida 5000 líneas más abajo. Con `set -e` dentro de
+  `! ...` el 127 no abortaba pero **invertía la decisión**: `ntsync` se añadía a
+  todos los kernels, y cada ejecución escribía `kernel_version_ge: orden no
+  encontrada` en el stderr. Ahora la decisión vive en
+  `auto_add_ntsync_patch()`, llamada desde el flujo principal.
+
+Tests: 23 nuevos (identidad, reutilización por tipo, árbol a medias, purga,
+paquete que impide el desmontaje, `CIZEN_SMART_UMOUNT`/`CIZEN_KEEP_TMPFS`,
+tmpfs no montado, apilados, tmpfs ocupado, ntsync) y el detector de orden de
+funciones reescrito: antes solo miraba `$1` y por eso no vio el bug de
+`ntsync`; ahora examina la línea entera (solo nombres que son funciones
+definidas en el fichero, así que sin falsos positivos) y lleva un test que lo
+comprueba contra un fixture. Selftest **138 → 162, 0 fail**, en rojo (17
+fallos) contra v27.31.16. `shellcheck` sin avisos nuevos.
+
+Verificado además sobre un tmpfs real (montado y desmontado de verdad): árbol
+vanilla incompatible → purga + desmontaje; árbol propio correcto → se conserva
+y se purga el ajeno sin desmontar; montajes apilados → se desmontan los tres.
+
+## [27.31.16] - 2026-09-25
+
+El menú avisa **antes** de compilar cuando la stable que anuncia kernel.org
+todavía no está publicada en el fork CachyOS/linux, en lugar de dejar que el
+build reviente a mitad con el error de `resolve_cachyos_release`. Es la
+continuación de v27.31.15: el aviso mostraba la causa, pero el usuario se
+enteraba tras haber lanzado el build.
+
+- `load_fork_tags` sondea la API de releases del fork (máx. 5 s) y **cachea**
+  los tags 6 h en `${XDG_STATE_HOME:-$HOME/.local/state}/kernel-update/cachyos-fork-tags.cache`
+  (`CIZEN_FORK_TAGS_TTL` para ajustar). Sin red o API caída no se avisa de nada
+  y el menú sigue igual: **fail-open**, nunca bloquea. `CIZEN_MENU_SKIP_FORK_CHECK=1`
+  lo desactiva.
+- Cabecera: aviso con la última release del fork de esa línea (`7.2.x → 7.2.7`)
+  y la opción 14 marcada. Si el fork no tiene ninguna release de esa línea, el
+  aviso dice que use `eevdf` y que los schedulers del fork volverán cuando se
+  publiquen.
+- Opción 14: si el scheduler elegido (`pds|bmq|lfbmq|muqss`) solo existe en el
+  fork y la versión no está allí, **ofrece la última del fork** de esa línea
+  («¿Compilar 7.2.7 en su lugar? [S/n]») y pasa la versión como argumento
+  posicional al motor. Responder `n` deja la versión pedida (el motor explica la
+  causa). Sin TTY no se pregunta: se comporta como antes.
+- `bore` y `eevdf` no se ven afectados: `bore` compila vanilla y `eevdf` es
+  mainline, así que ninguno fuerza el árbol del fork.
+
+Tests: 5 nuevos (bash -n del menú, tagrel máximo, fallback de la línea sin
+inventar releases a partir de tags `-rc`, `7.2.80` no se confunde con `7.2.8`,
+y fail-open + TTL + guarda de TTY). Selftest **133 → 138, 0 fail**; verificados
+en rojo contra el menú instalado anterior. `shellcheck` sin avisos nuevos.
+
+Deploy con paridad sha256 (motor `19492d02…`, menú `9aca2555…`, selftest
+`2573953f…`).
+
+## [27.31.15] - 2026-09-25
+
+La opción 14 (bmq/clang) sobre la nueva stable **7.2.8** abortaba con un error
+inexplicable — `Error 1 en línea 1081: tail -n1` — y sin llegar al diagnóstico
+que el propio motor tenía preparado. Causa raíz: **CachyOS todavía no ha
+publicado 7.2.8** (su último release 7.2.x es `cachyos-7.2.7-1`; 7.3 va por
+`rc4`), así que la resolución del tagrel no encuentra nada y el `grep` final de
+la tubería de parseo del JSON devuelve 1. Con `set -Eeuo pipefail` + `trap ERR`
+eso **mata la run entera**: no se llega al sondeo directo de `.asc` ni al
+`fatal` que explicaba la causa. El bug era que la tubería no estaba guardada.
+
+- `|| true` en la tubería de parseo: sin coincidencias devuelve vacío y el
+  flujo sigue su curso (sondeo directo → `fatal`).
+- Diagnóstico accionable cuando el fork no tiene la versión: se listan los
+  últimos tags publicados, se recuerda que los schedulers/tuning del proyecto
+  solo existen en el fork, y se ofrecen las dos salidas reales (compilar una
+  versión que el fork sí tenga con `--version`, o un scheduler de mainline
+  que sí puede compilar esa versión vanilla desde kernel.org).
+- **Regresión cubierta**: dos tests del selftest que reproducen el marco real
+  (`set -Eeuo pipefail` en un subshell **sin** `||`/`&&` alrededor — una
+  sustitución de comandos dentro de una lista `||` hereda errexit desactivado y
+  daría falso verde) y comprueban que la función alcanza su propio `fatal`, y
+  que la guarda no rompe el camino feliz. Verificados en rojo contra el motor
+  sin la guarda. Selftest **131 → 133, 0 fail**.
+
+⚠️ Estado del objetivo: para completar el build end-to-end con bmq/clang hay que
+usar **7.2.7** (la última que el fork publica), no 7.2.8.
+
+Deploy con paridad sha256 (motor `f58f61b0…`, selftest `b5dc2c28…`).
+
+## [27.31.14] - 2026-09-25
+
+Cierra el build end-to-end de la opción 14 (bmq/clang): el fallo de
+post-compilación era un **bug latente de orden de funciones**.
+`collect_build_artifact` se invocaba desde el flujo principal (línea 8507,
+top-level) y se definía 200 líneas más abajo (8705). En bash el archivo se
+interpreta secuencialmente, así que la llamada se ejecutaba antes de que la
+función existiera → `orden no encontrada` y el `fatal` de
+"No se pudo identificar/verificar el artefacto generado". `bash -n` no lo
+detecta (no es un error de sintaxis) y la ruta nunca se había ejecutado en
+ningún build anterior, por eso llevaba latente desde que el helper entró en
+v27.30.0.
+
+- Fix: el bloque de `collect_build_artifact` se mueve justo detrás de
+  `copy_packages_from_build` (su único helper), de forma que toda la cadena de
+  artefactos queda definida antes del flujo principal.
+- Barrido estático de las 158 funciones del motor: no queda ninguna llamada
+  top-level anterior a su definición.
+- **Regresión cubierta**: nuevo test del selftest que analiza el motor en dos
+  pasadas (definiciones y luego llamadas) y falla si aparece una referencia
+  adelantada. Verificado en rojo contra el motor v27.31.12 commiteado
+  (`collect_build_artifact, línea 8507, def 8705`) y en verde con el fix.
+  Selftest **130 → 131, 0 fail**.
+
+De paso se consolida en el repo el perfil **v5.12.1 → v5.12.2**: los 16
+símbolos que Kconfig conserva por dependencia (codecs HDA `ALC260…ALC882` +
+`HDMI_ATI/NVIDIA/MCP/SIMPLE/TEGRA`, `TDX_HOST_SERVICES`,
+`WATCHDOG_PRETIMEOUT_GOV_SEL`) pasan de `OPTS_DISABLE` a `EXPECTED_REBELS`. Es
+lo que hace el propio motor con `--absorb-rebels` (con backup
+`.bak-<fecha>`), pero el cambio se había quedado solo en la copia instalada:
+ahora repo == instalado, con la nota de por qué en la cabecera. No se fuerza
+`CONFIG_EXPERT` (lo apagaría todo, cientos de prompts); solo se absorbe lo que
+la validación ya demostró que no se puede desactivar. Perfil: ENABLE 33,
+DISABLE 263→247, REBELS 34→50, sin duplicados ni contradicciones.
+
+Deploy con paridad sha256 (motor `b97b1f2d…`, perfil `5d6b8351…`, selftest
+`079a93aa…`, root:root 755/644).
+
 ## [27.31.13] - 2026-09-25
 
 Fix de validación FATAL en la opción 14: `SETVAL CONFIG_HID_PLAYSTATION

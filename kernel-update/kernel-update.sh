@@ -54,6 +54,12 @@
 #   no existe --no-lite ni CIZEN_LITE. El paquete se poda igual siempre.
 #   CIZEN_KEEP_MODULES="kvm_intel,vfio_pci" ./kernel-update.sh <versión>  # módulos extra a conservar en la poda
 #   CIZEN_KEEP_TMPFS=1 ./kernel-update.sh <versión>        # conservar el tmpfs tras éxito (defecto: se desmonta)
+#   CIZEN_SMART_UMOUNT=0 ./kernel-update.sh <versión>       # no desmontar el tmpfs aunque no sirva su árbol
+#     v27.31.17: antes de compilar, los árboles del tmpfs que no corresponden a
+#     este build (otra versión, o vanilla<->cachyos según el parche/scheduler)
+#     se descartan siempre; si no queda ninguno aprovechable, el tmpfs se
+#     DESMONTA entero para devolver la RAM y se vuelve a montar limpio.
+#     CIZEN_SMART_UMOUNT=0 (o CIZEN_KEEP_TMPFS=1) los purga sin desmontar.
 #   ./kernel-update.sh <versión> --patch bore                 # framework de parches
 #   ./kernel-update.sh <versión> --bore                       # alias de --patch bore
 #   CIZEN_PATCHES="bore" ./kernel-update.sh <versión>         # parches por env
@@ -128,7 +134,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.12"
+SCRIPT_VERSION="27.31.17"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -175,6 +181,22 @@ TMPFS_CREATED_BY_SCRIPT=false
 # no tiene motivo de existir y se desmonta. CIZEN_KEEP_TMPFS=1 conserva el
 # comportamiento anterior (reutilización del árbol entre ejecuciones).
 CIZEN_KEEP_TMPFS="${CIZEN_KEEP_TMPFS:-0}"
+# Desmontaje inteligente (v27.31.17). El directorio del árbol solo lleva la
+# versión (linux-X.Y.Z), de modo que un vanilla conservado y un build del fork
+# pueden acabar en el mismo camino y "reutilizarse" sin que se note (los
+# parches -cachy no aplican y el kernel compilado no es el pedido). Al arrancar
+# se reconcilia el tmpfs con lo que este build va a compilar (versión + tipo,
+# y el tipo depende del parche/scheduler elegido). Lo que no sirve se descarta
+# y, si no queda nada aprovechable, se DESMONTA el tmpfs entero para devolver
+# la RAM de golpe y montar limpio. CIZEN_SMART_UMOUNT=0 desactiva solo el
+# desmontaje (los árboles incompatibles se siguen descartando, no mezclando).
+CIZEN_SMART_UMOUNT="${CIZEN_SMART_UMOUNT:-1}"
+# Testigo de identidad de cada árbol extraído (version + kind). Los árboles
+# anteriores a v27.31.17 no lo tienen: se deducen del propio árbol.
+TREE_META_NAME=".cizen-tree"
+# Motivo por el que KERNEL_TREE no es "vanilla" (lo rellena
+# resolve_kernel_tree), para explicar los descartes con el parche concreto.
+TREE_FORCE_NOTE=""
 # Se marca solo al terminar el pipeline completo con éxito (instalación + UKI
 # sincronizada); los flujos parciales (p. ej. solo check) no desmontan.
 FULL_PIPELINE_OK=false
@@ -445,13 +467,13 @@ check_build_memory() {
       # prepare_tmpfs_build para ese caso exacto. El margen de build completo
       # (min_tmp) solo se exige cuando no hay nada reutilizable y hay que
       # extraer un árbol nuevo desde cero.
-      if [ -d "$SRC" ]; then
+      if source_tree_reusable; then
         min_tmp_used="$TMPFS_EXISTING_SRC_MIN_FREE_MB"
       else
         min_tmp_used="$min_tmp"
       fi
       if [ -z "$free_mb" ] || [ "$free_mb" -lt "$min_tmp_used" ]; then
-        fatal "Espacio libre insuficiente en el tmpfs de build ($TMPFS_ROOT): ${free_mb:-?} MB < ${min_tmp_used} MB (árbol reutilizable=$([ -d "$SRC" ] && echo sí || echo no)). Tras purgar los artefactos regenerables sigue lleno: remonta el tmpfs (sudo umount $TMPFS_ROOT) o ajusta CIZEN_BUILD_MIN_TMPFS_MB (o _BTF_MB)."
+        fatal "Espacio libre insuficiente en el tmpfs de build ($TMPFS_ROOT): ${free_mb:-?} MB < ${min_tmp_used} MB (árbol reutilizable=$(source_tree_reusable && echo sí || echo no)). Tras purgar los artefactos regenerables sigue lleno: el desmontaje automático no ha podido (CIZEN_SMART_UMOUNT=0, CIZEN_KEEP_TMPFS=1 o tmpfs en uso); hazlo a mano (sudo umount $TMPFS_ROOT) o ajusta CIZEN_BUILD_MIN_TMPFS_MB (o _BTF_MB)."
       fi
       ok "Espacio del tmpfs liberado tras limpieza: ${free_mb} MB libres (mín ${min_tmp_used} MB)."
     fi
@@ -474,7 +496,10 @@ liberate_tmpfs_space() {
 
   # 1. Artefactos del enlace final del árbol de esta versión. El vmlinux con
   #    .BTF es el mayor consumidor del tmpfs; su purga devuelve varios GB.
-  if [ -d "$SRC" ]; then
+  #    Solo si el árbol es realmente reutilizable: si es de otro tipo o
+  #    versión, reconcile_tmpfs_trees lo descarta entero (o desmonta el tmpfs)
+  #    y purgar sus artefactos sería tirar tiempo.
+  if source_tree_reusable; then
     while IFS= read -r -d '' art; do
       rm -f -- "$art"
       purged=1
@@ -771,14 +796,13 @@ case "$CIZEN_SCHED" in
   *) fatal "CIZEN_SCHED inválido: $CIZEN_SCHED (use inherit, eevdf, bore, pds, bmq, lfbmq o muqss)." ;;
 esac
 # ntsync para kernels SIN soporte nativo (< 6.10): se pide el parche CachyOS.
-# (con $VERSION aún vacío en kcheck --check-update este atajo no se dispara y
-# el usuario puede pedir --patch ntsync a mano).
-if [ "$CIZEN_PATCH_NTSYNC" != "0" ] && [ -n "${VERSION:-}" ] && ! kernel_version_ge "$VERSION" "6.10"; then
-  case " ${PATCH_NAMES[*]:-} " in
-    *" ntsync "*) ;;
-    *) PATCH_NAMES+=(ntsync) ;;
-  esac
-fi
+# NO se resuelve aquí: kernel_version_ge está definida unas 5000 líneas más
+# abajo, y llamarla en este punto top-level daba "orden no encontrada" en
+# todas las ejecuciones. Como la llamada iba dentro de `! ...`, el 127 no
+# abortaba (contexto de condición) pero el resultado era el contrario del
+# buscado: se añadía ntsync SIEMPRE, incluso a kernels con soporte nativo, y
+# se ensuciaba el stderr. La decisión vive ahora en auto_add_ntsync_patch(),
+# llamada desde el flujo principal con todas las definiciones ya cargadas.
 
 case "$PRUNE_MODULES" in
   0|1) ;;
@@ -1043,17 +1067,23 @@ resolve_latest_release() {
 # release vanilla de kernel.org los ficheros vanilla (0001-prjc.patch) ya no se
 # publican para ramas recientes y el resultado es build vanilla silencioso.
 resolve_kernel_tree() {
+  local __p
   KERNEL_TREE="$CIZEN_KERNEL_TREE"
+  TREE_FORCE_NOTE=""
   if [ "$KERNEL_TREE" = "auto" ]; then
-    local __p
     for __p in "${PATCH_NAMES[@]:-}"; do
       case "$__p" in
-        pds|bmq|lfbmq|muqss) KERNEL_TREE="cachyos"; break ;;
+        pds|bmq|lfbmq|muqss)
+          KERNEL_TREE="cachyos"
+          TREE_FORCE_NOTE="lo fuerza el parche/scheduler '$__p' (solo existe en el fork CachyOS/linux)"
+          break ;;
       esac
     done
     if [ "$KERNEL_TREE" = "auto" ]; then
       KERNEL_TREE="vanilla"
     fi
+  else
+    TREE_FORCE_NOTE="CIZEN_KERNEL_TREE=$CIZEN_KERNEL_TREE"
   fi
 }
 
@@ -1067,18 +1097,28 @@ resolve_kernel_tree() {
 #   2) Fallback sin depender de rate limits ni paginación: sondeo directo del
 #      .asc de los tags cachyos-$VERSION-1..8 (asset mínimo; 404 = tag ausente).
 resolve_cachyos_release() {
-  local ver="$1" i cand_url probes
+  local ver="$1" i cand_url probes seen api_ok=0
   CACHYOS_TAGREL=""
   probes="$KERNEL_BUILD_ROOT/.cizen-cachy-probe-$$"
   rm -f -- "$probes"
 
   if download_small_file "https://api.github.com/repos/CachyOS/linux/releases?per_page=20" "$probes" >/dev/null 2>&1; then
+    api_ok=1
+    # v27.31.15: `|| true` en la tubería. Sin él, cuando el fork aún no publicó
+    # la versión (p. ej. stable 7.2.8 recién salida en kernel.org) el último
+    # grep se queda sin entrada y devuelve 1; con `set -Eeuo pipefail` + trap
+    # ERR eso abortaba la run entera con "Error 1 en línea N: tail -n1" y sin
+    # llegar al sondeo directo ni al fatal explicativo. Ahora la tubería
+    # devuelve vacío y el flujo sigue su curso (sondeo → fatal claro).
     CACHYOS_TAGREL="$(
       grep -oE 'cachyos-'"$ver"'-[-A-Za-z0-9.]+' "$probes" \
       | sed -E 's/^cachyos-'"$ver"'-([0-9]+)$/\1/' \
       | grep -E '^[0-9]+$' \
-      | sort -n | tail -n1
+      | sort -n | tail -n1 || true
     )"
+    # Últimos tags vistos, para el diagnóstico final si esta versión no existe.
+    seen="$(grep -oE '"tag_name": *"cachyos-[^"]+"' "$probes" 2>/dev/null \
+      | sed -E 's/.*"(cachyos-[^"]+)"/\1/' | head -6 | tr '\n' ' ' || true)"
     rm -f -- "$probes"
     if [ -n "$CACHYOS_TAGREL" ]; then
       ok "Release CachyOS detectado (API): cachyos-${ver}-${CACHYOS_TAGREL}"
@@ -1098,7 +1138,18 @@ resolve_cachyos_release() {
     fi
   done
   rm -f -- "$probes"
-  fatal "No se pudo determinar el release cachyos-${ver}-N del fork CachyOS/linux (¿red? ¿el fork no publicó esa versión?). El build del árbol CachyOS se aborta."
+
+  # v27.31.15: diagnóstico accionable. Lo normal es que kernel.org ya tenga la
+  # release y el fork CachyOS todavía no (los tags van con retraso): decirlo
+  # claro evita que parezca un fallo de red.
+  err "El fork CachyOS/linux no tiene ningún release para ${ver}."
+  if [ "$api_ok" = 1 ] && [ -n "$seen" ]; then
+    err "Últimos tags publicados por el fork: ${seen}"
+  else
+    warn "No se pudo consultar la API de releases del fork (¿red?)."
+  fi
+  err "Los schedulers/tuning del proyecto (pds/bmq/lfbmq/muqss) solo existen en el fork CachyOS."
+  fatal "Opciones: compila una versión que el fork sí tenga publicado (p. ej. la estable del fork) con --version <VER>, o usa un scheduler de mainline (eevdf) que sí puede compilar ${ver} vanilla desde kernel.org."
 }
 
 # ============================================================
@@ -1718,7 +1769,23 @@ ensure_config_dir_writable() {
 }
 
 tmpfs_is_mounted() {
-  [ "$(findmnt -n -M "$TMPFS_ROOT" -o FSTYPE 2>/dev/null || true)" = "tmpfs" ]
+  [ "$(findmnt -n -M "$TMPFS_ROOT" -o FSTYPE 2>/dev/null | head -n1 || true)" = "tmpfs" ]
+}
+
+# Desmonta el tmpfs de compilación, incluidos los montajes APILADOS que
+# hubiera (un solo umount no basta y dejaría la RAM retenida, que es justo lo
+# que este flujo viene a devolver). Si algo lo usa, no se fuerza con -l.
+tmpfs_umount_all() {
+  local n=0 max=4
+  while [ "$n" -lt "$max" ]; do
+    findmnt -n -M "$TMPFS_ROOT" -o TARGET 2>/dev/null | grep -q . || return 0
+    sudo umount "$TMPFS_ROOT" 2>/dev/null || return 1
+    n=$((n + 1))
+  done
+  if findmnt -n -M "$TMPFS_ROOT" -o TARGET 2>/dev/null | grep -q .; then
+    return 1
+  fi
+  return 0
 }
 
 verify_tmpfs_ownership() {
@@ -1743,8 +1810,19 @@ prepare_tmpfs_build() {
 
   mkdir -p "$TMPFS_ROOT"
 
-  fstype="$(findmnt -n -M "$TMPFS_ROOT" -o FSTYPE 2>/dev/null || true)"
-  mount_target="$(findmnt -n -M "$TMPFS_ROOT" -o TARGET 2>/dev/null || true)"
+  fstype="$(findmnt -n -M "$TMPFS_ROOT" -o FSTYPE 2>/dev/null | head -n1 || true)"
+  mount_target="$(findmnt -n -M "$TMPFS_ROOT" -o TARGET 2>/dev/null | head -n1 || true)"
+  # Montajes APILADOS en el mismo punto: se dan cuando un umount se queda a
+  # medias (proceso usando el tmpfs) y se vuelve a montar encima. findmnt -M
+  # devuelve una línea por montaje, así que sin head -n1 las comparaciones de
+  # abajo fallaban con un "tmpfs\ntmpfs" ilegible y el motor se paraba sin
+  # motivo aparente. Se avisa y se sigue con el montaje visible.
+  local stacked
+  stacked="$(findmnt -n -M "$TMPFS_ROOT" -o TARGET 2>/dev/null | grep -c . || true)"
+  if [ "${stacked:-0}" -gt 1 ]; then
+    warn "$TMPFS_ROOT tiene $stacked montajes apilados (umount interrumpido en alguna ejecución anterior); se sigue con el más reciente. Para limpiarlos todos: for i in $(seq $stacked); do sudo umount $TMPFS_ROOT; done"
+  fi
+  unset stacked
 
   if [ -n "$fstype" ]; then
     if [ "$fstype" != "tmpfs" ] || [ "$mount_target" != "$TMPFS_ROOT" ]; then
@@ -1773,7 +1851,7 @@ prepare_tmpfs_build() {
 
   avail_mb="$(get_avail_mb "$TMPFS_ROOT")"
   min_required="$TMPFS_MIN_FREE_MB"
-  if [ -d "$SRC" ]; then
+  if source_tree_reusable; then
     min_required="$TMPFS_EXISTING_SRC_MIN_FREE_MB"
   fi
   if [ "$avail_mb" -lt "$min_required" ]; then
@@ -1781,7 +1859,7 @@ prepare_tmpfs_build() {
     # final (vmlinux*, .tmp_vmlinux*, System.map) suelen llenar el tmpfs tras un
     # build reciente. Se purgan ANTES de declarar falta de espacio: se vuelven a
     # enlazar en minutos, y se conservan .o/.a (la inversión grande) y paquetes.
-    if [ -d "$SRC" ]; then
+    if source_tree_reusable; then
       local __purged=0 __art
       while IFS= read -r -d '' __art; do
         rm -f -- "$__art"
@@ -1811,7 +1889,8 @@ unmount_tmpfs_build() {
   if [ "$FULL_PIPELINE_OK" = true ] && [ "$CIZEN_KEEP_TMPFS" != "1" ]; then
     if tmpfs_is_mounted; then
       log "Desmontando tmpfs de compilación (flujo completo exitoso): $TMPFS_ROOT"
-      if sudo umount "$TMPFS_ROOT"; then
+      if sudo -v >/dev/null 2>&1 || true; then :; fi
+      if tmpfs_umount_all; then
         ok "tmpfs desmontado: $TMPFS_ROOT"
         TMPFS_MOUNTED=false
         TMPFS_CREATED_BY_SCRIPT=false
@@ -1894,6 +1973,101 @@ cleanup_old_source_trees() {
       rm -rf -- "$dir"
     fi
   done
+}
+
+# ============================================================
+# RECONCILIACIÓN DEL tmpfs Y DESMONTAJE INTELIGENTE (v27.31.17)
+# ============================================================
+# El directorio del árbol solo lleva la versión ($TMPFS_ROOT/linux-X.Y.Z), así
+# que "reutilizar el árbol" mixing es silencioso: un vanilla conservado de una
+# ejecución anterior se reutilizaría para un build del fork de la MISMA versión
+# (los parches -cachy no aplican) y un vanilla de OTRA versión se reutilizaría
+# con el margen de espacio incremental. Nada de eso puede fallar en un sitio
+# útil: o compila el kernel equivocado, o revienta con ENOSPC a mitad.
+#
+# Antes del chequeo de espacio (que decide con márgenes distintos según haya o
+# no un árbol reutilizable) se reconcilia el tmpfs con lo que este build va a
+# compilar. Cada linux-* se clasifica por su identidad real (versión + tipo, y
+# el tipo lo determina el parche/scheduler elegido):
+#
+#   reutilizable  misma versión y mismo tipo -> se conserva tal cual
+#   otro tipo     misma versión, vanilla<->cachyos -> NUNCA se mezcla
+#   otra versión  no puede servir a este build
+#
+# Lo que no es reutilizable se descarta siempre (mezclar es peor que
+# reextraer). Si tras el descarte no queda ningún árbol aprovechable y el
+# tmpfs no guarda nada más que preservar (paquetes/artefactos), se DESMONTA
+# entero: borra lo que quedaba de golpe, devuelve la RAM a la RAM del sistema
+# y prepare_tmpfs_build lo vuelve a montar vacío y limpio, sin residuos de la
+# ejecución anterior. Con CIZEN_SMART_UMOUNT=0 o CIZEN_KEEP_TMPFS=1 se purga
+# dentro del tmpfs en lugar de desmontarlo.
+reconcile_tmpfs_trees() {
+  local dir id ver kind kept=0 purged=0 others
+  tmpfs_is_mounted || return 0
+
+  shopt -s nullglob
+  local -a trees=("$TMPFS_ROOT"/linux-*)
+  shopt -u nullglob
+  [ "${#trees[@]}" -eq 0 ] && return 0
+
+  for dir in "${trees[@]}"; do
+    [ -d "$dir" ] && [ -f "$dir/Makefile" ] || continue
+    id="$(tree_identity "$dir")"
+    ver="${id%%|*}"
+    kind="${id#*|}"
+    if tree_usable_for "$dir" "$VERSION" "$KERNEL_TREE"; then
+      kept=1
+      log "Árbol de fuentes reutilizable: $dir ($ver, $kind)"
+      continue
+    fi
+    if [ -f "$TMPFS_ROOT/.cizen-extracting-$ver" ] || [ -f "$TMPFS_ROOT/.cizen-extracting-$VERSION" ]; then
+      warn "Descartando $dir: extracción interrumpida (a medias, versión $ver). No se reutiliza un árbol incompleto."
+    elif [ "$ver" = "$VERSION" ] || [[ "$ver" == "$VERSION"-* ]]; then
+      warn "Descartando $dir: es $kind y este build compila $KERNEL_TREE${TREE_FORCE_NOTE:+ ($TREE_FORCE_NOTE)}. Un árbol de otro tipo no se reutiliza nunca (los parches -cachy no aplican sobre vanilla y al revés)."
+    else
+      warn "Descartando $dir: es $ver y este build compila $VERSION."
+    fi
+    rm -rf -- "$dir"
+    purged=1
+  done
+  unset dir id ver kind
+
+  [ "$purged" = 1 ] || return 0
+  # Los árboles descartados se van con su testigo de extracción; el único que
+  # podría seguir vivo es el reutilizable, que por definición no lo tiene.
+  rm -f "$TMPFS_ROOT"/.cizen-extracting-* 2>/dev/null || true
+  if [ "$kept" = 1 ]; then
+    ok "tmpfs depurado: se conserva el árbol de este build, ya no caben árboles ajenos."
+    return 0
+  fi
+  if [ "$CIZEN_KEEP_TMPFS" = "1" ] || [ "$CIZEN_SMART_UMOUNT" = "0" ]; then
+    info "CIZEN_KEEP_TMPFS/CIZEN_SMART_UMOUNT lo impiden: el tmpfs se conserva (ya sin árboles de fuentes incompatibles)."
+    return 0
+  fi
+  # Solo se desmonta si no queda nada más en el tmpfs que merezca la pena
+  # (paquetes o artefactos de una ejecución anterior). Los marcadores propios
+  # (.build-marker-*, .cizen-*) no cuentan, y los árboles son directorios: un
+  # fichero linux-*.pkg.tar.zst SÍ cuenta (no es un árbol).
+  others="$(find "$TMPFS_ROOT" -mindepth 1 -maxdepth 1 \
+    ! -name '.build-marker-*' ! -name '.cizen-*' \
+    \( ! -type d -o ! -name 'linux-*' \) -print 2>/dev/null | head -n5 || true)"
+  if [ -n "$others" ]; then
+    info "El tmpfs guarda además otras entradas (paquetes/artefactos): no se desmonta, solo se descartaron los árboles incompatibles."
+    return 0
+  fi
+  log "Ningún árbol del tmpfs sirve para este build ($VERSION, $KERNEL_TREE${TREE_FORCE_NOTE:+, $TREE_FORCE_NOTE}): se desmonta para devolver la RAM y empezar de un tmpfs limpio."
+  # `sudo -v` aquí es solo para renovar la credencial cacheada: si no se puede
+  # (sin TTY, credencial caducada...) NO se aborta la build, se intenta el
+  # umount igualmente y, si tampoco, se sigue con el tmpfs actual: los árboles
+  # incompatibles ya se descartaron, que es lo que evita la mezcla.
+  sudo -v >/dev/null 2>&1 || true
+  if tmpfs_umount_all; then
+    ok "tmpfs desmontado (los árboles incompatibles se descartaron): $TMPFS_ROOT"
+    TMPFS_MOUNTED=false
+    TMPFS_CREATED_BY_SCRIPT=false
+  else
+    warn "No se pudo desmontar $TMPFS_ROOT (¿proceso usándolo?); los árboles incompatibles ya se descartaron, se continúa sobre el tmpfs actual."
+  fi
 }
 
 check_disk_space() {
@@ -2351,39 +2525,120 @@ source_tree_valid() {
 # vanilla de kernel.org aunque makepkg kernelversion coincida (p. ej. 7.2.7).
 # Sin este marcador, un árbol vanilla conservado de una build previa se
 # reutilizaría para una build cachyos y los parches -cachy fallarían.
+# Acepta un directorio para poder clasificar árboles que no son el de esta
+# versión (los que conviven en el tmpfs).
 source_tree_kind() {
-  if [ -f "$SRC/kernel/sched/poc_selector.c" ]; then
+  local dir="${1:-$SRC}"
+  if [ -f "$dir/kernel/sched/poc_selector.c" ]; then
     printf 'cachyos\n'
-  else
+  elif [ -f "$dir/Makefile" ]; then
     printf 'vanilla\n'
+  else
+    printf 'desconocido\n'
   fi
 }
 
+# Identidad de un árbol como "<versión>|<tipo>". Preferencia por el testigo
+# .cizen-tree que se escribe al extraer; si no existe (árboles de versiones
+# anteriores de esta herramienta) se deduce del propio árbol. La versión del
+# directorio solo es un último recurso (un árbol recién extraído siempre tiene
+# Makefile y por tanto kernelversion legible).
+tree_identity() {
+  local dir="$1" meta ver kind
+  meta="$dir/$TREE_META_NAME"
+  if [ -f "$meta" ]; then
+    ver="$(sed -nE 's/^version=//p' "$meta" 2>/dev/null | head -n1 || true)"
+    kind="$(sed -nE 's/^kind=//p' "$meta" 2>/dev/null | head -n1 || true)"
+    if [ -n "$ver" ] && [ -n "$kind" ]; then
+      printf '%s|%s\n' "$ver" "$kind"
+      return 0
+    fi
+  fi
+  ver="$(make -C "$dir" -s kernelversion 2>/dev/null || true)"
+  if [ -z "$ver" ]; then
+    ver="$(basename -- "$dir")"
+    ver="${ver#linux-}"
+    ver="${ver#cachyos-}"
+  fi
+  printf '%s|%s\n' "$ver" "$(source_tree_kind "$dir")"
+}
+
+# ¿Sirve el árbol $1 para compilar la versión $2 de tipo $3? $3 vacío o con un
+# valor que no sea vanilla|cachyos = no se discrimina por tipo. Fuente única de
+# verdad: la usan tanto el chequeo de espacio como la reconciliación del tmpfs.
+#
+# El tipo lo fija el parche/scheduler (pds/bmq/lfbmq/muqss -> cachyos), que es
+# justamente la dimensión que hace que dos árboles NO sean intercambiables: el
+# directorio del árbol solo lleva la versión, así que un vanilla conservado se
+# reutilizaría para un build del fork de la misma versión (los parches -cachy no
+# aplican) sin dar ningún error visible. Los parches de terceros se aplican
+# encima en cada build y no invalidan nada.
+tree_usable_for() {
+  local dir="$1" ver_want="$2" kind_want="$3" id ver kind
+  [ -d "$dir" ] && [ -f "$dir/Makefile" ] && [ -f "$dir/kernel/Makefile" ] || return 1
+  # Testigo de "extrayéndose ahora": una ejecución interrumpida deja el árbol a
+  # medias, con Makefile y todo, y se reutilizaría tal cual (al motor solo le
+  # basta el Makefile para leer kernelversion). El testigo vive en la raíz del
+  # tmpfs, no dentro del árbol, para no interferir con la extracción ni con el
+  # renombrado del tarball del fork.
+  [ ! -f "$TMPFS_ROOT/.cizen-extracting-$ver_want" ] || return 1
+  id="$(tree_identity "$dir")"
+  ver="${id%%|*}"
+  kind="${id#*|}"
+  [ "$ver" = "$ver_want" ] || [[ "$ver" == "$ver_want"-* ]] || return 1
+  case "$kind_want" in
+    vanilla|cachyos) [ "$kind" = "$kind_want" ] || return 1 ;;
+  esac
+  return 0
+}
+
+# ¿El árbol de $SRC sirve para ESTE build? Es la única comprobación válida
+# para decidir que el tmpfs tiene algo reutilizable. Con un simple
+# [ -d "$SRC" ] un árbol del tipo equivocado contaba como reutilizable: el
+# chequeo de espacio aplicaba el margen incremental (2048 MB) y luego
+# extract_tarball lo borraba para extraer 4-5 GB de cero, con ENOSPC a mitad.
+source_tree_reusable() {
+  tree_usable_for "$SRC" "$VERSION" "$KERNEL_TREE"
+}
+
+# Testigo de identidad del árbol recién extraído, para que la reconciliación
+# del tmpfs de la siguiente ejecución no tenga que deducirlo del Makefile.
+write_tree_meta() {
+  local dir="$1" kver
+  kver="$(make -C "$dir" -s kernelversion 2>/dev/null || true)"
+  {
+    printf 'version=%s\n' "${kver:-$VERSION}"
+    printf 'kind=%s\n' "$(source_tree_kind "$dir")"
+    printf 'ts=%s\n' "$(date +%s)"
+  } > "$dir/$TREE_META_NAME" 2>/dev/null || true
+}
+
 extract_tarball() {
-  local _top extract_top kver want_kind got_kind
+  local _top extract_top kver
   cleanup_old_source_trees
 
+  if source_tree_reusable; then
+    ok "Reutilizando el árbol de fuentes: $SRC ($VERSION, $KERNEL_TREE${TREE_FORCE_NOTE:+, $TREE_FORCE_NOTE})"
+    return 0
+  fi
+
   if source_tree_valid; then
+    # Red de seguridad: reconcile_tmpfs_trees ya habrá descartado este árbol
+    # antes del chequeo de espacio, pero si se llega aquí (p. ej. el árbol se
+    # creó entre medias) se descarta igualmente: reutilizar un árbol de otro
+    # tipo o de otra versión compilaría el kernel equivocado sin avisar.
     kver="$(make -C "$SRC" -s kernelversion 2>/dev/null || true)"
     if [ "$kver" = "$VERSION" ] || [[ "$kver" == "$VERSION"-* ]]; then
-      want_kind="$KERNEL_TREE"
-      got_kind="$(source_tree_kind)"
-      if [ "$want_kind" = "cachyos" ] && [ "$got_kind" != "cachyos" ]; then
-        warn "El árbol conservado es $got_kind (se pidió $want_kind); se descarta y se vuelve a extraer $VERSION."
-        rm -rf "$SRC"
-      elif [ "$want_kind" = "vanilla" ] && [ "$got_kind" != "vanilla" ]; then
-        warn "El árbol conservado es $got_kind (se pidió $want_kind); se descarta y se vuelve a extraer $VERSION."
-        rm -rf "$SRC"
-      else
-        return 0
-      fi
+      warn "El árbol conservado es $(source_tree_kind "$SRC") y este build compila $KERNEL_TREE${TREE_FORCE_NOTE:+ ($TREE_FORCE_NOTE)}; se descarta y se vuelve a extraer $VERSION."
     else
-      warn "El árbol existente no coincide con $VERSION; se elimina y se vuelve a extraer."
-      rm -rf "$SRC"
+      warn "El árbol existente es ${kver:-?} y este build compila $VERSION; se descarta y se vuelve a extraer."
     fi
+    rm -rf "$SRC"
   fi
 
   log "Extrayendo fuentes en $(dirname "$SRC") ..."
+  rm -f "$TMPFS_ROOT/.cizen-extracting-$VERSION" 2>/dev/null || true
+  : > "$TMPFS_ROOT/.cizen-extracting-$VERSION"
   tar -xf "$TARBALL" -C "$(dirname "$SRC")"
 
   # El tarball de kernel.org extrae linux-X.Y.Z (== basename de $SRC); el del
@@ -2412,6 +2667,8 @@ extract_tarball() {
     rm -rf "$SRC"
     return 1
   fi
+  write_tree_meta "$SRC"
+  rm -f "$TMPFS_ROOT/.cizen-extracting-$VERSION" 2>/dev/null || true
 }
 
 # ============================================================
@@ -5507,6 +5764,20 @@ kernel_version_ge() {
   [ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | head -n1)" = "$b" ]
 }
 
+# ntsync se pide solo para kernels SIN soporte nativo (< 6.10). Con $VERSION
+# vacío (kcheck --check-update) no se decide nada y el usuario puede pedir
+# --patch ntsync a mano. Se llama desde el flujo principal, no en el arranque
+# del script, para no invocar kernel_version_ge antes de existir.
+auto_add_ntsync_patch() {
+  [ "$CIZEN_PATCH_NTSYNC" != "0" ] || return 0
+  [ -n "${VERSION:-}" ] || return 0
+  kernel_version_ge "$VERSION" "6.10" && return 0
+  case " ${PATCH_NAMES[*]:-} " in
+    *" ntsync "*) ;;
+    *) PATCH_NAMES+=(ntsync) ;;
+  esac
+}
+
 # ============================================================
 # SCRIPTS/CONFIG + KCONFIG
 # ============================================================
@@ -6507,6 +6778,48 @@ copy_packages_from_build() {
   fi
 
   ok "Paquete verificado: $(basename "$PKG") ($PKG_NAME $PKG_VERSION)"
+}
+
+# v27.30.0: detecta el artefacto generado segun el backend. Para arch fija
+# PKG/PKG_NAME/PKG_VERSION con copy_packages_from_build (metadatos .PKGINFO);
+# para el resto localiza el artefacto nativo (o deja PKG vacío en los
+# backends sin paquete, que instalan directo desde el árbol).
+collect_build_artifact() {
+  local newest f
+  case "$CIZEN_PKG_BACKEND" in
+    arch)
+      copy_packages_from_build || return 1
+      ;;
+    deb)
+      newest=""
+      while IFS= read -r -d '' f; do newest="$f"; done < <(
+        find "$TMPFS_ROOT" -maxdepth 2 -type f \( -name 'linux-image-*.deb' -o -name 'linux-*.deb' \) -print0 2>/dev/null || true)
+      if [ -z "$newest" ]; then
+        err "No se encontró ningún .deb tras make deb-pkg en $TMPFS_ROOT."
+        return 1
+      fi
+      PKG="$newest"; PKG_NAME="linux-image-cizen"; PKG_VERSION="$VERSION-cizen-v3"
+      ok "Artefacto .deb detectado: $(basename "$PKG")"
+      ;;
+    rpm)
+      newest=""
+      while IFS= read -r -d '' f; do newest="$f"; done < <(
+        find "$TMPFS_ROOT" -maxdepth 2 -type f -name 'linux-*.rpm' -print0 2>/dev/null || true)
+      if [ -z "$newest" ]; then
+        err "No se encontró ningún .rpm tras make rpm-pkg en $TMPFS_ROOT."
+        return 1
+      fi
+      PKG="$newest"; PKG_NAME="linux-cizen"; PKG_VERSION="$VERSION-cizen-v3"
+      ok "Artefacto .rpm detectado: $(basename "$PKG")"
+      ;;
+    generic|gentoo)
+      PKG=""
+      PKG_NAME="linux-cizen-v3"
+      PKG_VERSION="$VERSION-cizen-v3"
+      ok "Backend $CIZEN_PKG_BACKEND: sin paquete; se instala desde el árbol (modules_install + vmlinuz)."
+      ;;
+  esac
+  [ -n "$PKG" ] || [ "$CIZEN_PKG_BACKEND" = "generic" ] || [ "$CIZEN_PKG_BACKEND" = "gentoo" ]
 }
 
 validate_split_package_transition_metadata() {
@@ -7931,11 +8244,15 @@ if [ -z "$VERSION" ]; then
 # La versión ya está resuelta: a partir de aquí todas las rutas son deterministas.
 # Primero se decide el árbol de fuentes: los schedulers PRJC/MuQSS (pds, bmq,
 # lfbmq, muqss) solo existen como parches -cachy y exigen el fork CachyOS/linux.
+# Antes, con todo PATCH_NAMES ya conocido: ntsync se añade solo si el kernel no
+# tiene soporte nativo (v27.31.17; antes se decidiría antes de que existiría la
+# función que compara versiones).
+auto_add_ntsync_patch
 resolve_kernel_tree
 if [ "$KERNEL_TREE" = "cachyos" ]; then
   resolve_cachyos_release "$VERSION"
 fi
-log "Árbol de fuentes: $KERNEL_TREE"
+log "Árbol de fuentes: $KERNEL_TREE${TREE_FORCE_NOTE:+ ($TREE_FORCE_NOTE)}"
 
 MAJOR="${VERSION%%.*}"
 if [ "$KERNEL_TREE" = "cachyos" ]; then
@@ -7973,6 +8290,13 @@ sudo -v
 # gastar minutos en descarga/compilación.
 check_sudo_capabilities
 
+# v27.31.17: reconciliar el tmpfs con este build ANTES de mirar memoria/espacio.
+# (a) los árboles de otra versión o de otro tipo (vanilla<->cachyos, decided
+# por el parche/scheduler) no se reutilizan nunca, y (b) si no queda nada
+# aprovechable se desmonta el tmpfs para devolver la RAM. El chequeo de espacio
+# de check_build_memory y de prepare_tmpfs_build ya solo considera reutilizable
+# un árbol cuya identidad coincide con la de este build.
+reconcile_tmpfs_trees
 check_build_memory
 
 # Solo se valida el punto de montaje dedicado de compilación. El /tmp global
@@ -7995,8 +8319,8 @@ prepare_tmpfs_build
 if ! tmpfs_is_mounted; then
   fatal "El tmpfs dedicado de compilación no quedó montado correctamente: $TMPFS_ROOT"
 fi
-TMPFS_FINAL_FS="$(findmnt -n -M "$TMPFS_ROOT" -o FSTYPE 2>/dev/null || true)"
-TMPFS_FINAL_OPTS="$(findmnt -n -M "$TMPFS_ROOT" -o OPTIONS 2>/dev/null || true)"
+TMPFS_FINAL_FS="$(findmnt -n -M "$TMPFS_ROOT" -o FSTYPE 2>/dev/null | head -n1 || true)"
+TMPFS_FINAL_OPTS="$(findmnt -n -M "$TMPFS_ROOT" -o OPTIONS 2>/dev/null | head -n1 || true)"
 [ "$TMPFS_FINAL_FS" = "tmpfs" ] || fatal "El punto de compilación no es tmpfs: $TMPFS_ROOT"
 
 case ",${TMPFS_FINAL_OPTS}," in
@@ -8696,48 +9020,6 @@ install_kernel_package() {
   done
 
   return 1
-}
-
-# v27.30.0: detecta el artefacto generado segun el backend. Para arch fija
-# PKG/PKG_NAME/PKG_VERSION con copy_packages_from_build (metadatos .PKGINFO);
-# para el resto localiza el artefacto nativo (o deja PKG vacío en los
-# backends sin paquete, que instalan directo desde el árbol).
-collect_build_artifact() {
-  local newest f
-  case "$CIZEN_PKG_BACKEND" in
-    arch)
-      copy_packages_from_build || return 1
-      ;;
-    deb)
-      newest=""
-      while IFS= read -r -d '' f; do newest="$f"; done < <(
-        find "$TMPFS_ROOT" -maxdepth 2 -type f \( -name 'linux-image-*.deb' -o -name 'linux-*.deb' \) -print0 2>/dev/null || true)
-      if [ -z "$newest" ]; then
-        err "No se encontró ningún .deb tras make deb-pkg en $TMPFS_ROOT."
-        return 1
-      fi
-      PKG="$newest"; PKG_NAME="linux-image-cizen"; PKG_VERSION="$VERSION-cizen-v3"
-      ok "Artefacto .deb detectado: $(basename "$PKG")"
-      ;;
-    rpm)
-      newest=""
-      while IFS= read -r -d '' f; do newest="$f"; done < <(
-        find "$TMPFS_ROOT" -maxdepth 2 -type f -name 'linux-*.rpm' -print0 2>/dev/null || true)
-      if [ -z "$newest" ]; then
-        err "No se encontró ningún .rpm tras make rpm-pkg en $TMPFS_ROOT."
-        return 1
-      fi
-      PKG="$newest"; PKG_NAME="linux-cizen"; PKG_VERSION="$VERSION-cizen-v3"
-      ok "Artefacto .rpm detectado: $(basename "$PKG")"
-      ;;
-    generic|gentoo)
-      PKG=""
-      PKG_NAME="linux-cizen-v3"
-      PKG_VERSION="$VERSION-cizen-v3"
-      ok "Backend $CIZEN_PKG_BACKEND: sin paquete; se instala desde el árbol (modules_install + vmlinuz)."
-      ;;
-  esac
-  [ -n "$PKG" ] || [ "$CIZEN_PKG_BACKEND" = "generic" ] || [ "$CIZEN_PKG_BACKEND" = "gentoo" ]
 }
 
 # Comprueba que el release generado no esté ya instalado con un pkgrel igual o
