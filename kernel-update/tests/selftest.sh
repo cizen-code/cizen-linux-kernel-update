@@ -114,6 +114,7 @@ extract() { # $1 = nombre de función (hasta el `}` inicial en columna 0)
   extract patch_markers_hit
   extract apply_patch_register
   extract apply_patch_plugin
+  extract _sched_alt_rtmutex_futex_fixup
   extract add_unique
   extract build_effective_arrays
   extract check_profile_contradictions
@@ -305,6 +306,35 @@ case " ${PATCH_ENABLE_ALL[*]:-} " in
   *) rec fail "bmq ENABLE: [${PATCH_ENABLE_ALL[*]:-}]" ;;
 esac
 rm -f -- "$ROOT/patch-bmq.patch"
+
+printf '%s\n' "== _sched_alt_rtmutex_futex_fixup (v27.31.9): hooks futex del rtmutex en SCHED_ALT =="
+rm -rf "$SRC"; mkdir -p "$SRC/kernel/sched" "$SRC/kernel/locking"
+: > "$SRC/kernel/sched/alt_core.c"
+printf '%s\n' \
+  "	int rt_mutex_futex_pre_schedule();" \
+  "	rt_mutex_futex_post_schedule();" > "$SRC/kernel/locking/rtmutex_api.c"
+_sched_alt_rtmutex_futex_fixup
+grep -q 'void rt_mutex_futex_pre_schedule' "$SRC/kernel/sched/alt_core.c" \
+  && rec ok "fixup añade rt_mutex_futex_pre_schedule a alt_core.c (hueco forward-port)" \
+  || rec fail "fixup: rt_mutex_futex_pre_schedule no añadido a alt_core.c"
+grep -q 'void rt_mutex_futex_post_schedule' "$SRC/kernel/sched/alt_core.c" \
+  && rec ok "fixup añade rt_mutex_futex_post_schedule a alt_core.c" \
+  || rec fail "fixup: rt_mutex_futex_post_schedule no añadido"
+n1="$(grep -c 'void rt_mutex_futex_pre_schedule' "$SRC/kernel/sched/alt_core.c")"
+_sched_alt_rtmutex_futex_fixup
+n2="$(grep -c 'void rt_mutex_futex_pre_schedule' "$SRC/kernel/sched/alt_core.c")"
+[ "$n1" = "1" ] && [ "$n2" = "1" ] \
+  && rec ok "fixup idempotente (no duplica las definiciones al reintentar)" \
+  || rec fail "fixup idempotencia: n1=$n1 n2=$n2"
+: > "$SRC/kernel/sched/alt_core.c"
+printf '%s\n' "	int rtmputex_plain;" > "$SRC/kernel/locking/rtmutex_api.c"
+_sched_alt_rtmutex_futex_fixup
+[ "$(grep -c 'void rt_mutex_futex_pre_schedule' "$SRC/kernel/sched/alt_core.c")" = "0" ] \
+  && rec ok "sin hooks futex en rtmutex_api.c el fixup no toca nada (kernel anterior)" \
+  || rec fail "fixup: debería ser no-op sin hooks futex (añadió spurious)"
+rm -rf "$SRC/kernel"; mkdir -p "$SRC"
+_sched_alt_rtmutex_futex_fixup
+rec ok "fixup no-op si no hay alt_core.c (arbol no-SCHED_ALT)"
 
 printf '%s\n' "== resolve_release_tree (v27.31.0): selección del árbol CachyOS =="
 KERNEL_TREE=""

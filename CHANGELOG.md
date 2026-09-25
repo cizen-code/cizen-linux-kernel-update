@@ -1,3 +1,26 @@
+## [27.31.9] - 2026-09-24
+
+La build clang real de la opción 14 (BMQ sobre `cachyos-7.2.7-1`) llegó por fin
+al enlazado final de `vmlinux`, pero el `LD` falló con `undefined symbol:
+rt_mutex_futex_pre_schedule` / `rt_mutex_futex_post_schedule`. Causa raíz:
+mainline 7.x llama a esos hooks desde `kernel/locking/rtmutex_api.c` (path de
+futex PI en `rt_mutex_wait_proxy_lock`), pero con `SCHED_ALT` se compila
+`kernel/sched/alt_core.c` **en lugar de** `core.c` (donde mainline los define),
+y el forward-port PRJC incrustado no los portó.
+
+- Nueva función `_sched_alt_rtmutex_futex_fixup()`: autocontenida e idempotente.
+  Solo actúa si (1) existe `kernel/sched/alt_core.c` (scheduler SCHED_ALT
+  activo), (2) `rtmutex_api.c` referencia `rt_mutex_futex_pre_schedule` (mainline
+  lo pide) y (3) `alt_core.c` aún no lo define (re-ejecuciones / árbol
+  conservado). Entonces añade al final de `alt_core.c` las dos funciones con la
+  misma semántica que `core.c` (guardadas en `CONFIG_RT_MUTEXES`, con un
+  `lockdep_assert` propio). No afecta a MuQSS (no compila `alt_core.c`) ni a
+  kernels que no tengan esos hooks.
+- Se invoca tras registrar cualquier parche aplicado, cubriendo tanto el flujo
+  normal como el de "árbol conservado ya parcheado" (`patch_markers_hit`).
+- Selftest: extracción + casos funcionales del fixup (añade, idempotente, no-op
+  sin hooks, no-op sin `alt_core.c`). 121→125 OK.
+
 ## [27.31.8] - 2026-09-24
 
 Primera build clang real (tras el fix de v27.31.7) rompía en `build()` con

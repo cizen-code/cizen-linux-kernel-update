@@ -128,7 +128,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.8"
+SCRIPT_VERSION="27.31.9"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -4915,6 +4915,41 @@ patch_markers_hit() {
   return 0
 }
 
+# v27.31.9 — hueco del forward-port PRJC. Los mainlines recientes (7.x)
+# referencian desde kernel/locking/rtmutex_api.c los hooks
+# rt_mutex_futex_pre_schedule()/rt_mutex_futex_post_schedule() (definidos en
+# kernel/sched/core.c). Los schedulers SCHED_ALT compilan kernel/sched/
+# alt_core.c EN LUGAR de core.c, y PRJC no portó esos hooks → link final con
+# "undefined symbol: rt_mutex_futex_pre_schedule". Fixup autocontenido e
+# idempotente: si alt_core.c está activo, rtmutex_api.c los referencia y
+# alt_core.c no los define, se añaden (mismas que core.c) al final del fichero.
+# No afecta a muqss (no compila alt_core.c) ni a kernels sin esos hooks.
+_sched_alt_rtmutex_futex_fixup() {
+  local alt_core="$SRC/kernel/sched/alt_core.c"
+  [ -f "$alt_core" ] || return 0
+  grep -q 'rt_mutex_futex_pre_schedule' "$SRC/kernel/locking/rtmutex_api.c" 2>/dev/null || return 0
+  grep -q 'void rt_mutex_futex_pre_schedule' "$alt_core" 2>/dev/null && return 0
+  log "SCHED_ALT: añadiendo rt_mutex_futex_pre/post_schedule a alt_core.c (hueco del forward-port; mainline los llama desde rtmutex_api.c)..."
+  cat >> "$alt_core" <<'ALT_EOF'
+
+#ifdef CONFIG_RT_MUTEXES
+#define CIZEN_FETCH_AND_SET(x, v) ({ int _x = (x); (x) = (v); _x; })
+void rt_mutex_futex_pre_schedule(void)
+{
+	lockdep_assert(!(current->flags & (PF_WQ_WORKER | PF_IO_WORKER)));
+	lockdep_assert(!current->plug);
+	lockdep_assert(!CIZEN_FETCH_AND_SET(current->sched_rt_mutex, 1));
+	}
+void rt_mutex_futex_post_schedule(void)
+{
+	lockdep_assert(CIZEN_FETCH_AND_SET(current->sched_rt_mutex, 0));
+	}
+#endif /* CONFIG_RT_MUTEXES */
+ALT_EOF
+  ok "SCHED_ALT: rt_mutex_futex_pre/post_schedule definidos en alt_core.c (hueco del forward-port PRJC cubierto)."
+  return 0
+}
+
 # Registra un parche como aplicado: añade a la lista de aplicados y acumula sus
 # símbolos Kconfig para que build_effective_arrays los fuerce a =y y los marque
 # como rebeldes esperados. BORE mantiene además BORE_ENABLED (resumen y firma).
@@ -4983,6 +5018,7 @@ apply_patch_plugin() {
   if patch_markers_hit; then
     ok "${PATCH_DISP_NAME:-$name} ya estaba aplicado en el árbol conservado."
     apply_patch_register "$name"
+    _sched_alt_rtmutex_futex_fixup
     return 0
   fi
 
@@ -5089,6 +5125,7 @@ apply_patch_plugin() {
   fi
 
   apply_patch_register "$name"
+  _sched_alt_rtmutex_futex_fixup
   ok "${PATCH_DESC:-${PATCH_DISP_NAME:-$name}} aplicado (${PATCH_SYMBOLS[0]:-símbolos nuevos}) sobre fuentes $VERSION."
   return 0
 }
