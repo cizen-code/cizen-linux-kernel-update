@@ -1,3 +1,50 @@
+## [27.31.11] - 2026-09-25
+
+`modprobed-db` deja de ser opt-in: el motor pasa a **auto-descubrimiento por
+defecto** (`CIZEN_MODPROBED_DB=1` + `--modprobed-db` también disponible como
+`--no-modprobed-db` para desactivar). El usuario instaló `modprobed-db` v2.50
+(base en `~/.local/share/modprobed-db/modprobed.db`, 65 módulos capturados), que
+es justo la primera ruta que `prepare_lite_config` sondea; el historial
+persistente alimenta `make localmodconfig` junto a `/proc/modules` y el
+allowlist, de modo que en el próximo build iterativo solo se compilan los
+módulos que este hardware ha llegado a cargar alguna vez.
+
+- Default `CIZEN_MODPROBED_DB:-0 → :-1` (sigue aceptando ruta explícita).
+- `modprobed-db` pasa a ser **dependencia requerida**: `check_prerequisites`
+  aborta si falta (con la sugerencia `yay -S modprobed-db`, ya que es un
+  paquete AUR y no puede autoinstalarse con pacman). `--no-modprobed-db`
+  (`CIZEN_MODPROBED_DB=0`) la exime explícitamente.
+- Selftest 126→129 (default auto + requerida con yay + exención `--no-...`).
+- Deploy con paridad sha256 (motor `c7eb9975…`, selftest `3de87cdf…`).
+
+## [27.31.10] - 2026-09-25
+
+Adelgazamiento del perfil para el i5-7500/Kaby Lake (petición del usuario: kernel
+menos gordo y compilación más rápida). El host usa ALSA HDA legacy
+(`lsmod`: `snd_hda_intel` + codec `ALC269` + `intelhdmi`, y **cero**
+`snd_soc*`/`sof*`/`soundwire*`), así que se retiran del árbol source todo el
+gasto de compilación ajeno al hardware:
+
+- **ASoC/SOF/SST completo**: `SND_SOC`, `SND_SOC_SOF_TOPLEVEL`,
+  `SND_SOC_SOF_INTEL_TOPLEVEL`, `SND_SOC_INTEL_SST_TOPLEVEL`,
+  `SND_SOC_INTEL_MACH`, `SND_SOC_INTEL_USER_FRIENDLY_LONG_NAMES`,
+  `SND_SOC_SDCA_OPTIONAL`, `SND_SOC_I2C_AND_SPI`, `SND_SOC_HDA`.
+- **Códecs HDA de otros vendors**: `SND_HDA_CODEC_ALC260/262/268/662/680/861/
+  861VD/880/882` y `SND_HDA_CODEC_HDMI_ATI/NVIDIA/NVIDIA_MCP/SIMPLE/TEGRA`.
+  Se conservan `ALC269` (el ALC3234 usa este driver), `REALTEK*` y
+  `SND_HDA_CODEC_HDMI` + `HDMI_INTEL` (este último con su `select`
+  `HDMI_GENERIC` → queda intacto).
+- **Huecos de plataforma**: `TDX_HOST_SERVICES` (Kaby Lake no tiene TDX),
+  `WATCHDOG_PRETIMEOUT_GOV_SEL`, `LEDS_CLASS_MULTICOLOR`,
+  `ACPI_PROCESSOR_AGGREGATOR`, `PERF_EVENTS_INTEL_RAPL` (movido de SETVAL a
+  DISABLE; RAPL sensado sigue vía `INTEL_RAPL_CORE`) y `MQ_IOSCHED_ADIOS`.
+- Nota: `SND_INTEL_SOUNDWIRE_ACPI` **NO** se desactiva: el `select` de
+  `SND_INTEL_DSP_CONFIG` (exigido por `SND_HDA_INTEL`) lo mantiene en `=m`
+  con los humildes bytes de su helper ACPI.
+- Perfil: `cizen-optiplex7050.conf` v5.12.0 (OPTS_DISABLE 249→264). El modo
+  lite ya es el único modo de compilación, así que el recorte reduce directa-
+  mente los `.ko` que Kbuild produce en paralelo a `vmlinux`.
+
 ## [27.31.9] - 2026-09-24
 
 La build clang real de la opción 14 (BMQ sobre `cachyos-7.2.7-1`) llegó por fin

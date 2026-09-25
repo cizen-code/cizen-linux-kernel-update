@@ -889,6 +889,24 @@ else
   rec fail "apply_patch_and_recheck: olddefconfig sin KCONFIG_CC_OPTS"
 fi
 
+if grep -q 'CIZEN_MODPROBED_DB="\${CIZEN_MODPROBED_DB:-1}"' "$MOTOR"; then
+  rec ok "modprobed-db: default auto-descubrimiento (base instalada)"
+else
+  rec fail "modprobed-db: default sigue desactivado (CIZEN_MODPROBED_DB:-0)"
+fi
+
+if grep -q 'yay -S modprobed-db' "$MOTOR" && grep -q 'CIZEN_MODPROBED_DB:-1.*command -v modprobed-db' "$MOTOR"; then
+  rec ok "modprobed-db: dependencia requerida con sugerencia yay -S modprobed-db"
+else
+  rec fail "modprobed-db: no se exige como requerida ni se sugiere yay"
+fi
+
+if grep -q '(--no-modprobed-db) la exime' "$MOTOR"; then
+  rec ok "modprobed-db: --no-modprobed-db exime la obligatoriedad"
+else
+  rec fail "modprobed-db: falta la exención explícita (--no-modprobed-db)"
+fi
+
 # --- resumen ---
 echo
 printf 'Totales: %d ok, %d fail\n' "$PASS" "$FAIL"

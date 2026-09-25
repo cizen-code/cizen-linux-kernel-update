@@ -128,7 +128,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.9"
+SCRIPT_VERSION="27.31.11"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -381,9 +381,9 @@ declare -a CACHY_MISC_SYMBOLS=()
 CIZEN_USER_PATCHES_DIR="${CIZEN_USER_PATCHES_DIR:-}"
 # Frags de configuración reutilizables (.frag). Default: $CONFIG_DIR/frags.
 CIZEN_FRAGS_DIR="${CIZEN_FRAGS_DIR:-$CONFIG_DIR/frags}"
-# Modprobed-db: 0=off (default), 1=auto-descubrimiento, o ruta a la bbdd.
+# Modprobed-db: 0=off, 1=auto-descubrimiento (default), o ruta a la bbdd.
 # Alimenta make localmodconfig con el historial persistente de módulos.
-CIZEN_MODPROBED_DB="${CIZEN_MODPROBED_DB:-0}"
+CIZEN_MODPROBED_DB="${CIZEN_MODPROBED_DB:-1}"
 # Empaquetado multi-backend (v27.30.0): arch (default) | deb | rpm | generic | gentoo.
 CIZEN_PKG_BACKEND="${CIZEN_PKG_BACKEND:-arch}"
 # Firma persistente de módulos estilo MOK: no (default) | yes. Las claves viven
@@ -1602,6 +1602,15 @@ check_prerequisites() {
   # con instrucciones, igual que siempre.
   if [ ! -x "$(command -v sudo 2>/dev/null || true)" ]; then
     fatal "Falta sudo en PATH (instálalo como root: pacman -S sudo)."
+  fi
+
+  # modprobed-db (AUR) es obligatorio para el keep-list persistente en modo
+  # lite (default CIZEN_MODPROBED_DB=1 = auto-descubrimiento). No está en los
+  # repos oficiales de Arch, así que no se autoinstala con pacman: si falta se
+  # aborta sugiriendo la instalación AUR. CIZEN_MODPROBED_DB=0
+  # (--no-modprobed-db) la exime explícitamente.
+  if [ "${CIZEN_MODPROBED_DB:-1}" != "0" ] && ! command -v modprobed-db >/dev/null 2>&1; then
+    fatal "modprobed-db (AUR) no está instalado (dependencia requerida del keep-list --lite). Instálalo con: yay -S modprobed-db"
   fi
 
   # Deduplicar paquetes: varios comandos comparten coreutils/util-linux/etc.
