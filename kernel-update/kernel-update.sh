@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.31.1 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.31.2 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / XFS / systemd / KVM-libvirt / QEMU-OVMF
 #
@@ -59,6 +59,7 @@
 #   CIZEN_PATCHES="bore" ./kernel-update.sh <versión>         # parches por env
 #   ./kernel-update.sh <versión> --no-btf                     # sin CONFIG_DEBUG_INFO_BTF (opt-out; default: BTF=y)
 #   ./kernel-update.sh <versión> --clang                      # build LLVM/clang (opt-in)
+#   ./kernel-update.sh <versión> --cc gcc-14                  # tu compilador: auto|gcc|clang|versión (gcc-14, clang-17)|rutas
 #   ./kernel-update.sh <versión> --tree auto|vanilla|cachyos  # árbol de fuentes: auto (pds/bmq/lfbmq/muqss -> fork CachyOS) | vanilla | cachyos
 #   ./kernel-update.sh <versión> --menuconfig                 # editar config con menuconfig
 #   ./kernel-update.sh [versión] --publish-repo               # publicar pkg a repo pacman local
@@ -127,7 +128,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.1"
+SCRIPT_VERSION="27.31.2"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -328,10 +329,14 @@ fi
 # firma de módulos. Los defaults NO son invasivos ("inherit"/0/auto): no
 # tocan el perfil cizen salvo que el usuario lo pida explícitamente.
 # ============================================================
-# Compilador: auto (clang si está, si no gcc) | gcc | clang. --clang == clang.
-# Elegir clang (o LTO) convierte a clang+lld en dependencias OBLIGATORIAS:
-# si faltan, check_prerequisites los ofrece e instala como las demás.
+# Compilador de preferencia: auto (clang si LTO pedido o ya instalado previo;
+# si no gcc) | gcc | clang | versión (gcc-14, clang-17) | binario/ruta (la
+# familia la decide el basename). --clang == clang. Elegir un compilador lo
+# vuelve OBLIGATORIO: si falta, check_prerequisites lo ofrece e instala igual
+# que cualquier dependencia (nunca degrada a gcc ni cambia tu elección).
 CIZEN_CC="${CIZEN_CC:-auto}"
+CC_FAMILY=gcc
+CC_LAUNCHER=gcc
 # LTO únicamente con clang: 0=off (default), 1|thin=CONFIG_LTO_CLANG_THIN,
 # full=CONFIG_LTO_CLANG_FULL.
 CIZEN_LLVM_LTO="${CIZEN_LLVM_LTO:-0}"
@@ -489,6 +494,37 @@ on_err() {
 }
 trap on_err ERR
 
+# Compilador de preferencia (--cc / CIZEN_CC): valida el valor elegido y deduce
+# la FAMILIA (gcc|clang) y el BINARIO EFECTIVO (CC_LAUNCHER) que se usará en
+# make. Acepta los lógicos auto|gcc|clang, compiladores versionados de Arch
+# (gcc-14/gcc14, clang-17/clang17) o una ruta/binario propios (la familia se
+# infiere del basename: contiene gcc → GCC, clang → LLVM). En familia clang se
+# marca CLANG_REQUESTED (o si ya venía de --clang/LTO): el compilador elegido
+# se exige como dependencia obligatoria en check_prerequisites. La elección
+# explícita (--cc gcc) gana sobre la bandera --clang previa: el compilador que
+# pediste es el que se usa.
+_resolve_cc_compiler() {
+  case "$CIZEN_CC" in
+    auto)
+      if [ "$CIZEN_LLVM_LTO" != "0" ] || [ "$CLANG_REQUESTED" = true ]; then
+        CC_FAMILY=clang; CC_LAUNCHER=clang; CLANG_REQUESTED=true
+      else
+        CC_FAMILY=gcc; CC_LAUNCHER=gcc
+      fi ;;
+    gcc)
+      CC_FAMILY=gcc; CC_LAUNCHER=gcc; CLANG_REQUESTED=false ;;
+    clang)
+      CC_FAMILY=clang; CC_LAUNCHER=clang; CLANG_REQUESTED=true ;;
+    *)
+      case "$(basename -- "$CIZEN_CC")" in
+        *clang*) CC_FAMILY=clang; CLANG_REQUESTED=true ;;
+        *gcc*)   CC_FAMILY=gcc;   CLANG_REQUESTED=false ;;
+        *) fatal "CIZEN_CC inválido: $CIZEN_CC (use auto, gcc, clang, gcc-14, clang-17 o una ruta a tu compilador)." ;;
+      esac
+      CC_LAUNCHER="$CIZEN_CC" ;;
+  esac
+}
+
 # ============================================================
 # ARGUMENTOS
 # ============================================================
@@ -565,7 +601,7 @@ while [ $# -gt 0 ]; do
       RENAME_PAIR="${1#--rename=}"
       shift ;;
     --cc)
-      CIZEN_CC="${2:-}"; [ -n "$CIZEN_CC" ] || { err "--cc requiere gcc|clang|auto"; exit 1; }
+      CIZEN_CC="${2:-}"; [ -n "$CIZEN_CC" ] || { err "--cc requiere auto|gcc|clang, una versión (gcc-14, clang-17) o una ruta a tu compilador"; exit 1; }
       shift 2 ;;
     --cc=*)
       CIZEN_CC="${1#--cc=}"; shift ;;
@@ -672,22 +708,17 @@ fi
 [ "${CIZEN_CLANG:-0}" = "1" ] && CLANG_REQUESTED=true
 
 # ── Perfil de compilación extendido: validación de valores por env ──
-case "$CIZEN_CC" in auto|gcc|clang) ;; *) fatal "CIZEN_CC inválido: $CIZEN_CC (use auto, gcc o clang)." ;; esac
 case "$CIZEN_LLVM_LTO" in 0|1|thin|full) ;; *) fatal "CIZEN_LLVM_LTO inválido: $CIZEN_LLVM_LTO (use 0, 1, thin o full)." ;; esac
-# LTO solo es viable con clang+lld presentes de verdad: se decide AHORA, antes de
-# la fase de config, para no inyectar CONFIG_LTO_CLANG_* en un build que luego
-# degrade a gcc (olddefconfig los descartaría y la validación ENABLE fallaría).
-if [ "$CIZEN_LLVM_LTO" != "0" ]; then
-  if [ "$CIZEN_CC" = "gcc" ]; then
-    warn "LTO (${CIZEN_LLVM_LTO}) exige clang; CIZEN_CC=gcc → se ignora el LTO."
-    CIZEN_LLVM_LTO=0
-  else
-    # LTO únicamente se compila con clang+lld (LLVM=1): en lugar de degradar a
-    # gcc o ignorar el LTO cuando faltan, se EXIGEN ahora como dependencias
-    # obligatorias (check_prerequisites las ofrece e instala como las demás).
-    [ "$CIZEN_CC" = "auto" ] && CIZEN_CC=clang
-    CLANG_REQUESTED=true
-  fi
+# Compilador de preferencia: deduce familia/binario y marca CLANG_REQUESTED
+# (la elección explícita en --cc gana sobre la bandera --clang previa).
+_resolve_cc_compiler
+# LTO solo es viable con la familia clang (LLVM=1): si el compilador elegido es
+# GCC se ignora el LTO AHORA, antes de la fase de config, para no inyectar
+# CONFIG_LTO_CLANG_* en un build gcc (olddefconfig los descartaría y la
+# validación ENABLE fallaría).
+if [ "$CIZEN_LLVM_LTO" != "0" ] && [ "$CC_FAMILY" = "gcc" ]; then
+  warn "LTO (${CIZEN_LLVM_LTO}) exige clang; el compilador elegido es GCC (${CC_LAUNCHER}); se ignora el LTO."
+  CIZEN_LLVM_LTO=0
 fi
 case "$CIZEN_CFLAGS_OLEVEL" in inherit|2|3) ;; *) fatal "CIZEN_CFLAGS_OLEVEL inválido: $CIZEN_CFLAGS_OLEVEL (use inherit, 2 o 3)." ;; esac
 case "$CIZEN_CPU_OPT" in
@@ -712,9 +743,8 @@ case "$CIZEN_KERNEL_TREE" in auto|vanilla|cachyos) ;; *) fatal "CIZEN_KERNEL_TRE
 if [ -n "$CIZEN_USER_PATCHES_DIR" ] && [ ! -d "$CIZEN_USER_PATCHES_DIR" ]; then
   fatal "CIZEN_USER_PATCHES_DIR no existe o no es un directorio: $CIZEN_USER_PATCHES_DIR"
 fi
-# Compilador explícito por env sobre la auto-detección.
-[ "$CIZEN_CC" = "clang" ] && CLANG_REQUESTED=true
-[ "$CIZEN_CC" = "gcc" ] && CLANG_REQUESTED=false
+# Compilador explícito por env sobre la auto-detección: resuelto por
+# _resolve_cc_compiler (familias, versiones y rutas incluidas).
 # CIZEN_SCHED como alias de --patch (evita que dedupe lo pierda).
 case "$CIZEN_SCHED" in
   inherit|eevdf) ;;
@@ -1478,17 +1508,36 @@ install_dependency_packages() {
 }
 
 check_prerequisites() {
-  local cmd pkg rc
+  local cmd pkg rc _ccb
   local -a tools=(awk bash bc bison cat ccache cmp cp date df du find findmnt flex flock fuser grep gcc gpg head id ls make mktemp mount nproc pacman pahole perl rm sbctl sed sleep sort stat tar tr umount wget xargs xz timeout cizen-uki-sync)
   local -a missing_cmds=() missing_pkgs=()
 
-  # --clang (o LTO, que solo se compila con clang/lld): clang y lld pasan a ser
-  # dependencias OBLIGATORIAS, se ofrecen e instalan igual que el resto (mismo
-  # flujo check → sudo pacman -S --needed → fatal si se rechaza). Nunca degrada
-  # a gcc: si el usuario eligió LLVM/Clang se respeta como elección explícita.
-  if [ "$CLANG_REQUESTED" = true ]; then
-    tools+=(clang ld.lld)
+  # Compilador de preferencia (--cc / CIZEN_CC): la familia clang exige ld.lld
+  # (LLVM=1) y, con clang genérico, también clang. Un compilador CONCRETO
+  # (gcc-14 / clang-17 / ruta) se exige igual que cualquier dependencia: si es
+  # versionado se ofrece su paquete Arch homónimo (gcc14/clang17) vía el flujo
+  # estándar de instalación; una ruta personal debe existir (no hay paquete que
+  # adivinar) y se aborta si no. Nunca se degrada: tu elección es vinculante.
+  if [ "$CC_FAMILY" = "clang" ]; then
+    tools+=(ld.lld)
+    [ "$CC_LAUNCHER" = "clang" ] && tools+=(clang)
   fi
+  case "$CC_LAUNCHER" in
+    gcc|clang) ;;
+    *)
+      _ccb="$(basename -- "$CC_LAUNCHER")"
+      if [[ "$_ccb" =~ ^(gcc|clang)[-_]?[0-9]+$ ]]; then
+        if ! command -v -- "$CC_LAUNCHER" >/dev/null 2>&1; then
+          missing_cmds+=("$CC_LAUNCHER")
+          missing_pkgs+=("${_ccb//-/}")
+        fi
+      else
+        command -v -- "$CC_LAUNCHER" >/dev/null 2>&1 || \
+          fatal "Compilador de preferencia no encontrado: $CC_LAUNCHER (instálalo o pasa una ruta válida)."
+      fi
+      unset _ccb
+      ;;
+  esac
 
   for cmd in "${tools[@]}"; do
     if command -v "$cmd" >/dev/null 2>&1; then
@@ -5769,6 +5818,13 @@ resolve_sign_uki
 # COMPILACIÓN
 # ============================================================
 declare -a MAKE_CC_OPTS=()
+# El compilador elegido (--cc) es vinculante: LLVM=1 solo para la familia clang;
+# en GCC genérico se deja que Kbuild resuelva CC por PATH, y con un binario
+# concreto (gcc-14 / clang-17 / ruta) se fuerza siempre CC/HOSTCC a ese binario.
+if [ "$CC_FAMILY" = "clang" ]; then
+  MAKE_CC_OPTS+=('LLVM=1')
+  export LLVM=1
+fi
 if command -v ccache >/dev/null 2>&1; then
   export CCACHE_DIR="${CCACHE_DIR:-$HOME/.cache/ccache}"
   # Tuning (no destructivo, silencioso):
@@ -5781,16 +5837,20 @@ if command -v ccache >/dev/null 2>&1; then
     ccache -o max_size="$CCACHE_MAX_SIZE" >/dev/null 2>&1 || true
   fi
   MAKE_CC_OPTS+=(
-    'CC=ccache gcc'
-    'HOSTCC=ccache gcc'
+    "CC=ccache $CC_LAUNCHER"
+    "HOSTCC=ccache $CC_LAUNCHER"
   )
   # No fijamos KBUILD_BUILD_TIMESTAMP. Kbuild utilizará la fecha/hora real
   # de compilación, evitando que uname -a muestre una fecha artificial.
   # La reproducibilidad temporal puede activarse explícitamente desde el
   # entorno si el usuario exporta KBUILD_BUILD_TIMESTAMP antes de ejecutar.
-  ok "ccache activo: $CCACHE_DIR (CC/HOSTCC forzados; timestamp de build real)"
+  ok "ccache activo: $CCACHE_DIR (CC/HOSTCC=$CC_LAUNCHER; timestamp de build real)"
 else
   warn "ccache no instalado; compilación normal."
+  case "$CC_LAUNCHER" in
+    gcc|clang) ;;   # Kbuild resuelve el genérico por PATH
+    *) MAKE_CC_OPTS+=("CC=$CC_LAUNCHER" "HOSTCC=$CC_LAUNCHER") ;;
+  esac
 fi
 
 export KCFLAGS="${KCFLAGS:--pipe}"
@@ -5817,25 +5877,15 @@ case "$CIZEN_CPU_OPT" in
     ;;
 esac
 
-# Build con LLVM/Clang (--clang): Kbuild aplica LLVM=1 (CC=clang, ld.lld,
-# llvm-ar/nm, etc.). clang/lld ya se exigieron e instalaron como dependencias
-# obligatorias en check_prerequisites (--clang / LTO → jamás se degrada a gcc);
-# esta sanidad solo es una red de seguridad.
+# Build con LLVM/Clang (LLVM=1): CC=clang, ld.lld, llvm-ar/nm, etc. La toolchain
+# ya se exigió e instaló como dependencia obligatoria en check_prerequisites por
+# el compilador de preferencia (--clang / --cc familia clang / LTO → jamás se
+# degrada a gcc); esta sanidad solo es una red de seguridad.
 CLANG_BUILD=false
 if [ "$CLANG_REQUESTED" = true ]; then
-  if command -v clang >/dev/null 2>&1 && command -v ld.lld >/dev/null 2>&1; then
-    if command -v ccache >/dev/null 2>&1; then
-      MAKE_CC_OPTS+=(
-        'LLVM=1'
-        'CC=ccache clang'
-        'HOSTCC=ccache clang'
-      )
-    else
-      MAKE_CC_OPTS+=('LLVM=1')
-    fi
-    export LLVM=1
+  if command -v "$CC_LAUNCHER" >/dev/null 2>&1; then
     CLANG_BUILD=true
-    ok "Compilación con LLVM/Clang (LLVM=1)."
+    ok "Compilación con LLVM/Clang (LLVM=1; $CC_LAUNCHER)."
   else
     fatal "clang/ld.lld no están disponibles pese a exigirse como dependencia (sudo pacman -S clang lld)."
   fi

@@ -89,6 +89,7 @@ extract() { # $1 = nombre de función (hasta el `}` inicial en columna 0)
   extract patch_desc_ntsync
   extract patch_desc_fsync
   extract kernel_version_ge
+  extract _resolve_cc_compiler
   extract resolve_kernel_tree
   extract resolve_cachyos_release
   extract process_frag_file
@@ -584,13 +585,61 @@ for _fn in uki_backup_prev module_sign_installed luks_fde_audit apply_cachy_misc
 done
 unset _fn _def _call
 
-printf '%s\n' "== clang/lld como dependencias OBLIGATORIAS cuando el usuario elige LLVM (--clang/LTO) =="
-if grep -q 'tools+=(clang ld.lld)' "$MOTOR"; then
-  rec ok "check_prerequisites exige clang+ld.lld cuando CLANG_REQUESTED=true"
+printf '%s\n' "== compilador de preferencia (--cc): familias, versiones y rutas (_resolve_cc_compiler) =="
+CIZEN_CC=auto; CIZEN_LLVM_LTO=0; CLANG_REQUESTED=false; _resolve_cc_compiler
+[ "$CC_FAMILY" = gcc ] && [ "$CC_LAUNCHER" = gcc ] && [ "$CLANG_REQUESTED" = false ] \
+  && rec ok "auto sin LTO -> GCC (launcher gcc, CLANG_REQUESTED=false)" \
+  || rec fail "auto sin LTO -> esperaba gcc/gcc/false (got $CC_FAMILY/$CC_LAUNCHER/$CLANG_REQUESTED)"
+CIZEN_CC=auto; CIZEN_LLVM_LTO=thin; CLANG_REQUESTED=false; _resolve_cc_compiler
+[ "$CC_FAMILY" = clang ] && [ "$CC_LAUNCHER" = clang ] && [ "$CLANG_REQUESTED" = true ] \
+  && rec ok "auto con LTO -> clang (LLVM=1)" \
+  || rec fail "auto+LTO -> esperaba clang/clang/true (got $CC_FAMILY/$CC_LAUNCHER)"
+CIZEN_CC=gcc; CIZEN_LLVM_LTO=thin; CLANG_REQUESTED=true; _resolve_cc_compiler
+[ "$CC_FAMILY" = gcc ] && [ "$CLANG_REQUESTED" = false ] \
+  && rec ok "gcc explícito gana sobre --clang/LTO previos (CLANG_REQUESTED=false)" \
+  || rec fail "gcc explícito -> esperaba gcc/false (got $CC_FAMILY/$CLANG_REQUESTED)"
+CIZEN_CC=clang; CIZEN_LLVM_LTO=0; CLANG_REQUESTED=false; _resolve_cc_compiler
+[ "$CC_FAMILY" = clang ] && [ "$CC_LAUNCHER" = clang ] && [ "$CLANG_REQUESTED" = true ] \
+  && rec ok "clang -> familia clang, launcher clang, CLANG_REQUESTED=true" \
+  || rec fail "clang -> esperaba clang/clang/true (got $CC_FAMILY/$CC_LAUNCHER)"
+CIZEN_CC=gcc-14; CIZEN_LLVM_LTO=0; CLANG_REQUESTED=true; _resolve_cc_compiler
+[ "$CC_FAMILY" = gcc ] && [ "$CC_LAUNCHER" = "gcc-14" ] \
+  && rec ok "gcc-14 -> familia gcc, launcher gcc-14, gana sobre --clang" \
+  || rec fail "gcc-14 -> esperaba gcc/gcc-14 (got $CC_FAMILY/$CC_LAUNCHER)"
+CIZEN_CC=gcc14; CLANG_REQUESTED=false; _resolve_cc_compiler
+[ "$CC_FAMILY" = gcc ] && [ "$CC_LAUNCHER" = gcc14 ] \
+  && rec ok "gcc14 (sin guion) -> familia gcc, launcher gcc14" \
+  || rec fail "gcc14 -> esperaba gcc/gcc14 (got $CC_FAMILY/$CC_LAUNCHER)"
+CIZEN_CC=clang-17; CLANG_REQUESTED=false; _resolve_cc_compiler
+[ "$CC_FAMILY" = clang ] && [ "$CC_LAUNCHER" = "clang-17" ] && [ "$CLANG_REQUESTED" = true ] \
+  && rec ok "clang-17 -> familia clang, launcher clang-17, CLANG_REQUESTED=true" \
+  || rec fail "clang-17 -> esperaba clang/clang-17/true (got $CC_FAMILY/$CC_LAUNCHER)"
+CIZEN_CC=/opt/toolchain/llvm/bin/clang-custom; CLANG_REQUESTED=false; _resolve_cc_compiler
+[ "$CC_FAMILY" = clang ] && [ "$CC_LAUNCHER" = "/opt/toolchain/llvm/bin/clang-custom" ] \
+  && rec ok "ruta con basename clang -> familia clang (LLVM)" \
+  || rec fail "ruta clang -> esperaba clang/launcher (got $CC_FAMILY/$CC_LAUNCHER)"
+CIZEN_CC=afl-gcc-fast; _resolve_cc_compiler
+[ "$CC_FAMILY" = gcc ] && [ "$CC_LAUNCHER" = afl-gcc-fast ] \
+  && rec ok "binario afl-gcc-fast -> familia gcc" \
+  || rec fail "afl-gcc-fast -> esperaba gcc (got $CC_FAMILY)"
+unset CC_FAMILY CC_LAUNCHER
+CIZEN_CC=zapache; CLANG_REQUESTED=false; _resolve_cc_compiler
+[ -z "${CC_FAMILY:-}" ] \
+  && rec ok "nombre sin gcc/clang (zapache) -> fatal (familia sin clasificar)" \
+  || rec fail "zapache -> esperaba fatal con CC_FAMILY vacío (got $CC_FAMILY)"
+
+printf '%s\n' "== clang/lld como dependencias OBLIGATORIAS según el compilador elegido =="
+if grep -q 'tools+=(ld.lld)' "$MOTOR" && grep -Fq '"$CC_LAUNCHER" = "clang" ] && tools+=(clang)' "$MOTOR"; then
+  rec ok "check_prerequisites exige ld.lld (familia clang) y clang si el launcher es genérico"
 else
-  rec fail "check_prerequisites: falta la exigencia condicional 'tools+=(clang ld.lld)'"
+  rec fail "check_prerequisites: falta la exigencia por familia (ld.lld / clang genérico)"
 fi
-if grep -q '\[ld.lld\]=lld' "$MOTOR"; then
+if grep -q 'missing_pkgs+=("${_ccb//-/}")' "$MOTOR"; then
+  rec ok "compilador versionado ausente -> paquete Arch homónimo (gcc-14 -> gcc14)"
+else
+  rec fail "versiones: falta derivar el paquete homónimo del basename"
+fi
+if grep -Fq '[ld.lld]=lld' "$MOTOR"; then
   rec ok "TOOL_PKG mapea ld.lld -> lld (autoinstalación 'sudo pacman -S lld')"
 else
   rec fail "TOOL_PKG: falta '[ld.lld]=lld'"
@@ -605,10 +654,25 @@ if grep -q 'se degrada a GCC (sudo pacman -S clang lld)'; then
 else
   rec ok "--clang sin toolchain ya no degrada a gcc (fatal en su lugar)"
 fi
-if grep -q 'jamás se degrada a gcc' "$MOTOR"; then
-  rec ok "CLANG_BUILD documenta la exigencia previa en check_prerequisites"
+if grep -q 'Nunca se degrada' "$MOTOR"; then
+  rec ok "check_prerequisites documenta que la elección del compilador es vinculante"
 else
-  rec fail "CLANG_BUILD: falta la sanidad/documentación de dependencias exigidas"
+  rec fail "check_prerequisites: falta la sanidad/documentación de la elección vinculante"
+fi
+if grep -Fq '"$CIZEN_LLVM_LTO" != "0" ] && [ "$CC_FAMILY" = "gcc" ]; then' "$MOTOR"; then
+  rec ok "sanity LTO usa CC_FAMILY (gcc elegido -> se ignora el LTO)"
+else
+  rec fail "sanity LTO: falta la guarda por familia"
+fi
+if grep -q '"CC=ccache $CC_LAUNCHER"' "$MOTOR"; then
+  rec ok "make usa CC/HOSTCC=ccache $""CC_LAUNCHER (tu compilador con ccache)"
+else
+  rec fail "make: falta la emisión con CC_LAUNCHER bajo ccache"
+fi
+if grep -q "'CC=ccache gcc'"; then
+  rec fail "queda hardcode 'CC=ccache gcc' (debería ser $CC_LAUNCHER)"
+else
+  rec ok "no queda hardcode 'CC=ccache gcc' en la emisión de make"
 fi
 
 # --- resumen ---

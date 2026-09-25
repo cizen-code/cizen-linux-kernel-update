@@ -1,3 +1,30 @@
+## [27.31.2] - 2026-09-24
+
+El compilador de compilación es ahora **de tu preferencia**: puedes elegir una
+versión concreta o un binario/ruta propio, no solo la familia genérica gcc/clang.
+
+- `--cc` / `CIZEN_CC` acepta `auto | gcc | clang` (como siempre), versiones de
+  Arch (`gcc-14`, `gcc14`, `clang-17`, `clang17`) o una ruta/binario propio
+  (`/opt/.../clang-custom`, `afl-gcc-fast`; la familia se infiere del basename).
+- Nueva `_resolve_cc_compiler()`: deduce la familia (gcc|clang) y el binario
+  efectivo `CC_LAUNCHER` que se usa de verdad en make. La elección explícita
+  (`--cc gcc` / `--cc gcc-14`) gana sobre la bandera `--clang` previa: se
+  compila con lo que pediste.
+- Kbuild: familia clang → `LLVM=1`; con ccache → `CC=ccache $CC_LAUNCHER` /
+  `HOSTCC=...`; binario concreto sin ccache → `CC=$CC_LAUNCHER`. Eliminado el
+  hardcode `CC=ccache gcc`.
+- Dependencia obligatoria igual que el resto: si el compilador elegido no está,
+  `check_prerequisites` lo exige y ofrece instalarlo — package Arch homónimo
+  para versionados (`gcc-14` → `gcc14`, `clang-17` → `clang17`), fatal con
+  ruta/instalación manual si es un binario personal. Familia clang exige
+  `ld.lld`; genérico clang exige también `clang`.
+- LTO saneness por familia: con GCC elegido (+LTO) se ignora el LTO (aviso);
+  con `auto` + LTO se selecciona clang y se exige la toolchain.
+- Menú (opción 14): añadida la entrada para teclear tu compilador (auto/gcc/
+  clang u otro: versión o ruta); lo que escribas se pasa a `--cc`.
+- Selftest 86→100 checks (tabla de `_resolve_cc_compiler`, prereqs por familia,
+  emisión de make); `bash -n`; repo==instalado.
+
 ## [27.31.1] - 2026-09-24
 
 clang y lld pasan a ser dependencias **obligatorias** (con el mismo flujo de

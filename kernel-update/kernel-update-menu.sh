@@ -141,6 +141,7 @@ while true; do
        printf '    %bauto%b  elige según el sistema (clang si LTO/toolchain LLVM viable; si no gcc) (default)\n' "$W" "$N"
        printf '    %bgcc%b   compilador GCC\n' "$W" "$N"
        printf '    %bclang%b Clang/LLVM (necesario para el LTO)\n' "$W" "$N"
+       printf '    %botro%b  teclea TU compilador (p. ej. gcc-14, clang-17 o una ruta). Se exigirá como dependencia si falta.\n' "$W" "$N"
        printf '  %bCC%b [Enter=%blauto%b]: ' "$W" "$N" "$Y" "$N"
        read -r cc
        args="--absorb-rebels"
