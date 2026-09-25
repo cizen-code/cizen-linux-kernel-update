@@ -79,6 +79,16 @@ download_small_file() { download_file "$@"; }
 printf 'config SCHED_BORE\n--- a/init/Kconfig\n+++ b/init/Kconfig\n' > "$ROOT/patch-cachy.patch"
 cp -- "$ROOT/patch-cachy.patch" "$ROOT/patch-upstream.patch"
 
+# stub del blob embebido (v27.31.5): el motor NO extrae la función real de
+# 2283+ líneas al harness; se sustituye por base64(gzip) de un parche sintético
+# con el mismo PATCH_MAGIC que bmq y un marcador propio del harness. El test del
+# camino embebido reemplaza este stub por uno con marcador FORWARD-EMBED-TEST
+# para distinguir qué parche (main vs embed) está pasando por el dry-run.
+patch_embed_b64_prjc_cachy() {
+  printf 'config SCHED_BMQ\n--- a/init/Kconfig\n+++ b/init/Kconfig\n' \
+    | gzip | base64 | tr -d '\n'
+}
+
 # --- extraer funciones del motor -------------------------------------
 extract() { # $1 = nombre de función (hasta el `}` inicial en columna 0)
   sed -n "/^[[:space:]]*$1() {/,/^}/p" "$MOTOR"
@@ -390,6 +400,52 @@ rm -f -- "$ROOT/patch-bmq.patch"
 # restaura el stub bueno de descarga para el resto del harness
 download_file() { download_file_good "$@"; }
 unset releases_json
+
+printf '%s\n' "== apply_patch_plugin: forward-port embebido como fallback (v27.31.5) =="
+# Escenario: el main upstream no aplica (LAST_SERVED=cachy -> dry-run rc=1) y el
+# stub patch distingue el parche embebido por su marcador... pero el stub patch()
+# DEL HARNESS decide por LAST_SERVED, no por contenido. Para ejercitar el camino
+# embebido sin árbol real, se sustituye PATCH_EMBED_B64 por base64(gzip) de un
+# parche con marcador único y se reemplaza patch() por uno que lee stdin:
+#   - si el fichero contiene FORWARD-EMBED-TEST  -> aplica (rc=0)   [embebido]
+#   - si no                                    -> rechaza (rc=1)  [main/upstream]
+rm -rf "$SRC/kernel/sched"; mkdir -p "$SRC"
+PATCHES_APPLIED=(); PATCH_ENABLE_ALL=(); PATCH_REBEL_ALL=(); PATCH_DISABLE_ALL=(); BORE_ENABLED=false
+KERNEL_TREE=cachyos; DL_CALLED=0
+patch() {
+  local contenido
+  IFS= read -r -d '' contenido || true
+  case "$contenido" in
+    *FORWARD-EMBED-TEST*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+patch_embed_b64_prjc_cachy() {
+  printf 'config SCHED_BMQ\nFORWARD-EMBED-TEST\n--- a/init/Kconfig\n+++ b/init/Kconfig\n' \
+    | gzip | base64 | tr -d '\n'
+}
+: > "$ROOT/dl.log"
+if apply_patch_plugin bmq; then
+  rec ok "fallback embebido: flujo completo aplica (embebido > upstream)"
+else
+  rec fail "fallback embebido debía aplicar (degrade upstream)"
+fi
+if grep -q 'FORWARD-EMBED-TEST' "$KERNEL_BUILD_ROOT/prjc-bmq-7.2.patch" 2>/dev/null; then
+  rec ok "el parche real usado es el embebido (marcador presente en dest)"
+else
+  rec fail "el destino no contiene el parche embebido: [$(ls "$KERNEL_BUILD_ROOT" 2>/dev/null)]"
+fi
+[ "${PATCHES_APPLIED[*]:-}" = "bmq" ] && rec ok "bmq registrado tras camino embebido" || rec fail "PATCHES_APPLIED= [${PATCHES_APPLIED[*]:-}]"
+# solo el main se descarga; el embebido NO toca la red y evita el upstream
+[ "$DL_CALLED" -le 1 ] && rec ok "embebido evita descargas extra (DL_CALLED=$DL_CALLED)" || rec fail "descargas inesperadas (DL_CALLED=$DL_CALLED)"
+# restaura el stub patch() del harness (decide por LAST_SERVED)
+patch() {
+  if [ "$LAST_SERVED" = "cachy" ]; then return 1; else return 0; fi
+}
+patch_embed_b64_prjc_cachy() {
+  printf 'config SCHED_BMQ\n--- a/init/Kconfig\n+++ b/init/Kconfig\n' \
+    | gzip | base64 | tr -d '\n'
+}
 
 printf '%s\n' "== patch_desc: skip por versión (ntsync / fsync) =="
 VERSION_SAVE="$VERSION"

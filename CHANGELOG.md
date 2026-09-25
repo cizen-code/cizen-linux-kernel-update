@@ -1,3 +1,23 @@
+## [27.31.5] - 2026-09-24
+
+Compila los kernels del fork CachyOS con su scheduler PRJC (bmq/pds) incluso cuando
+el forward-port `master/7.2` de CachyOS/kernel-patches ya no aplica limpio sobre la
+release publicada (p. ej. `cachyos-7.2.7-1`, que refactorizó `fair.c`/`exit.c`/`Kconfig.preempt`).
+
+- Nuevo fallback intermedio en `apply_patch_plugin`: si el main upstream no aplica,
+  se intenta un **forward-port incrustado en el motor** (`PATCH_EMBED_B64`): blob
+  base64 (de un `.gz`) del `0001-prjc-cachy.patch` regenerado contra el árbol real
+  del fork. Se decodifica, se valida por marcador + `patch --dry-run` y, si vale, se
+  usa en vez de degradar a vanilla. Si tampoco aplica, se sigue con el upstream.
+- `source_tree_kind()` detecta el tipo del árbol conservado (`cachyos` si existe
+  `kernel/sched/poc_selector.c`, si no `vanilla`); `extract_tarball()` reutiliza el
+  árbol SÓLO si coincide el tipo con `KERNEL_TREE` (fix del bug de reutilizar el
+  árbol vanilla stale aunque `make kernelversion` diera la misma versión).
+- El blob embebido es el parche forward-port validado por compilación: en 7.2.7-1
+  `kernel/` y `kernel/sched/` compilan con `CONFIG_SCHED_ALT=y + CONFIG_SCHED_BMQ=y`
+  (smoke build real). Solo los descriptores bmq/pds llevan embed (lfbmq/muqss usan
+  MAIN file propio).
+
 ## [27.31.4] - 2026-09-24
 
 Arreglado un cuelgue del motor al resolver el release del fork CachyOS (elección
