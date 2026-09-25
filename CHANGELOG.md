@@ -1,3 +1,38 @@
+## [27.31.8] - 2026-09-24
+
+Primera build clang real (tras el fix de v27.31.7) rompía en `build()` con
+`llvm-ar: orden no encontrada`: con `LLVM=1`, Kbuild usa `llvm-ar` en lugar de
+`ar` para archivar objetos, y `check_prerequisites` solo exigía `clang` + `ld.lld`.
+
+- `check_prerequisites` ahora exige la **toolchain LLVM completa** cuando
+  `CC_FAMILY=clang`: `ld.lld` + `llvm-ar` + `llvm-nm` + `llvm-objcopy` +
+  `llvm-strip` + `llvm-objdump` + `llvm-readelf` (y clang si el launcher es
+  genérico). `TOOL_PKG` mapea toda la familia `llvm-*` al paquete `llvm`, así que
+  la falta entra por el flujo estándar `sudo pacman -S --needed ... llvm`, igual
+  que el resto de dependencias (sin degradar ni abortar a mano).
+- Selftest: guardas para la familia clang (`tools+=(ld.lld llvm-ar ... llvm-readelf)`)
+  y los mapeos `[llvm-*]=llvm` en TOOL_PKG. 121/121 OK.
+
+## [27.31.7] - 2026-09-24
+
+Al compilar con clang (`LLVM=1`), las fases de preparación de config
+(`listnewconfig`/`olddefconfig`/`localmodconfig`) corrían con el compilador por
+defecto (gcc), así que los símbolos que solo existen con `CC_IS_CLANG` (p. ej.
+`AUTOFDO_CLANG`, "Enable Clang's AutoFDO build") quedaban **fuera de `.config`**.
+Entonces el build real con `LLVM=1` re-ejecutaba `conf --syncconfig`, los veía
+como `(NEW)` y **preguntaba interactivamente** ("Restart config...") colgando la
+compilación esperando respuesta en una terminal no supervisada.
+
+- Nuevo array `KCONFIG_CC_OPTS`: se construye justo tras resolver el compilador y
+  lleva `LLVM=1` cuando `CC_FAMILY=clang` (y `CC/HOSTCC` si el launcher es un
+  binario/ruta concreta). Se inyecta en TODAS las fases de preparación de config:
+  `run_kconfig_audit` (`listnewconfig` + `olddefconfig`), `prepare_lite_config`
+  (su `olddefconfig` final) y `apply_patch_and_recheck`. La preparación ya ve el
+  mismo compilador que la build → los símbolos clang quedan fijados con su default
+  y `syncconfig` no tiene nada que preguntar.
+- Selftest: nueva sección "KCONFIG_CC_OPTS" (declaración del array, rama LLVM=1
+  para clang, y presencia en audit/lite/recheck). 119/119 OK.
+
 ## [27.31.6] - 2026-09-24
 
 Al compilar un kernel del fork CachyOS con scheduler alternativo (bmq/pds/lfbmq,

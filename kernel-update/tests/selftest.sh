@@ -699,8 +699,8 @@ CIZEN_CC=zapache; CLANG_REQUESTED=false; _resolve_cc_compiler
   || rec fail "zapache -> esperaba fatal con CC_FAMILY vacío (got $CC_FAMILY)"
 
 printf '%s\n' "== clang/lld como dependencias OBLIGATORIAS según el compilador elegido =="
-if grep -q 'tools+=(ld.lld)' "$MOTOR" && grep -Fq '"$CC_LAUNCHER" = "clang" ] && tools+=(clang)' "$MOTOR"; then
-  rec ok "check_prerequisites exige ld.lld (familia clang) y clang si el launcher es genérico"
+if grep -q 'tools+=(ld.lld llvm-ar llvm-nm llvm-objcopy llvm-strip llvm-objdump llvm-readelf)' "$MOTOR" && grep -Fq '"$CC_LAUNCHER" = "clang" ] && tools+=(clang)' "$MOTOR"; then
+  rec ok "check_prerequisites exige la toolchain LLVM completa (ld.lld + llvm-* + clang genérico)"
 else
   rec fail "check_prerequisites: falta la exigencia por familia (ld.lld / clang genérico)"
 fi
@@ -814,6 +814,49 @@ if check_profile_contradictions 2>/dev/null; then
   rec ok "check_profile_contradictions tolera el retiro (sin falsa contradicción)"
 else
   rec fail "check_profile_contradictions rompió tras retirar símbolos"
+fi
+
+if grep -Fq 'tools+=(ld.lld llvm-ar llvm-nm llvm-objcopy llvm-strip llvm-objdump llvm-readelf)' "$MOTOR"; then
+  rec ok "familia clang exige ld.lld + llvm-* completos (LLVM=1 usa llvm-ar/nm/objcopy/strip/objdump/readelf)"
+else
+  rec fail "check_prerequisites: con clang faltaba la toolchain llvm-* completa (paquete llvm)"
+fi
+if grep -Fq '[llvm-ar]=llvm' "$MOTOR" && grep -Fq '[llvm-nm]=llvm' "$MOTOR" && grep -Fq '[llvm-objcopy]=llvm' "$MOTOR" && grep -Fq '[llvm-strip]=llvm' "$MOTOR" && grep -Fq '[llvm-readelf]=llvm' "$MOTOR"; then
+  rec ok "TOOL_PKG mapea la toolchain llvm-* -> llvm (autoinstalación 'sudo pacman -S llvm')"
+else
+  rec fail "TOOL_PKG: faltan mapeos llvm-* -> llvm"
+fi
+
+printf '%s\n' "== KCONFIG_CC_OPTS: las fases de preparación usan el compilador del build (v27.31.7) =="
+if grep -q 'declare -a KCONFIG_CC_OPTS=()' "$MOTOR"; then
+  rec ok "motor declara KCONFIG_CC_OPTS (opts de CC para fases Kconfig)"
+else
+  rec fail "KCONFIG_CC_OPTS: falta la declaración del array"
+fi
+if grep -qE 'CC_FAMILY" = "clang"' "$MOTOR" && grep -Fq "KCONFIG_CC_OPTS+=('LLVM=1')" "$MOTOR"; then
+  rec ok "KCONFIG_CC_OPTS (+=LLVM=1) cuando la familia es clang"
+else
+  rec fail "KCONFIG_CC_OPTS: falta la rama LLVM=1 para familia clang"
+fi
+if grep -q 'make "\${KCONFIG_CC_OPTS\[@\]}" olddefconfig' "$MOTOR"; then
+  rec ok "run_kconfig_audit llama olddefconfig con KCONFIG_CC_OPTS (mismo CC que el build)"
+else
+  rec fail "run_kconfig_audit: olddefconfig sin KCONFIG_CC_OPTS"
+fi
+if grep -q 'make "\${KCONFIG_CC_OPTS\[@\]}" listnewconfig' "$MOTOR"; then
+  rec ok "listnewconfig también ve el compilador del build"
+else
+  rec fail "listnewconfig sin KCONFIG_CC_OPTS"
+fi
+if grep -q 'make "\${KCONFIG_CC_OPTS\[@\]}" ARCH="\$karch" olddefconfig' "$MOTOR"; then
+  rec ok "prepare_lite_config usa KCONFIG_CC_OPTS en su olddefconfig final"
+else
+  rec fail "lite: olddefconfig final sin KCONFIG_CC_OPTS"
+fi
+if grep -q 'make "\${KCONFIG_CC_OPTS\[@\]}" olddefconfig; then' "$MOTOR"; then
+  rec ok "apply_patch_and_recheck usa KCONFIG_CC_OPTS al re-configurar con parche"
+else
+  rec fail "apply_patch_and_recheck: olddefconfig sin KCONFIG_CC_OPTS"
 fi
 
 # --- resumen ---

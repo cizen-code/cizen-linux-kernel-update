@@ -128,7 +128,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.6"
+SCRIPT_VERSION="27.31.8"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -725,6 +725,20 @@ if [ "$CIZEN_LLVM_LTO" != "0" ] && [ "$CC_FAMILY" = "gcc" ]; then
   warn "LTO (${CIZEN_LLVM_LTO}) exige clang; el compilador elegido es GCC (${CC_LAUNCHER}); se ignora el LTO."
   CIZEN_LLVM_LTO=0
 fi
+# v27.31.7: las fases de preparación de config (listnewconfig/olddefconfig/
+# localmodconfig) deben ver el MISMO compilador que la build real. Si se
+# preparan con gcc y se compila con LLVM=1 (clang), los símbolos que solo
+# existen con CC_IS_CLANG (p. ej. AUTOFDO_CLANG) quedan fuera de .config y el
+# syncconfig del build los trata como (NEW) → conf pide respuestas interactivas
+# (prompt "Restart config...") y cuelga una compilación no interactiva.
+declare -a KCONFIG_CC_OPTS=()
+if [ "$CC_FAMILY" = "clang" ]; then
+  KCONFIG_CC_OPTS+=('LLVM=1')
+fi
+case "$CC_LAUNCHER" in
+  gcc|clang) ;;  # genérico: Kbuild resuelve por PATH
+  *) KCONFIG_CC_OPTS+=("CC=$CC_LAUNCHER" "HOSTCC=$CC_LAUNCHER") ;;
+esac
 case "$CIZEN_CFLAGS_OLEVEL" in inherit|2|3) ;; *) fatal "CIZEN_CFLAGS_OLEVEL inválido: $CIZEN_CFLAGS_OLEVEL (use inherit, 2 o 3)." ;; esac
 case "$CIZEN_CPU_OPT" in
   inherit|generic|native) ;;
@@ -1497,6 +1511,8 @@ declare -A TOOL_PKG=(
   [umount]=util-linux [wget]=wget          [xargs]=findutils
   [xz]=xz
   [clang]=clang          [lld]=lld          [llvm-ar]=llvm
+  [llvm-nm]=llvm         [llvm-objcopy]=llvm [llvm-strip]=llvm
+  [llvm-objdump]=llvm    [llvm-readelf]=llvm
   [ld.lld]=lld
   [mokutil]=mokutil      [openssl]=openssl  [dpkg]=dpkg
   [objcopy]=binutils     [readelf]=binutils
@@ -1550,7 +1566,7 @@ check_prerequisites() {
   # estándar de instalación; una ruta personal debe existir (no hay paquete que
   # adivinar) y se aborta si no. Nunca se degrada: tu elección es vinculante.
   if [ "$CC_FAMILY" = "clang" ]; then
-    tools+=(ld.lld)
+    tools+=(ld.lld llvm-ar llvm-nm llvm-objcopy llvm-strip llvm-objdump llvm-readelf)
     [ "$CC_LAUNCHER" = "clang" ] && tools+=(clang)
   fi
   case "$CC_LAUNCHER" in
@@ -5414,7 +5430,7 @@ prepare_lite_config() {
       && LSMOD="$keepfile" perl scripts/kconfig/streamline_config.pl --localmodconfig "$SRC" Kconfig > .config.cizen-lite 2> "$lite_log" \
       && mv -f .config .config.cizen-lite.old \
       && mv -f .config.cizen-lite .config \
-      && make ARCH="$karch" olddefconfig >> "$lite_log" 2>&1 \
+      && make "${KCONFIG_CC_OPTS[@]}" ARCH="$karch" olddefconfig >> "$lite_log" 2>&1 \
       && rm -f .config.cizen-lite.old ); then
     ok "Config lite generada: solo se compilarán los módulos en uso ($keep_lines en allowlist)."
     lite_gap="$(lite_missing_check "$lite_log" 2>/dev/null || true)"
@@ -5752,7 +5768,7 @@ run_kconfig_audit() {
   export KCONFIG_WARN_CHANGED_INPUT=1
 
   log "Detectando símbolos nuevos antes de olddefconfig..."
-  NEWCONFIG_OUTPUT="$(make listnewconfig 2>&1 || true)"
+  NEWCONFIG_OUTPUT="$(make "${KCONFIG_CC_OPTS[@]}" listnewconfig 2>&1 || true)"
   if printf '%s\n' "$NEWCONFIG_OUTPUT" | grep -qE '^CONFIG_|^# CONFIG_'; then
     # Con parches/BTF activos, sus símbolos aparecerán aquí como nuevos (los
     # introduce el parche). Son esperados; se auditán en la validación vía
@@ -5774,7 +5790,7 @@ run_kconfig_audit() {
   fi
 
   log "Normalizando con olddefconfig..."
-  OLDCONFIG_OUTPUT="$(make olddefconfig 2>&1)" || {
+  OLDCONFIG_OUTPUT="$(make "${KCONFIG_CC_OPTS[@]}" olddefconfig 2>&1)" || {
     err "olddefconfig falló."
     printf '%s\n' "$OLDCONFIG_OUTPUT" | tail -80 >&2 || true
     return 1
@@ -8148,7 +8164,7 @@ apply_patch_and_recheck() {
   build_effective_arrays
   check_profile_contradictions
   log "Reconfigurando con ${PATCH_DISP_NAME:-$__pn} aplicado (olddefconfig + perfil + auditoría + validación)..."
-  if ! make olddefconfig; then
+  if ! make "${KCONFIG_CC_OPTS[@]}" olddefconfig; then
     err "olddefconfig falló tras aplicar ${PATCH_DISP_NAME:-$__pn}."
     return 1
   fi
