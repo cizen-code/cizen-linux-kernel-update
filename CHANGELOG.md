@@ -1,3 +1,11 @@
+## [27.31.3] - 2026-09-24
+
+Arreglado un aborto del motor al resolver el árbol de fuentes del fork CachyOS.
+
+- `resolve_kernel_tree()` terminaba con `[ "$KERNEL_TREE" = "auto" ] && KERNEL_TREE="vanilla"`: al resolver `auto → cachyos` (scheduler bmq/pds/lfbmq/muqss) ese test devolvía 1 y, bajo `set -Eeuo pipefail` + trap ERR, la llamada desnuda en la línea 5451 abortaba la operación ("Error 1 en línea 5451") antes de descargar nada. Sustituido por un `if` que no propaga el estado de salida 1.
+- El árbol `cachyos` se resuelve y continúa el flujo normalmente.
+- Selftest: añadido test de regresión (resolve bajo `set -e`) → es el motivo por el que el harness anterior no lo cazaba (usaba `set -u` sin `-e`).
+
 ## [27.31.2] - 2026-09-24
 
 El compilador de compilación es ahora **de tu preferencia**: puedes elegir una

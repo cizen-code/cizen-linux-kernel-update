@@ -317,6 +317,10 @@ PATCH_NAMES=()
 resolve_kernel_tree
 [ "$KERNEL_TREE" = "vanilla" ] && rec ok "auto sin parches -> vanilla" || rec fail "auto sin parches -> KERNEL_TREE=$KERNEL_TREE"
 PATCH_NAMES=()
+( set -e; PATCH_NAMES=(bmq)
+  resolve_kernel_tree; [ "$KERNEL_TREE" = "cachyos" ] ) \
+  && rec ok "resolve_kernel_tree no aborta bajo set -e (regresión fix v27.31.3)" \
+  || rec fail "resolve_kernel_tree aborta bajo set -e (regresión fix v27.31.3)"
 
 printf '%s\n' "== resolve_cachyos_release (v27.31.0): parseo del JSON de releases =="
 releases_json() {

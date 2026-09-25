@@ -128,7 +128,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.2"
+SCRIPT_VERSION="27.31.3"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -1032,7 +1032,9 @@ resolve_kernel_tree() {
         pds|bmq|lfbmq|muqss) KERNEL_TREE="cachyos"; break ;;
       esac
     done
-    [ "$KERNEL_TREE" = "auto" ] && KERNEL_TREE="vanilla"
+    if [ "$KERNEL_TREE" = "auto" ]; then
+      KERNEL_TREE="vanilla"
+    fi
   fi
 }
 
