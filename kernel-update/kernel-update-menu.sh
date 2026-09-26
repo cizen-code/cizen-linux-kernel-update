@@ -11,7 +11,8 @@
 #            muestra la stable; sin conexión indica la opción 6.
 # Opciones: 1-4 validación/build, 5 force, 6 check-update, 7/8 BORE,
 # 14 buildvariant (scheduler/tuning), 15 ntsync, 16 cachy, 17 manager,
-# 9 rollback, 10 kcfg, 11 selftest, 12 changelog, 13 hardened, 0 salir.
+# 9 rollback (reinstala el PAQUETE del kernel anterior), 10 kcfg, 11 selftest,
+# 12 changelog, 13 hardened, 0 salir.
 # ============================================================
 set -uo pipefail
 
@@ -110,6 +111,35 @@ if [ -z "$REMOTE" ] && [ -t 0 ]; then
   REMOTE="$(discover_remote 2>/dev/null || true)"
 fi
 
+# ── Estado del rollback (opción 9) ──────────────────────────────
+# v27.31.24: el rollback reinstala el PAQUOTE del kernel anterior, no solo
+# extrae ficheros, y ese paquete es de un build concreto (con su scheduler).
+# Decirlo en la propia opción evita el viaje a la terminal para descubrir que no
+# hay nada que deshacer — o, peor, que hay algo distinto de lo que uno creería.
+ROLLBACK_SCRIPT="${CIZEN_KROLLBACK_SCRIPT:-/usr/local/bin/kernel-update/kernel-update-rollback.sh}"
+ROLLBACK_DIR="${CIZEN_ROLLBACK_DIR:-/var/lib/kernel-update/rollback}"
+
+rollback_resumen() { # una línea para la etiqueta de la opción 9
+  local mf="$ROLLBACK_DIR/rollback.info" pkgbase pkgver sched pkgfile
+  if [ ! -r "$mf" ]; then
+    # Sin manifiesto legible: puede no haber nada, o estar en un dir con otro
+    # permiso. No se inventa: se dice lo que se sabe.
+    if [ -d "$ROLLBACK_DIR" ]; then printf 'no hay kernel anterior preservado'; else printf 'nunca se ha hecho rollback'; fi
+    return 0
+  fi
+  pkgbase="$(sed -n 's/^pkgbase=//p' "$mf" 2>/dev/null | head -n1)"
+  pkgver="$(sed -n 's/^pkgver=//p' "$mf" 2>/dev/null | head -n1)"
+  sched="$(sed -n 's/^sched=//p' "$mf" 2>/dev/null | head -n1)"
+  pkgfile="$(sed -n 's/^pkgfile=//p' "$mf" 2>/dev/null | head -n1)"
+  if [ -z "$pkgver" ]; then
+    printf 'sin kernel anterior preservado'
+  elif [ -n "$pkgfile" ] && [ -r "$ROLLBACK_DIR/$pkgfile" ]; then
+    printf '%s-%s%s' "${pkgbase:-linux-cizen-v3}" "$pkgver" "${sched:+ ($sched)}"
+  else
+    printf '%s-%s%s ⚠ sin paquete' "${pkgbase:-linux-cizen-v3}" "$pkgver" "${sched:+ ($sched)}"
+  fi
+}
+
 LOCAL="$(uname -r)"
 MOTOR_VER="$(awk -F'"' '/^SCRIPT_VERSION=/{print $2; exit}' "$SCRIPT" 2>/dev/null || true)"
 [ -n "$MOTOR_VER" ] && MOTOR_VER="v$MOTOR_VER"
@@ -196,7 +226,7 @@ opt 17 "manager"    "gestor de kernels instalados"
 rule
 echo "  ${W}Consulta y sistema${N}"
 opt 6 "check-update" "última stable de kernel.org"
-opt 9 "rollback"    "restaurar kernel previo"
+opt 9 "rollback"    "volver al kernel anterior · $(rollback_resumen)"
 rule
 
 while true; do
@@ -210,7 +240,16 @@ while true; do
     6) exec "$SCRIPT" --check-update ;;
     7) exec "$SCRIPT" --absorb-rebels --patch bore ;;
     8) CIZEN_BUILD_PRIORITY=normal exec "$SCRIPT" --absorb-rebels --patch bore ;;
-    9) exec /usr/local/bin/kernel-update/kernel-update-rollback.sh ;;
+    9) if [ -x "$ROLLBACK_SCRIPT" ]; then
+         exec "$ROLLBACK_SCRIPT"
+       else
+         # exec de un path inexistente solo da un error de bash que no explica
+         # nada: el script de rollback vive aparte del motor y se puede instalar
+         # (o desinstalar) por su cuenta.
+         printf '  %b✗%b No está %s\n' "$R" "$N" "$ROLLBACK_SCRIPT"
+         printf '    Instálalo con:  sudo install -Dm755 kernel-update/kernel-update-rollback.sh %s\n' "$ROLLBACK_SCRIPT"
+         printf '    (o usa CIZEN_KROLLBACK_SCRIPT si vive en otra ruta)\n'
+       fi ;;
     10) exec "$SCRIPT" --absorb-rebels --menuconfig ;;
     11) exec "$SCRIPT" --selftest ;;
     12) exec "$SCRIPT" --changelog ;;

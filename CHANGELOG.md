@@ -1,6 +1,7 @@
 ## [27.31.24] - 2026-09-25
 
-El rollback deja de ser un extracting de ficheros y pasa a reinstalar el paquete.
+El rollback deja de ser un extracting de ficheros y pasa a reinstalar el paquete,
+y el menú dice a cuál se vuelve antes de que elijas la opción.
 
 Lo que pasaba: `krollback` extraía un `.tar.xz` con módulos + vmlinuz + UKI y
 decía, muy honestamente, "esto NO es un downgrade de paquete". El resultado era
@@ -40,6 +41,15 @@ implicaba recompilar.
 - La copia va a temporal y se renombra: un `.pkg.tar.zst` truncado por una
   interrupción no llega a existe para que pacman lo instale a medias.
 - `CIZEN_ROLLBACK_PKG=0` desactiva la preservación y vuelve al plan B.
+- **El menú (opción 9) enseña en la etiqueta qué kernel hay para deshacer**:
+  `volver al kernel anterior · linux-cizen-v3-7.2.7_cizen_v3-2 (bmq)`. Con bore y
+  bmq compartiendo release, esa línea es la que distingue "vuelvo al mismo" de
+  "vuelvo a otro kernel del mismo nombre". Si el manifiesto apunta a un paquete
+  que ya no está, lo dice (`⚠ sin paquete`) en vez de dejar que se descubra al
+  entrar; y si no hay manifiesto, no inventa uno.
+- La opción 9 comprueba que el script exista y admite `CIZEN_KROLLBACK_SCRIPT`:
+  vive fuera del motor y se instala por su cuenta, y un `exec` a un path
+  inexistente solo suelta un error de bash que no explica nada.
 
 Lo que esto **no** arregla: el paquete de bore (pkgrel-2) que había en este host
 ya no existe en ninguna parte, así que volver a él sigue necesitando un build

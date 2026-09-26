@@ -68,6 +68,15 @@ Ahora el motor copia a `$ROLLBACK_DIR` el **paquete que acaba de instalar** (y
 solo ese: "actual + previo"), junto a un manifiesto `rollback.info` con
 pkgbase, pkgver, release y scheduler:
 
+En el menú interactivo es la **opción 9** (`cizen-menu`), que además muestra en
+la propia etiqueta a qué se vuelve:
+
+```
+    9)  rollback      volver al kernel anterior · linux-cizen-v3-7.2.7_cizen_v3-2 (bmq)
+```
+
+Y desde la terminal:
+
 ```sh
 sudo /usr/local/bin/kernel-update/kernel-update-rollback.sh --list   # qué kernel anterior hay, con su scheduler
 sudo /usr/local/bin/kernel-update/kernel-update-rollback.sh          # lo reinstala (pacman -U) y regenera el UKI

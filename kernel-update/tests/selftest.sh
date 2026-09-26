@@ -1263,6 +1263,53 @@ cachyos-7.2.80-1" fork_tagrel 7.2.8)" ]; then
   else
     rec fail "menú: no se pudieron extraer load_fork_tags/fork_tagrel/fork_latest_minor"
   fi
+  # v27.31.24: la opción 9 dice en la propia etiqueta qué kernel hay para
+  # deshacer (y con qué scheduler). Sin esto se entra al rollback para descubrir
+  # que no hay nada, o que es otro kernel del que uno creía.
+  sed -n '/^rollback_resumen() {/,/^}/p' "$MENU" > "$ROOT/rbfn.sh"
+  if [ -s "$ROOT/rbfn.sh" ]; then
+    # shellcheck disable=SC1090,SC1091
+    source "$ROOT/rbfn.sh"
+    RB2="$ROOT/menu-rb"
+    rm -rf "$RB2"; mkdir -p "$RB2"
+    ROLLBACK_DIR="$RB2"
+    # Sin manifiesto: lo dice, sin inventarse un paquete.
+    out="$(rollback_resumen)"
+    if [ -n "$out" ] && ! printf '%s' "$out" | grep -qE 'cizen_v3-[0-9]'; then
+      rec ok "menú rollback: sin manifiesto no inventa un kernel anterior ('$out')"
+    else
+      rec fail "menú rollback: sin manifiesto inventó un paquete ('$out')"
+    fi
+    # Manifiesto con paquete presente: pkgver + scheduler, que es lo que hace
+    # falta para distinguir bore de bmq (misma release, distinto pkgrel).
+    printf 'pkgbase=linux-cizen-v3\npkgver=7.2.7_cizen_v3-2\nsched=bmq\npkgfile=linux-cizen-v3-7.2.7_cizen_v3-2-x86_64.pkg.tar.zst\n' > "$RB2/rollback.info"
+    : > "$RB2/linux-cizen-v3-7.2.7_cizen_v3-2-x86_64.pkg.tar.zst"
+    out="$(rollback_resumen)"
+    if [ "$out" = "linux-cizen-v3-7.2.7_cizen_v3-2 (bmq)" ]; then
+      rec ok "menú rollback: la etiqueta muestra el kernel anterior con su scheduler"
+    else
+      rec fail "menú rollback: etiqueta inesperada ('$out')"
+    fi
+    # Manifiesto que dice un paquete que ya no está: hay que avisar, porque un
+    # rollback a medias es peor que saber que no hay nada.
+    rm -f "$RB2/linux-cizen-v3-7.2.7_cizen_v3-2-x86_64.pkg.tar.zst"
+    out="$(rollback_resumen)"
+    if printf '%s' "$out" | grep -q "sin paquete"; then
+      rec ok "menú rollback: avisa si el manifiesto apunta a un paquete que no está"
+    else
+      rec fail "menú rollback: no_avisa de un paquete ausente ('$out')"
+    fi
+    rm -rf "$RB2"
+  else
+    rec fail "menú: no se pudo extraer rollback_resumen"
+  fi
+  # El script de rollback vive FUERA del motor y se instala por su cuenta: si no
+  # está, un `exec` a un path inexistente solo suelta un error de bash.
+  if grep -q 'CIZEN_KROLLBACK_SCRIPT' "$MENU" && grep -q 'if \[ -x "\$ROLLBACK_SCRIPT" \]' "$MENU"; then
+    rec ok "menú rollback: comprueba que el script exista y admite CIZEN_KROLLBACK_SCRIPT"
+  else
+    rec fail "menú rollback: exec sin comprobar el script (error ilegible si falta)"
+  fi
   # Sin red el menú no debe avisar ni bloquear (fail-open), y la pregunta de la
   # versión alternativa solo se hace en terminal.
   if grep -q '\[ -n "\$tags" \] || return 1' "$MENU" \
