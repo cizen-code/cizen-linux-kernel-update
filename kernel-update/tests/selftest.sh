@@ -1826,6 +1826,76 @@ if [ -r "$BENCH" ]; then
   else
     rec fail "banco: el scheduler medido puede no ser el que está en marcha"
   fi
+
+  # Una fila que no mide nada no puede decidir la mediana. El histórico real tenía
+  # dos (iteraciones 0 → 1 ms) y basta una tercera para que la fila entera se
+  # mueva: el número basura no se ve, pero sale en la mediana. El resumen tiene
+  # que filtrarlas Y decir cuántas deja fuera, que es lo que permite fiarse de él.
+  # El histórico se escribe a medias: si dos ejecuciones terminan a la vez, sus
+  # bloques quedan PEGADOS y la línea en blanco cae donde sea —incluso en medio
+  # de un bloque—. Por eso el delimitante de bloque del resumen tiene que ser la
+  # línea `fecha`, no el blanco. Este histórico va pegado y con un blanco dentro
+  # del primer bloque: con el blanco como separador, ese bloque se parte en dos y
+  # se pierde entero.
+  BD="$ROOT/bench-sintetico"
+  mkdir -p "$BD"
+  (
+    fila() { # $1=iteraciones $2=1 hilo $3=N hilos $4=latencia fg
+      echo "fecha        : 2026-01-01T00:00:00+00:00"
+      echo "kernel       : 0.0.0-test  (build test)"
+      echo "scheduler    : TEST"
+      echo "núcleos      : 4   carga: 4   iteraciones: $1   fichero: 1MB"
+      echo "load medio   : 0.10 0.10 0.10 (antes de medir)"
+      echo "1 hilo       : $2 ms"
+      if [ -n "${5:-}" ]; then echo; fi
+      echo "4 hilos  : $3 ms"
+      echo "latencia fg  : $4 ms (mediana de 3 con 4 tareas en carga)"
+    }
+    fila 1 100  300 10 blanco
+    fila 1 200  600 20
+    fila 1 400 1200 40
+    fila 0   1    1  1
+    fila 0   1    1  1
+  ) > "$BD/sched-bench-0.0.0-test-TEST.txt"
+  # Mediana de las 3 buenas = 200 / 600 / 20. Si las basura contaran, 100 / 300 / 10.
+  # Las cifras van con " ms" detrás, así que en la fila son los campos 6, 8 y 10.
+  resumen_fila="$(CIZEN_VERIFY_STATE_DIR="$BD" bash "$BENCH" --resumen 2>/dev/null \
+    | awk 'NR==2{print $4, $5, $6, $8, $10}')"
+  if [ "$resumen_fila" = "3 2 200 600 20" ]; then
+    rec ok "banco: --resumen ignora las filas degeneradas y cuenta cuántas deja fuera"
+  else
+    rec fail "banco: --resumen no filtra las filas con iteraciones 0 (n/desc/medianas: '$resumen_fila')"
+  fi
+
+  # Red de seguridad al escribir: con ITERS>=1 y 20 MB no se puede medir en 2 ms
+  # (el suelo son ~4 GB/s). Tiene que salir con rc=1 SIN dejar fila; si anota, el
+  # histórico se pudre por dentro aunque el --resumen la filtrara después.
+  STUB="$ROOT/stub-sin-hash"; mkdir -p "$STUB"
+  printf '#!/bin/sh\nexit 0\n' > "$STUB/sha256sum"; chmod +x "$STUB/sha256sum"
+  BD2="$ROOT/bench-degenerado"; mkdir -p "$BD2"
+  PATH="$STUB:$PATH" CIZEN_VERIFY_STATE_DIR="$BD2" SCHED_BENCH_SIZE_MB=20 \
+    SCHED_BENCH_ITERS=1 SCHED_BENCH_REPS=1 SCHED_BENCH_LOAD_N=1 \
+    bash "$BENCH" >/dev/null 2>&1
+  rc_deg=$?
+  n_deg="$(find "$BD2" -name 'sched-bench-*' 2>/dev/null | wc -l)"
+  if [ "$rc_deg" -eq 1 ] && [ "$n_deg" -eq 0 ]; then
+    rec ok "banco: una medición degenerada no se anota (rc=1, histórico intacto)"
+  else
+    rec fail "banco: la medición degenerada se anota igual (rc=$rc_deg, ficheros=$n_deg)"
+  fi
+
+  # Y lo contrario, porque una guarda que siempre suena no es una guarda: una
+  # medición diminuta pero REAL (20 MB, una vuelta) tiene que pasar y anotarse.
+  BD3="$ROOT/bench-mini"; mkdir -p "$BD3"
+  CIZEN_VERIFY_STATE_DIR="$BD3" SCHED_BENCH_SIZE_MB=20 SCHED_BENCH_ITERS=1 \
+    SCHED_BENCH_REPS=1 SCHED_BENCH_LOAD_N=1 bash "$BENCH" >/dev/null 2>&1
+  rc_mini=$?
+  n_mini="$(find "$BD3" -name 'sched-bench-*' 2>/dev/null | wc -l)"
+  if [ "$rc_mini" -eq 0 ] && [ "$n_mini" -eq 1 ]; then
+    rec ok "banco: una medición diminuta pero real sí se anota (la guarda no es ruido)"
+  else
+    rec fail "banco: la guarda salta con una medición real (rc=$rc_mini, ficheros=$n_mini)"
+  fi
 else
   printf '  (sin %s: se omiten los tests del banco)\n' "$BENCH"
 fi

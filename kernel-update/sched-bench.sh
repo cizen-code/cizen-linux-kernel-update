@@ -33,6 +33,13 @@
 # Para que el par sea válido: mide en el mismo estado (mismo kernel, misma
 # carga de escritorio, sin compilando nada) y con el script sin tocar. El banco
 # anota el load average de la medición por si hay que descartar una tirada.
+#
+# Dos filtros, porque una medición que no mide nada no vale ni un segundo de lo
+# que tarda en estropear el histórico:
+#   · antes de anotar, una medición por debajo de un suelo razonable no se
+#     escribe (con ITERS>=1 y >=1 MB no se puede medir en 1 ms)
+#   · --resumen ignora las filas con `iteraciones: 0` aunque ya estén escritas,
+#     y las cuenta aparte para que se vean
 # ============================================================
 
 set -uo pipefail
@@ -49,21 +56,76 @@ SIZE_MB="${SCHED_BENCH_SIZE_MB:-300}"
 SELF="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
 
 # ---------- --resumen: tabla de todo lo histórico ----------
+#
+# El resumen NO confía en el fichero: lo parsea y solo cuenta las mediciones
+# reales. El histórico es un volcado de ejecuciones, y el delimitante de bloque
+# NO puede ser la línea en blanco: si dos ejecuciones terminan a la vez, sus
+# bloques quedan pegados y el blanco cae donde sea (en el histórico real hay
+# bloques sin blanco detrás). El delimitante fiable es la línea `fecha`, que
+# abre toda medición sí o sí. El awk va de bloque en bloque y acumula el que
+# tenga `iteraciones >= 1`; los demás —una ejecución con ITERS=0 no mide nada y
+# deja 1 ms, y uno a medias no tiene todas las cifras— se cuentan como
+# descartados y se enseñan. Motivo: en el histórico ya había dos filas así y con
+# una tercera la mediana de la fila entera se desplaza para siempre — el número
+# basura no se ve, pero decide.
+resumen_datos() {
+  awk '
+    BEGIN { it = -1; un = -1; par = -1; lat = -1 }   # -1 = "todavía no medido"
+    function num_ms(   s) {   # el entero que precede a " ms"
+      if (match($0, /[0-9]+ ms/)) return substr($0, RSTART, RLENGTH - 3) + 0
+      return -1
+    }
+    function med(a, n,   i, j, v) {
+      if (n < 1) return 0
+      for (i = 2; i <= n; i++) {
+        v = a[i]; j = i - 1
+        while (j > 0 && a[j] > v) { a[j+1] = a[j]; j-- }
+        a[j+1] = v
+      }
+      return (n % 2) ? a[(n+1)/2] : int((a[n/2] + a[n/2+1]) / 2)
+    }
+    function flush() {
+      if (it >= 1 && un >= 0 && par >= 0 && lat >= 0) { n++; U[n] = un; P[n] = par; L[n] = lat }
+      else if (it >= 0) d++
+      it = -1; un = -1; par = -1; lat = -1
+    }
+    /^fecha/ { flush(); next }        # abre bloque: el anterior termina aquí
+    /iteraciones:/ {
+      it = -1
+      if (match($0, /iteraciones: *[0-9]+/)) {
+        s = substr($0, RSTART, RLENGTH); sub(/^.*: */, "", s); it = s + 0
+      }
+      next
+    }
+    /^1 hilo/       { un = num_ms(); next }
+    /^[0-9]+ hilos/  { par = num_ms(); next }
+    /^latencia fg/  { lat = num_ms(); next }
+    END {
+      flush()
+      printf "%d %d %s %s %s\n", n + 0, d + 0,
+             (n ? med(U, n) : "?"), (n ? med(P, n) : "?"), (n ? med(L, n) : "?")
+    }
+  ' "$1"
+}
+
 resumen() {
-  local f kernel sched fecha n un par lat
-  printf '%-26s %-8s %-20s %4s %9s %9s %9s\n' kernel scheduler "primera medición" n "1 hilo" "N hilos" "lat.fg"
+  local f kernel sched fecha n desc un par lat
+  printf '%-26s %-8s %-20s %3s %5s %9s %9s %9s\n' \
+    kernel scheduler "primera medición" n desc "1 hilo" "N hilos" "lat.fg"
   shopt -s nullglob
   for f in "$STATE_DIR"/sched-bench-*.txt; do
     kernel="$(basename "$f" .txt)"; kernel="${kernel#sched-bench-}"
     sched="${kernel##*-}"; kernel="${kernel%-*}"
-    n="$(grep -c '^1 hilo' "$f")"
+    read -r n desc un par lat <<<"$(resumen_datos "$f")"
     fecha="$(grep -m1 '^fecha' "$f" | sed -E 's/^fecha *: *//; s/T[0-9:.-]+//')"
-    un="$(grep '^1 hilo' "$f" | sed -E 's/.*: *([0-9]+) ms/\1/' | sort -n | awk '{a[NR]=$1} END{print (NR%2)?a[(NR+1)/2]:int((a[NR/2]+a[NR/2+1])/2)}')"
-    par="$(grep "^[0-9]* hilos" "$f" | sed -E 's/.*: *([0-9]+) ms/\1/' | sort -n | awk '{a[NR]=$1} END{print (NR%2)?a[(NR+1)/2]:int((a[NR/2]+a[NR/2+1])/2)}')"
-    lat="$(grep '^latencia fg' "$f" | sed -E 's/.*: *([0-9]+) ms.*/\1/' | sort -n | awk '{a[NR]=$1} END{print (NR%2)?a[(NR+1)/2]:int((a[NR/2]+a[NR/2+1])/2)}')"
-    printf '%-26s %-8s %-20s %4s %8s ms %8s ms %8s ms\n' "$kernel" "$sched" "$fecha" "$n" "${un:-?}" "${par:-?}" "${lat:-?}"
+    printf '%-26s %-8s %-20s %3s %5s %8s ms %8s ms %8s ms\n' \
+      "$kernel" "$sched" "$fecha" "$n" "$desc" "$un" "$par" "$lat"
   done
   shopt -u nullglob
+  echo
+  echo "n = mediciones contadas · desc. = filas fuera de las medianas (0"
+  echo "iteraciones o incompletas). No sirven como comparación, pero se pueden"
+  echo "borrar del fichero sin miedo: el resumen ya no las mira."
   echo
   echo "Nótese: la carga de escritorio y el estado del sistema mandan más que el"
   echo "scheduler en estas cifras. Tira dos o tres veces cada kernel y quédate con"
@@ -156,6 +218,23 @@ sched="$(sched_actual)"
 build="$(uname -v | awk '{print $4, $5, $6, $7, $8}')"
 out="$STATE_DIR/sched-bench-$(uname -r)-$sched.txt"
 mkdir -p "$STATE_DIR"
+
+# Suelo razonable antes de escribir en el histórico. El suelo son 0,25 ms por MB
+# y por iteración, o sea ~4 GB/s: sha256sum va a ~400 MB/s aquí, así que el suelo
+# es diez veces más rápido que lo físicamente posible. Por debajo no se ha medido
+# nada (ITERS=0, el fichero quedó vacío, el bucle no corrió). Anotarlo sería
+# enredo: el --resumen lo filtraría, pero el fichero es la materia prima y una
+# fila de 1 ms ni se ve. Mejor no escribirla y decirlo.
+suelo=$(( SIZE_MB * ITERS / 4 ))
+if [ "$un_hilo" -lt "$suelo" ] || [ "$paralelo" -lt "$suelo" ]; then
+  echo "Medición degenerada: no se anota nada." >&2
+  echo "  1 hilo=${un_hilo} ms  N hilos=${paralelo} ms  (suelo: ${suelo} ms," >&2
+  echo "  ${SIZE_MB} MB por vuelta × ${ITERS} vueltas)." >&2
+  echo "Si la carga del equipo lo ha interrumpido, no es un fallo del banco:" >&2
+  echo "espera a que se quede tranquila y repite." >&2
+  exit 1
+fi
+
 {
   echo
   echo "fecha        : $(date -Is)"

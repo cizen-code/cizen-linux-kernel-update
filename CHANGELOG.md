@@ -1,3 +1,42 @@
+## [27.31.31] - 2026-09-26
+
+El banco de schedulers se envenena solo: dos filas basura en el histórico.
+
+En `~/.local/state/kernel-update/sched-bench-7.2.7-cizen-v3-BMQ.txt` había ocho
+mediciones y dos de ellas no median nada: `iteraciones: 0` con `1 hilo: 1 ms`. La
+validación de parámetros ya las rechazaba (`ITERS=0` → rc=2), así que no se
+escribieron desde el banco tal como está — pero la fila está, y **`--resumen` se
+la creía**: contaba ocho, sacaba la mediana de las ocho y las basura se colaban
+en el número. Con dos no se notaba; con una tercera la fila entera se desplaza
+para siempre, y el síntoma (una cifra que no cuadra con lo medido) no señala al
+dato basura.
+
+Dos filtros, en los dos sitios donde puede colarse:
+
+- **Al escribir**: suelo de 0,25 ms por MB y por iteración —~4 GB/s, diez veces
+  más rápido que `sha256sum` en esta máquina—, y por debajo `rc=1` **sin
+  anotar**. Con `ITERS>=1` y 20 MB no se puede medir en 2 ms, así que si salta es
+  que el bucle no ha corrido. Se dice qué ha pasado y se recuerda que la culpa
+  suele ser del equipo cargado, no del banco.
+- **Al resumir**: `--resumen` parsea el histórico por bloques (cada medición
+  empieza en su línea `iteraciones:`) y solo acumula los de `iteraciones >= 1`.
+  Los que no se filtran salen en una columna nueva, `desc.`, contados: lo
+  que no se ve en la mediana tiene que verse en algún sitio, o el filtro es
+  indistinguible de un banco que no midió.
+
+El resumen anterior, además, era un `grep`/`sort`/`awk` por líneas sueltas y
+terminaba en `${un:-?}`: un cálculo que fallaba salía como `?` en la tabla, que
+es justo lo que hay que ver cuando el histórico está corrupto. Ahora el cálculo
+entra y sale de una función, `resumen_datos`, con la mediana en awk y las
+cifras sin inicializar a cero por el camino (un `-1` de "todavía no medido", no
+un 0 que parece una medición de 0 ms).
+
+Selftest: 307 -> 310. Los tres tests nuevos, en rojo contra el banco instalado
+(`--resumen` no filtra: `5 100 ms`; la guarda no existe: rc=0 y fichero
+escrito) y en verde con el nuevo. El tercero es el que evita una guarda
+inútil: una medición diminuta pero **real** (20 MB, una vuelta) tiene que pasar
+y anotarse, porque una guarda que siempre suena es ruido, no seguridad.
+
 ## [27.31.30] - 2026-09-26
 
 Ruido de `ukify` al construir la UKI, visible en el build de 7.2.8 + BORE.

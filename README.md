@@ -371,6 +371,18 @@ tres o cuatro tiradas se ve si la diferencia supera el ruido. Para comparar dos
 schedulers en serio hace falta el mismo estado en ambos (misma carga de
 escritorio, sin compilando nada), y mejor dos arranques de cada uno que uno solo.
 
+El banco se protege dos veces de medirse a sí mismo, porque una fila que no
+mide nada decide la mediana de las que sí miden:
+
+- **Al anotar**: si el tiempo cae por debajo de un suelo razonable (0,25 ms por
+  MB y por iteración, unos 4 GB/s — `sha256sum` va a ~400 MB/s), no se escribe
+  nada y se sale con `rc=1` diciéndolo. Suele ser el equipo cargado, no el banco:
+  espera a que se quede quieto y repite.
+- **Al resumir**: las filas con `iteraciones: 0` que ya estuvieran en el fichero
+  no entran en ninguna mediana. Se cuentan en la columna `desc.`, para que lo
+  que se ha dejado fuera se vea en lugar de ser un filtro indistinguible de un
+  banco que no midió.
+
 #### La notificación solo cuando el estado cambia (v27.31.21)
 
 La comprobación corre en **cada arranque**, así que notificar en cada una
