@@ -73,7 +73,8 @@
 #   ./kernel-update.sh --selftest                             # autoevaluación interna
 #   ./kernel-update.sh --hardened                             # auditoría hardening del kernel en ejecución
 #   ./kernel-update.sh --changelog                            # bump versión + borrador en CHANGELOG.md
-#   CIZEN_BOOT_TRIES=3 ./kernel-update.sh <versión>           # boot counting sd-boot (0 = UKI plana)
+#   CIZEN_BOOT_TRIES=0 ./kernel-update.sh <versión>           # UKI con nombre plano (default)
+#   CIZEN_BOOT_TRIES=3 ./kernel-update.sh <versión>           # boot counting sd-boot (+N.efi)
 #   ./kernel-update.sh <versión> --sign                       # firmar la UKI con sbctl (Secure Boot)
 #   ./kernel-update.sh <versión> --no-sign                    # NO firmar la UKI (evitar con Secure Boot activo)
 #   CIZEN_SIGN_UKI=auto ./kernel-update.sh <versión>          # firma de la UKI con sbctl (auto|yes|no; default auto)
@@ -135,7 +136,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.31"
+SCRIPT_VERSION="27.31.32"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -7737,8 +7738,19 @@ CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK="${CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK:-0}"
 # contador de intentos (arch-linux-cizen-v3+N.efi). Cada boot SIN completar
 # boot-complete.target resta 1; al llegar a 0 la entrada pasa a "bad" y
 # systemd-boot arranca otra (p.ej. el LTS). Cuando el arranque completa,
-# systemd-bless-boot renombra la UKI a nombre plano (sin contador). 0 desactiva.
-CIZEN_BOOT_TRIES="${CIZEN_BOOT_TRIES:-3}"
+# systemd-bless-boot renombra la UKI a nombre plano (sin contador).
+#
+# POR QUÉ EL DEFAULT ES 0 (UKI PLANA) — v27.31.32
+# El nombre con contador se firma con 'sbctl sign --save', que registra ESE
+# nombre (+3.efi) en /var/lib/sbctl/files.json; al arrancar bien,
+# systemd-bless-boot lo renombra a plano y la entrada queda huérfana para
+# siempre. El hook zzz-sbctl.hook lanza 'sbctl sign-all -g' en toda
+# transacción de pacman que toque /boot, así que desde el primer arranque
+# bueno TODO 'pacman -Syu' acababa en "error: la orden no se ejecutó
+# correctamente" por un .efi que ya no existía. Con el nombre plano no hay
+# renombrado, la entrada de sbctl sigue siendo válida y el hook pasa limpio.
+# cizen_uki_sbctl_prune() limpia además cualquier huérfano previo.
+CIZEN_BOOT_TRIES="${CIZEN_BOOT_TRIES:-0}"
 
 cizen_uki_fail() {
     if [ "${CIZEN_UKI_REQUIRED}" = 1 ]; then
@@ -8028,6 +8040,12 @@ sync_cizen_efi() {
         cizen_uki_fail "La UKI no quedó actualizada después de escribir en el objetivo."
     fi
 
+    # Saneado de la BD de sbctl aunque no se firme (CIZEN_SIGN_UKI=no): las
+    # entradas huérfanas hacen fallar el hook zzz-sbctl.hook de CUALQUIER
+    # pacman posterior, con o sin Secure Boot. cizen_uki_sign_targets también
+    # lo hace, pero solo entra si DO_SIGN_UKI=true.
+    cizen_uki_sbctl_prune
+
     # Firma de la UKI (ruta directa del motor, sin cizen-uki-sync).
     if [ "$DO_SIGN_UKI" = true ]; then
         if ! cizen_uki_sign_targets "${targets[@]}"; then
@@ -8064,10 +8082,56 @@ secure_boot_active() {
     [ "$val" = "1" ]
 }
 
+# Entradas de la BD de ficheros de sbctl cuyo fichero ya no existe (UKIs +N
+# renombradas por systemd-bless-boot, UKIs retiradas, vmlinuz borrados...). Son
+# la causa del fallo de pacman: el hook zzz-sbctl.hook ejecuta 'sbctl sign-all
+# -g' y aborta con "does not exist". Sin argumentos = todas.
+cizen_uki_sbctl_stale_entries() {
+    local db="${1:-${SBCTL_DB_FILE:-/var/lib/sbctl/files.json}}" f
+    [ -r "$db" ] || return 0
+    # Claves del objeto JSON de primer nivel ("ruta": { ... }); evita depender
+    # de jq. Las líneas indented del bloque "file"/"output_file" no encajan con
+    # el patrón porque no llevan '{' detrás de los dos puntos.
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        [ "$f" = "$db" ] && continue
+        sudo test -e "$f" 2>/dev/null || printf '%s\n' "$f"
+    done < <(sed -n 's/^[[:space:]]*"\([^"]*\)"[[:space:]]*:[[:space:]]*{.*/\1/p' "$db" 2>/dev/null || true)
+}
+
+# Purga la BD de sbctl de las entradas huérfanas (sbctl remove-file). Se llama
+# antes de firmar: si no, un '+3.efi' muerto de un build anterior hace que
+# 'pacman -Syu' termine en error aunque la UKI se firme bien. Idempotente.
+cizen_uki_sbctl_prune() {
+    local -a stale=()
+    local f n=0
+    [ -n "$SBCTL_BIN" ] || return 0
+    while IFS= read -r f; do
+        [ -n "$f" ] && stale+=("$f")
+    done < <(cizen_uki_sbctl_stale_entries "${1:-}")
+
+    [ "${#stale[@]}" -gt 0 ] || return 0
+    for f in "${stale[@]}"; do
+        if sudo "$SBCTL_BIN" remove-file "$f" >/dev/null 2>&1; then
+            n=$((n + 1))
+        fi
+    done
+    if [ "$n" -gt 0 ]; then
+        ok "BD de sbctl saneada: $n entrada(s) huérfana(s) eliminadas (sbctl remove-file)."
+        for f in "${stale[@]}"; do
+            sudo test -e "$f" 2>/dev/null || log "  - $f (no existe; estorbaba a sbctl sign-all en pacman)"
+        done
+    fi
+    return 0
+}
+
 # Firma cada objetivo con sbctl y verifica. Uso: cizen_uki_sign_targets "archivo"...
 cizen_uki_sign_targets() {
     local t fail=0
     [ -n "$SBCTL_BIN" ] || { warn "sbctl no está instalado; no se puede firmar la UKI."; return 1; }
+    # Antes de firmar: sanea la BD de sbctl. 'sbctl sign-all' (hook de pacman)
+    # aborta con "does not exist" ante una entrada huérfana y tumba el -Syu.
+    cizen_uki_sbctl_prune
     # --save: desde sbctl 0.18 firmar NO registra la firma en la BD sin -s;
   # sin --save el hook de pacman (sbctl sign-all) no re-firma systemd-boot/UKI
   # en actualizaciones y sbctl verify deja de reconocer el fichero.

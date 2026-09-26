@@ -2881,6 +2881,102 @@ else
   printf '  (sin %s: se omiten los tests de la UKI)\n' "$UKISYNC"
 fi
 
+# --- v27.31.32: el nombre +N del boot counting rompía cada 'pacman -Syu' ---
+# El UKI se escribía como arch-linux-cizen-v3+3.efi, se firmaba con
+# 'sbctl sign --save' (que registra ESE nombre en /var/lib/sbctl/files.json) y
+# systemd-bless-boot lo renombraba a plano al completar el arranque: la entrada
+# quedaba huérfana y el hook zzz-sbctl.hook ('sbctl sign-all -g') abortaba con
+# "does not exist", dejando el -Syu en "error: la orden no se ejecutó
+# correctamente". El default pasa a UKI PLANA + purge de la BD de sbctl.
+if [ -r "$UKISYNC" ]; then
+  # a) El default declarado es 0 en los DOS scripts (motor y cizen-uki-sync):
+  #    si alguien lo vuelve a poner a 3 sin saber lo que cuesta, cae el test.
+  if grep -q 'CIZEN_BOOT_TRIES="${CIZEN_BOOT_TRIES:-0}"' "$UKISYNC" \
+     && grep -q 'CIZEN_BOOT_TRIES="${CIZEN_BOOT_TRIES:-0}"' "$MOTOR"; then
+    rec ok "uki: CIZEN_BOOT_TRIES=0 (nombre plano) por defecto en motor y cizen-uki-sync"
+  else
+    rec fail "uki: CIZEN_BOOT_TRIES ya no es 0 por defecto (vuelve el UKI +N.efi y pacman falla)"
+  fi
+
+  # b) uki_efi_name: plano sin contador, +N solo si se pide explícitamente.
+  sed -n '/^uki_efi_name() {/,/^}/p' "$UKISYNC" > "$ROOT/ukiname.sh"
+  n_def="$(CIZEN_UKI_NAME=arch-linux-cizen-v3.efi bash -c 'set -u; . "$0"; uki_efi_name' "$ROOT/ukiname.sh" 2>/dev/null || true)"
+  n_3="$(CIZEN_UKI_NAME=arch-linux-cizen-v3.efi CIZEN_BOOT_TRIES=3 \
+         bash -c 'set -u; . "$0"; uki_efi_name' "$ROOT/ukiname.sh" 2>/dev/null || true)"
+  if [ "$n_def" = "arch-linux-cizen-v3.efi" ]; then
+    rec ok "uki: el nombre por defecto es arch-linux-cizen-v3.efi (el que pide el preset de mkinitcpio)"
+  else
+    rec fail "uki: el nombre por defecto no es el plano (obtenido: '${n_def:-vacio}')"
+  fi
+  if [ "$n_3" = "arch-linux-cizen-v3+3.efi" ]; then
+    rec ok "uki: CIZEN_BOOT_TRIES=3 sigue dando el +3.efi (opt-in explícito, no el default)"
+  else
+    rec fail "uki: CIZEN_BOOT_TRIES=3 no produce el nombre con contador (obtenido: '${n_3:-vacio}')"
+  fi
+
+  # c) La BD de sbctl: solo se detectan como huérfanas las entradas cuyo
+  #    fichero NO existe (el +3 renombrado), nunca las que sí están.
+  mkdir -p "$ROOT/esp/Linux" "$ROOT/esp/BOOT"
+  : > "$ROOT/esp/Linux/arch-linux-cizen-v3.efi"
+  : > "$ROOT/esp/Linux/arch-linux-lts.efi"
+  cat > "$ROOT/sbdb.json" <<JSON
+{
+    "/boot/EFI/Linux/arch-linux-cizen-v3+3.efi": {
+        "file": "/boot/EFI/Linux/arch-linux-cizen-v3+3.efi",
+        "output_file": "/boot/EFI/Linux/arch-linux-cizen-v3+3.efi"
+    },
+    "$ROOT/esp/Linux/arch-linux-cizen-v3.efi": {
+        "file": "$ROOT/esp/Linux/arch-linux-cizen-v3.efi",
+        "output_file": "$ROOT/esp/Linux/arch-linux-cizen-v3.efi"
+    },
+    "$ROOT/esp/Linux/arch-linux-lts.efi": {
+        "file": "$ROOT/esp/Linux/arch-linux-lts.efi",
+        "output_file": "$ROOT/esp/Linux/arch-linux-lts.efi"
+    }
+}
+JSON
+  sed -n '/^sbctl_stale_entries() {/,/^}/p' "$UKISYNC" > "$ROOT/stale.sh"
+  # SUDO se define DENTRO del bash -c: un array no se puede pasar por el
+  # entorno (llegaría como la cadena "()" y "${SUDO[@]}" sería una orden).
+  stale="$(bash -c 'set -u; SUDO=(); . "$0"; sbctl_stale_entries "$1"' "$ROOT/stale.sh" "$ROOT/sbdb.json" 2>/dev/null || true)"
+  if [ "$stale" = "/boot/EFI/Linux/arch-linux-cizen-v3+3.efi" ]; then
+    rec ok "sbctl: la BD solo marca como huérfana la entrada +3 renombrada, no las UKIs existentes"
+  else
+    rec fail "sbctl: la detección de huérfanos no aísla el +3.efi (obtenido: '${stale:-vacio}')"
+  fi
+
+  # d) El purge llama a 'sbctl remove-file' SOLO con la huérfana. Con un sbctl
+  #    falso que registra sus argumentos: si 'sign-all' siguiera viendo la
+  #    entrada, el próximo pacman -Syu moriría igual.
+  mkdir -p "$ROOT/sbctlfake"
+  cat > "$ROOT/sbctlfake/sbctl" <<'SBCTL'
+#!/bin/bash
+[ "${1:-}" = remove-file ] && printf '%s\n' "${2:-}" >> "$SBCTL_LOG"
+exit 0
+SBCTL
+  chmod +x "$ROOT/sbctlfake/sbctl"
+  sed -n '/^sbctl_prune_stale() {/,/^}/p' "$UKISYNC" >> "$ROOT/stale.sh"
+  : > "$ROOT/sbctl.log"
+  SBCTL_LOG="$ROOT/sbctl.log" SBCTL_BIN="$ROOT/sbctlfake/sbctl" \
+  bash -c 'set -u; SUDO=(); . "$0"; SBCTL_DB_FILE="$1"; sbctl_prune_stale' \
+    "$ROOT/stale.sh" "$ROOT/sbdb.json" >/dev/null 2>&1
+  if [ "$(cat "$ROOT/sbctl.log" 2>/dev/null)" = "/boot/EFI/Linux/arch-linux-cizen-v3+3.efi" ]; then
+    rec ok "sbctl: el purge elimina la entrada huérfana y deja intactas las que existen"
+  else
+    rec fail "sbctl: el purge no quitó la entrada huérfana (log: $(tr '\n' ' ' < "$ROOT/sbctl.log" 2>/dev/null))"
+  fi
+
+  # e) El motor tiene su propio prune (lo usa cuando firma sin pasar por
+  #    cizen-uki-sync) y detecta la misma huérfana.
+  if sed -n '/^cizen_uki_sbctl_prune() {/,/^}/p' "$MOTOR" | grep -q 'remove-file'; then
+    rec ok "uki: el motor sanea la BD de sbctl antes de firmar (ruta directa, sin cizen-uki-sync)"
+  else
+    rec fail "uki: el motor no sanea la BD de sbctl; un +3 muerto rompe el hook de pacman igual"
+  fi
+else
+  printf '  (sin %s: se omiten los tests del nombre de UKI)\n' "$UKISYNC"
+fi
+
 # --- resumen ---
 echo
 printf 'Totales: %d ok, %d fail\n' "$PASS" "$FAIL"

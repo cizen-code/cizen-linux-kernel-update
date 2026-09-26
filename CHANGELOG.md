@@ -1,3 +1,47 @@
+## [27.31.32] - 2026-09-26
+
+La UKI con contador de intentos rompía cada `pacman -Syu`.
+
+El boot counting de systemd-boot obliga a que el fichero del ESP se llame
+`arch-linux-cizen-v3+3.efi`. Firmarlo con `sbctl sign --save` registra **ese**
+nombre en `/var/lib/sbctl/files.json`, y al completar el arranque
+`systemd-bless-boot` lo renombra a `arch-linux-cizen-v3.efi`: la entrada queda
+apuntando a un fichero inexistente para siempre. El hook `zz-sbctl.hook` ejecuta
+`sbctl sign-all -g` en toda transacción de pacman que toque `/boot`, así que
+desde el primer arranque bueno cualquier actualización acababa en:
+
+```
+failed signing /boot/EFI/Linux/arch-linux-cizen-v3+3.efi: ... does not exist
+error: la orden no se ejecutó correctamente
+```
+
+Los 48 paquetes se instalaban, pero pacman devolvía error y el actualizador lo
+contaba como fallo. El renombrado no es algo que se pueda evitar mientras el
+nombre lleve contador: es el mecanismo mismo del boot counting.
+
+Dos cambios:
+
+- **`CIZEN_BOOT_TRIES=0` por defecto** (antes 3) en `kernel-update.sh` y
+  `cizen-uki-sync`: la UKI se escribe con su nombre plano, que no se renombra
+  nunca, con lo que la entrada de sbctl sigue siendo válida. También coincide con
+  el `default_uki` del preset de mkinitcpio, así que el `+3` no puede dejar al
+  `bootctl`/`systemd-boot` sin UKI con el nombre esperado, y `bootctl set-oneshot`
+  (menu `flip`) deja de apuntar a un `+3` que ya no está. `CIZEN_BOOT_TRIES=3`
+  sigue disponible como opt-in explícito.
+- **Saneado de la BD de sbctl** (`cizen_uki_sbctl_prune` en el motor,
+  `sbctl_prune_stale` en `cizen-uki-sync`): antes de firmar, y también al final
+  aunque no se firme, se borran con `sbctl remove-file` las entradas cuyo fichero
+  ya no existe. Es la autorreparación: un huérfano heredado de cualquier build
+  anterior (no solo del boot counting) vuelve a matar el hook de pacman. Es
+  idempotente y solo toca entradas huérfanas, nunca las que existen.
+
+Selftest: 310 -> 316. Los seis nuevos, en rojo contra el código anterior
+(`CIZEN_BOOT_TRIES` a 3, `uki_efi_name` devolvía el `+3` por defecto, y el purge
+no existía) y en verde con el nuevo. Uno de ellos es el que fija el coste del opt-in:
+`CIZEN_BOOT_TRIES=3` **sigue** produciendo el nombre con contador, para que
+reactivar el boot counting sea una decisión, no un cambio de comportamiento
+invisible.
+
 ## [27.31.31] - 2026-09-26
 
 El banco de schedulers se envenena solo: dos filas basura en el histórico.

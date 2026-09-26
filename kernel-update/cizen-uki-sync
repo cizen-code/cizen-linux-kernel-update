@@ -23,7 +23,8 @@
 #   CIZEN_BOOT_TRIES         boot counting de systemd-boot: intentos de arranque
 #                            antes del fallback automático (arch-linux-cizen-v3+N.efi;
 #                            renombrada a plano por systemd-bless-boot al completar
-#                            boot-complete.target). 0 = sin contador (default 3)
+#                            boot-complete.target). 0 = UKI PLANA (default 0; ver
+#                            "POR QUÉ 0" abajo)
 #   CIZEN_SIGN_UKI            yes|no|auto (default auto): firma de la UKI con sbctl
 #                            (Secure Boot). auto: firma SIEMPRE si Secure Boot está
 #                            activo en el firmware (una UKI sin firmar no arrancaría);
@@ -35,6 +36,22 @@
 #                            re-firma en las actualizaciones de pacman).
 #
 #   sudo cizen-uki-sync --sign        # además firma la UKI con sbctl (--no-sign lo contrario)
+#
+# POR QUÉ CIZEN_BOOT_TRIES=0 (UKI con nombre plano) — v27.31.32
+# -----------------------------------------------------------------
+# El contador de systemd-boot obliga a que el fichero en el ESP se llame
+# arch-linux-cizen-v3+3.efi. Firmarlo con 'sbctl sign --save' registra ESE
+# nombre en /var/lib/sbctl/files.json, y al completar el arranque
+# systemd-bless-boot lo renombra a arch-linux-cizen-v3.efi: la entrada de la
+# base de datos de sbctl queda apuntando a un fichero inexistente para
+# siempre. El hook zzz-sbctl.hook ejecuta 'sbctl sign-all -g' en TODA
+# transacción de pacman que toque /boot, así que a partir del primer arranque
+# bueno cualquier 'pacman -Syu' moría con:
+#   error: failed signing /boot/EFI/Linux/arch-linux-cizen-v3+3.efi: ... does not exist
+#   error: la orden no se ejecutó correctamente
+# El nombre plano no se renombra nunca, la entrada de sbctl sigue siendo válida
+# y el hook de pacman vuelve a pasar. Para tener el boot counting, hay que
+# pagar el peaje del purge (sbctl_prune_stale) en cada sincronización.
 # ============================================================
 
 set -Eeuo pipefail
@@ -46,9 +63,12 @@ CIZEN_UKI_PKGBASE="${CIZEN_UKI_PKGBASE:-linux-cizen-v3}"
 CIZEN_UKI_SUFFIX="${CIZEN_UKI_SUFFIX:--cizen-v3}"
 CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK="${CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK:-0}"
 CIZEN_UKI_KEEP_INITRAMFS="${CIZEN_UKI_KEEP_INITRAMFS:-0}"
-CIZEN_BOOT_TRIES="${CIZEN_BOOT_TRIES:-3}"
+CIZEN_BOOT_TRIES="${CIZEN_BOOT_TRIES:-0}"
 SIGN_REQUEST="${CIZEN_SIGN_UKI:-auto}"
 SBCTL_BIN="$(command -v sbctl 2>/dev/null || true)"
+# Ruta de la BD de ficheros de sbctl. Overridable para poder probar el purge
+# sin tocar /var/lib/sbctl.
+SBCTL_DB_FILE="${SBCTL_DB_FILE:-/var/lib/sbctl/files.json}"
 DO_SIGN=false
 
 # ── Colores ─────────────────────────────────────────────────
@@ -258,6 +278,10 @@ build_uki() {
   return 1
 }
 
+# Nombre real del .efi en el ESP. Plano por defecto (CIZEN_BOOT_TRIES=0): el
+# nombre con contador +N lo renombra systemd-bless-boot al completar el
+# arranque y eso deja entradas huérfanas en la BD de sbctl que matan el hook
+# de pacman (ver "POR QUÉ CIZEN_BOOT_TRIES=0" en la cabecera).
 uki_efi_name() {
   local base="${CIZEN_UKI_NAME%.efi}"
   if [ "${CIZEN_BOOT_TRIES:-0}" -gt 0 ]; then
@@ -267,6 +291,10 @@ uki_efi_name() {
   fi
 }
 
+# Borra las variantes que NO son el nombre actual (la plana bendecida por
+# systemd-bless-boot y los contadores +N de boots anteriores) para que tras
+# cada sincronización solo quede la UKI vigente. Con el nombre plano activo,
+# esto elimina cualquier +N que hubiera quedado de un build con boot counting.
 cleanup_uki_variants() {
   local base current r f
   base="${CIZEN_UKI_NAME%.efi}"
@@ -342,6 +370,53 @@ sbctl_keys_present() {
   "${SUDO[@]}" test -s /var/lib/sbctl/keys/db/db.key 2>/dev/null && \
   "${SUDO[@]}" test -s /var/lib/sbctl/keys/PK/PK.key 2>/dev/null && \
   "${SUDO[@]}" test -s /var/lib/sbctl/keys/KEK/KEK.key 2>/dev/null
+}
+
+# Entradas de la BD de sbctl cuyo fichero ya no existe. Esas entradas son la
+# causa del fallo de pacman: 'sbctl sign-all' (hook zzz-sbctl.hook) aborta con
+# "does not exist" y el -Syu termina en error. Sin argumentos = todas.
+sbctl_stale_entries() {
+  local db="${1:-$SBCTL_DB_FILE}" f
+  [ -r "$db" ] || return 0
+  # Claves del objeto JSON de primer nivel ("ruta": { ... }). Es la forma más
+  # robusta de extraerlas sin depender de jq ni de un parser propio: las líneas
+  # indented de "file"/"output_file" no encajan con el patrón porque detrás de
+  # los dos puntos no hay '{'.
+  while IFS= read -r f; do
+    f="${f#"${f%%[![:space:]]*}"}"   # quite espacios iniciales
+    f="${f%"${f##*[![:space:]]}"}"   # quite espacios finales
+    f="${f%\"}"; f="${f#\"}"          # quite comillas
+    [ -n "$f" ] || continue
+    [ "$f" = "$db" ] && continue
+    "${SUDO[@]}" test -e "$f" 2>/dev/null || printf '%s\n' "$f"
+  done < <(sed -n 's/^[[:space:]]*"\([^"]*\)"[[:space:]]*:[[:space:]]*{.*/\1/p' "$db" 2>/dev/null || true)
+}
+
+# Purga de la BD de sbctl: quita las entradas cuyo fichero ya no está (UKIs +N
+# renombradas por systemd-bless-boot, UKIs retiradas, vmlinuz borrados). Sin
+# esto, cualquier transacción de pacman que toque /boot falla. Idempotente, y
+# solo toca entradas huérfanas: nunca las que existen.
+sbctl_prune_stale() {
+  local -a stale=()
+  local f n=0
+  [ -n "$SBCTL_BIN" ] || return 0
+  while IFS= read -r f; do
+    [ -n "$f" ] && stale+=("$f")
+  done < <(sbctl_stale_entries "${1:-$SBCTL_DB_FILE}")
+
+  [ "${#stale[@]}" -gt 0 ] || return 0
+  for f in "${stale[@]}"; do
+    if "${SUDO[@]}" "$SBCTL_BIN" remove-file "$f" >/dev/null 2>&1; then
+      n=$((n + 1))
+    fi
+  done
+  if [ "$n" -gt 0 ]; then
+    ok "BD de sbctl saneada: $n entrada(s) huérfana(s) eliminadas (sbctl remove-file)."
+    for f in "${stale[@]}"; do
+      [ -e "$f" ] || info "  - $f (ya no existe; estorbaba a sbctl sign-all en pacman)"
+    done
+  fi
+  return 0
 }
 
 # Decide DO_SIGN a partir de CIZEN_SIGN_UKI / --sign / --no-sign. auto firma
@@ -486,6 +561,13 @@ if [ "$DO_SIGN" = true ]; then
     fatal "No se pudo firmar la UKI (sbctl sign/verify falló)."
   fi
 fi
+
+# Saneado final de la BD de sbctl, INDEPENDIENTEMENTE de si se acaba de firmar:
+# es lo que evita que el próximo 'pacman -Syu' muera en el hook zzz-sbctl.hook
+# ("failed signing ...: does not exist") por una UKI +N que systemd-bless-boot
+# renombró, por una variante que cleanup_uki_variants acaba de borrar o por
+# cualquier otra entrada huérfana que hubiera de un build anterior.
+sbctl_prune_stale
 
 if [ -n "$embedded_initrd" ] && [ "$CIZEN_UKI_KEEP_INITRAMFS" != "1" ] && [ -f "$embedded_initrd" ]; then
   if "${SUDO[@]}" rm -f "$embedded_initrd"; then

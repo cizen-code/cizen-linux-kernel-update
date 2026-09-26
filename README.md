@@ -240,23 +240,44 @@ escritorio (notify-send; desactivable con `CIZEN_NOTIFY=0`).
 
 ### Recuperación de arranque (boot counting)
 
-Desde esta versión la UKI se escribe con un **contador de intentos** de
-systemd-boot (`arch-linux-cizen-v3+3.efi`): en cada boot sin completar
-`boot-complete.target` resta 1; al agotarse, sd-boot marca la entrada como
-`bad` y arranca el kernel previo (p. ej. el LTS) en lugar de dejarte fuera del
-sistema. `systemd-bless-boot.service` (activación automática, no hay que
-habilitarla) renombra la UKI a nombre plano cuando el arranque completa.
-Configurable con `CIZEN_BOOT_TRIES` (0 = UKI plana, sin boot counting). El
-guard de `kernel-update-verify.sh` (check GUARD) avisa en el login siguiente si
-el kernel arrancado no es el último Cizen instalado.
+La UKI se escribe con su **nombre plano**, `/boot/EFI/Linux/arch-linux-cizen-v3.efi`
+(`CIZEN_BOOT_TRIES=0`, el default). Es el nombre que espera el `default_uki` del
+preset de mkinitcpio, el que ven `bootctl list` y el que `systemd-bless-boot`
+deja intacto: al no renombrarse nunca, la firma registrada en la base de datos de
+sbctl sigue apuntando a un fichero que existe.
 
-El `+3` no es una UKI aparte: es **la misma** con el número de intentos que
-quedan, y la anterior se borra a propósito (si no, el bootloader arrancaría el
-kernel nuevo sin contador y esto no serviría de nada). Consecuencia útil: hasta
-que arrancas **una** vez con éxito, el `default_uki` del preset de mkinitcpio
-(`/boot/EFI/Linux/arch-linux-cizen-v3.efi`) no existe en disco, porque el
-fichero en ese momento se llama `arch-linux-cizen-v3+3.efi`. No es un fallo del
-build.
+Se puede reactivar el **contador de intentos** de systemd-boot con
+`CIZEN_BOOT_TRIES=3` (`arch-linux-cizen-v3+3.efi`): en cada boot sin completar
+`boot-complete.target` resta 1; al agotarse, sd-boot marca la entrada como `bad`
+y arranca el kernel previo (p. ej. el LTS) en lugar de dejarte fuera del sistema,
+y `systemd-bless-boot.service` (activación automática) renombra la UKI a nombre
+plano cuando el arranque completa. El `+3` no es una UKI aparte: es **la misma**
+con los intentos que quedan, y la anterior se borra a propósito (si no, el
+bootloader arrancaría el kernel nuevo sin contador y esto no serviría de nada).
+
+**Por qué no es el default (v27.31.32)**: ese renombrado rompe pacman. La UKI con
+contador se firma con `sbctl sign --save`, que registra *ese* nombre
+(`…+3.efi`) en `/var/lib/sbctl/files.json`; al arrancar bien, `systemd-bless-boot`
+la renombra a plano y la entrada queda apuntando a un fichero inexistente para
+siempre. El hook `zz-sbctl.hook` ejecuta `sbctl sign-all -g` en **toda**
+transacción de pacman que toque `/boot`, así que desde el primer arranque bueno
+todo `pacman -Syu` terminaba en:
+
+```
+failed signing /boot/EFI/Linux/arch-linux-cizen-v3+3.efi: ... does not exist
+error: la orden no se ejecutó correctamente
+```
+
+Por eso, además del nombre plano, ambos scripts sanEAN la base de datos de sbctl
+(`sbctl remove-file` sobre las entradas cuyo fichero ya no existe) en cada
+sincronización, aunque no se firme: un huérfano heredado de un build con boot
+counting también tumbaba el `-Syu`. Si reactivás el boot counting, el saneado
+ocurre en la siguiente sincronización, no en el arranque, así que entre un boot y
+el siguiente un `pacman -Syu` puede volver a quejarse (avisa, no rompe la
+actualización de paquetes: el error es del hook de firma).
+
+El guard de `kernel-update-verify.sh` (check GUARD) avisa en el login siguiente si
+el kernel arrancado no es el último Cizen instalado.
 
 ### Firma de la UKI (Secure Boot)
 
