@@ -1,12 +1,12 @@
-## [27.31.25] - 2026-09-25
+## [27.31.26] - 2026-09-25
 
 El compilador se elige al vuelo en cualquier build, no solo en `variant`.
 
 Preguntar el CC solo en la 14 dejaba a las opciones que se usan a diario —`build`,
 `buildfast`, `force`, `buildbore`, `buildborefast`, `ntsync`, `cachy`— atadas al
 default del motor, sin forma de forzar `gcc` o `clang` justo cuando hace falta
-(un LTO de clang que falla, o comparar compilers de verdad). Ahora al elegir
-cualquiera de ellas (3, 4, 5, 7, 8, 14, 15, 16) aparece:
+(un LTO de clang que falla, o comparar compiladores de verdad). Ahora al elegir
+cualquiera de ellas (1, 2, 3, 4, 5, 7, 8, 14, 15, 16) aparece:
 
 ```
   CC (Enter usa el default):
@@ -26,7 +26,10 @@ cualquiera de ellas (3, 4, 5, 7, 8, 14, 15, 16) aparece:
   con `$( )` sin que la pregunta desaparezca dentro del subshell.
 - La prioridad `baja`/`alta` de cada opción se aplica en el mismo sitio, sin
   depender de un `VAR=x exec` (que solo exporta por su cuenta en algunos casos).
-- 6 tests nuevos: las 7 opciones de build pasan por `build_and_exec`, la 14
+- También las de **check** (1 `check-upgrade` y 2 `check-upgradefast`): un check
+  build compila el árbol entero, así que heredar el compilador del host sin poder
+  elegirlo hacía que no sirviera para comprobar si ese compiler arranca.
+- 6 tests nuevos: las 9 opciones que compilan pasan por `build_and_exec`, la 14
   reutiliza `ask_cc`, `--cc` llega tal cual al motor, Enter no añade nada, la
   prioridad `alta` se propaga, y el submenú se ve. Suite: 273 ok, 0 fail.
 

@@ -270,8 +270,8 @@ rule
 while true; do
   read -r -p "${W}  [0-17] > ${N}" choice
   case "$choice" in
-    1) exec "$SCRIPT" --absorb-rebels --check ;;
-    2) CIZEN_BUILD_PRIORITY=normal exec "$SCRIPT" --absorb-rebels --check ;;
+    1) build_and_exec baja --absorb-rebels --check ;;
+    2) build_and_exec alta --absorb-rebels --check ;;
     3) build_and_exec baja --absorb-rebels ;;
     4) build_and_exec alta --absorb-rebels ;;
     5) build_and_exec baja --force ;;

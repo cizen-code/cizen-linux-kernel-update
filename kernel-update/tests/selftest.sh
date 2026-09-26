@@ -1317,11 +1317,11 @@ cachyos-7.2.80-1" fork_tagrel 7.2.8)" ]; then
   # Cada build tiene que pasar por build_and_exec; si alguien añade una opción
   # nueva compilando con exec a pelo, este test lo canta.
   faltan=""
-  for n in 3 4 5 7 8 15 16; do
+  for n in 1 2 3 4 5 7 8 15 16; do
     grep -qE "^ +$n\) build_and_exec " "$MENU" || faltan="$faltan $n"
   done
   if [ -z "$faltan" ]; then
-    rec ok "menú: las 7 opciones de build (3,4,5,7,8,15,16) pasan por build_and_exec (preguntan CC)"
+    rec ok "menú: las 9 opciones que compilan (1,2,3,4,5,7,8,15,16) pasan por build_and_exec (preguntan CC)"
   else
     rec fail "menú: opciones de build sin pregunta de CC:$faltan"
   fi

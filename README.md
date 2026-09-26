@@ -68,7 +68,7 @@ Ahora el motor copia a `$ROLLBACK_DIR` el **paquete que acaba de instalar** (y
 solo ese: "actual + previo"), junto a un manifiesto `rollback.info` con
 pkgbase, pkgver, release y scheduler:
 
-Todas las opciones que compilan (3, 4, 5, 7, 8, 14, 15, 16) preguntan el
+Todas las opciones que compilan (1, 2, 3, 4, 5, 7, 8, 14, 15, 16) preguntan el
 compilador antes de arrancar:
 
 ```
