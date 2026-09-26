@@ -97,6 +97,19 @@ patch_embed_b64_prjc_cachy() {
 extract() { # $1 = nombre de función (hasta el `}` inicial en columna 0)
   sed -n "/^[[:space:]]*$1() {/,/^}/p" "$MOTOR"
 }
+# Igual, pero contando llaves: `extract` se come todo hasta el primer `}` en
+# columna 0, y con una función de una línea ({ ...; }) eso se lleva por delante
+# las siguientes (y la función preguntada no llega a definirse).
+extract_fn() { # $1 = nombre de función
+  awk -v fn="$1" '
+    !f && $0 ~ "^[[:space:]]*" fn "[[:space:]]*\\(\\)[[:space:]]*\\{" {f=1}
+    f {
+      l=$0; n=gsub(/\{/, "", l); m=gsub(/\}/, "", l)
+      d+=n-m
+      print
+      if (d==0) exit
+    }' "$MOTOR"
+}
 {
   extract bore_branch_from_version
   extract patch_desc_bore
@@ -967,12 +980,17 @@ CIZEN_CC=zapache; CLANG_REQUESTED=false; _resolve_cc_compiler
   || rec fail "zapache -> esperaba fatal con CC_FAMILY vacío (got $CC_FAMILY)"
 
 printf '%s\n' "== clang/lld como dependencias OBLIGATORIAS según el compilador elegido =="
-if grep -q 'tools+=(ld.lld llvm-ar llvm-nm llvm-objcopy llvm-strip llvm-objdump llvm-readelf)' "$MOTOR" && grep -Fq '"$CC_LAUNCHER" = "clang" ] && tools+=(clang)' "$MOTOR"; then
-  rec ok "check_prerequisites exige la toolchain LLVM completa (ld.lld + llvm-* + clang genérico)"
+# v27.31.37: la exigencia por familia vive en require_cc_toolchain, que la
+# reutiliza también la pregunta tardía del compilador (si se elige clang DESPUÉS
+# de validar, su toolchain tiene que exigirse igual que en el arranque).
+if grep -q 'for _ccb in ld.lld llvm-ar llvm-nm llvm-objcopy llvm-strip llvm-objdump llvm-readelf; do' "$MOTOR" \
+   && grep -Fq '[ "$CC_LAUNCHER" = "clang" ] && ! command -v clang' "$MOTOR" \
+   && grep -q 'if ! require_cc_toolchain; then' "$MOTOR"; then
+  rec ok "require_cc_toolchain exige la toolchain LLVM completa (ld.lld + llvm-* + clang genérico)"
 else
-  rec fail "check_prerequisites: falta la exigencia por familia (ld.lld / clang genérico)"
+  rec fail "require_cc_toolchain: falta la exigencia por familia (ld.lld / clang genérico)"
 fi
-if grep -q 'missing_pkgs+=("${_ccb//-/}")' "$MOTOR"; then
+if grep -q 'CC_MISSING_PKGS+=("${_ccb//-/}")' "$MOTOR"; then
   rec ok "compilador versionado ausente -> paquete Arch homónimo (gcc-14 -> gcc14)"
 else
   rec fail "versiones: falta derivar el paquete homónimo del basename"
@@ -1084,10 +1102,10 @@ else
   rec fail "check_profile_contradictions rompió tras retirar símbolos"
 fi
 
-if grep -Fq 'tools+=(ld.lld llvm-ar llvm-nm llvm-objcopy llvm-strip llvm-objdump llvm-readelf)' "$MOTOR"; then
+if grep -Fq 'for _ccb in ld.lld llvm-ar llvm-nm llvm-objcopy llvm-strip llvm-objdump llvm-readelf; do' "$MOTOR"; then
   rec ok "familia clang exige ld.lld + llvm-* completos (LLVM=1 usa llvm-ar/nm/objcopy/strip/objdump/readelf)"
 else
-  rec fail "check_prerequisites: con clang faltaba la toolchain llvm-* completa (paquete llvm)"
+  rec fail "require_cc_toolchain: con clang faltaba la toolchain llvm-* completa (paquete llvm)"
 fi
 if grep -Fq '[llvm-ar]=llvm' "$MOTOR" && grep -Fq '[llvm-nm]=llvm' "$MOTOR" && grep -Fq '[llvm-objcopy]=llvm' "$MOTOR" && grep -Fq '[llvm-strip]=llvm' "$MOTOR" && grep -Fq '[llvm-readelf]=llvm' "$MOTOR"; then
   rec ok "TOOL_PKG mapea la toolchain llvm-* -> llvm (autoinstalación 'sudo pacman -S llvm')"
@@ -1311,41 +1329,63 @@ cachyos-7.2.80-1" fork_tagrel 7.2.8)" ]; then
     rec fail "menú rollback: exec sin comprobar el script (error ilegible si falta)"
   fi
 
-  # ── Compilador: toda opción que compila tiene que preguntar cuál ──
-  # Preguntarlo solo en la opción 14 dejaba a las de uso diario atadas al
-  # default del motor, sin forma de forzar gcc o clang cuando hace falta.
-  # Cada build tiene que pasar por build_and_exec; si alguien añade una opción
-  # nueva compilando con exec a pelo, este test lo canta.
+  # ── Las preguntas de variante y compilador viven en el MOTOR (v27.31.37) ──
+  # Y solo se hacen detrás del «¿Desea continuar con la compilación?». Aquí se
+  # comprueba lo contrario de lo que se comprobaba antes: que el menú NO las
+  # haga (preguntarlas antes de validar es cambiar de opinión a mitad), que no
+  # se cuele ningún flag que las silencie por la vía rápida, y que la 14 siga
+  # con su propio prompt de Scheduler (su elección sí es definitiva).
   faltan=""
   for n in 1 2 3 4 5 7 8 15 16; do
     grep -qE "^ +$n\) build_and_exec (baja|alta) (ask|bore|none) " "$MENU" || faltan="$faltan $n"
   done
   if [ -z "$faltan" ]; then
-    rec ok "menú: las 9 opciones que compilan (1,2,3,4,5,7,8,15,16) pasan por build_and_exec (preguntan CC)"
+    rec ok "menú: las 9 opciones que compilan (1,2,3,4,5,7,8,15,16) pasan por build_and_exec"
   else
-    rec fail "menú: opciones de build sin pregunta de CC:$faltan"
+    rec fail "menú: opciones de build que no pasan por build_and_exec:$faltan"
   fi
-  # La 14 reutiliza el submenú en vez de tener su propia copia: las dos copias ya
-  # se habían desincronizado una vez (su prompt decía «lauto» y no «auto»).
-  # Y solo puede llamarlo una vez: preguntar dos veces hacía descartar la
-  # primera respuesta sin avisar.
-  if [ "$(grep -c 'CC%b (Enter usa el default)' "$MENU")" = 1 ] \
-     && [ "$(grep -c '^ *ask_cc$' "$MENU")" = 2 ] \
-     && ! printf '%s' "$MENU" | grep -q '="\$(ask_cc)"'; then
-    rec ok "menú: la opción 14 reutiliza ask_cc (y una sola vez) en vez de duplicar el submenú"
+  # El menú no puede tener ni las funciones ni los submenús: si vuelve a
+  # preguntar aquí, el usuario ve la pregunta dos veces (una sin efecto).
+  if ! grep -qE '^(ask_cc|ask_variant)\(\)' "$MENU" \
+     && ! grep -q 'Variante (Enter usa el default)' "$MENU" \
+     && ! grep -q 'CC (Enter usa el default)' "$MENU"; then
+    rec ok "menú: no pregunta variante ni compilador (las dos preguntas están en el motor)"
   else
-    rec fail "menú: submenú de CC duplicado, ask_cc llamada de más o mediante \$() (volverían a divergir)"
+    rec fail "menú: vuelve a preguntar la variante o el compilador antes de validar la config"
+  fi
+  # build_and_exec no puede silenciar por la vía rápida las preguntas que ahora
+  # hace el motor, ni elegir compilador por su cuenta: --no-ask-variant lo
+  # convertiría en un build sin pregunta, y --cc lo dejaría atado al default.
+  : > "$ROOT/bafn.sh"
+  sed -n '/^build_and_exec() {/,/^}/p' "$MENU" >> "$ROOT/bafn.sh"
+  if ! grep -qE -- '--no-ask-variant|--cc' "$ROOT/bafn.sh"; then
+    rec ok "menú: build_and_exec no pasa --no-ask-variant ni --cc (las preguntas son del motor)"
+  else
+    rec fail "menú: build_and_exec silencia o adelanta una pregunta que debe hacer el motor"
+  fi
+  # La 14 es la excepción: su Scheduler SÍ es definitivo (incluye «inherit»,
+  # que el motor no ofrece), así que --no-ask-variant es correcto ahí. Lo que no
+  # puede es volver a preguntar el compilador.
+  if grep -q 'args="\$args --no-ask-variant"' "$MENU" \
+     && grep -q 'Scheduler%b \[Enter=%blinherit%b\]' "$MENU"; then
+    rec ok "menú: la 14 mantiene su prompt de Scheduler y marca la variante como ya elegida"
+  else
+    rec fail "menú: la 14 perdió su prompt de Scheduler o volvió a preguntar la variante"
+  fi
+  # El fallback del fork (ofrecer la última release del CachyOS) lo decide el
+  # menú antes de lanzar, cuando ya sabe que la versión pedida no está allí.
+  if [ "$(grep -c 'fork_fallback_for' "$MENU")" -ge 2 ] \
+     && grep -q 'fork_fallback_for "\$sched"' "$MENU"; then
+    rec ok "menú: el fallback del fork se sigue ofreciendo al elegir scheduler de solo-fork (14)"
+  else
+    rec fail "menú: el fallback del fork se ha perdido"
   fi
 
-  # ask_cc imprime el submenú y el prompt en stdout y deja lo tecleado en la
-  # global ASK_CC: nada que capturar con $(), y por eso el bloque se ve aunque
-  # stderr no sea la terminal. build_and_exec solo añade --cc si se tecleó algo,
-  # porque el default del motor ya es auto.
+  # Funcional: build_and_exec solo compone la llamada. Sin preguntas, la fila del
+  # motor es lo único que sale, y lo que entre se tiene que ver llegar tal cual.
   : > "$ROOT/ccfn.sh"
-  sed -n '/^ask_cc() {/,/^}/p'        "$MENU" >> "$ROOT/ccfn.sh"
-  sed -n '/^ask_variant() {/,/^}/p'    "$MENU" >> "$ROOT/ccfn.sh"
   sed -n '/^fork_fallback_for() {/,/^}/p' "$MENU" >> "$ROOT/ccfn.sh"
-  sed -n '/^build_and_exec() {/,/^}/p' "$MENU" >> "$ROOT/ccfn.sh"
+  sed -n '/^build_and_exec() {/,/^}/p'   "$MENU" >> "$ROOT/ccfn.sh"
   cat > "$ROOT/fake-engine.sh" <<'FAKE'
 #!/bin/bash
 printf 'ARGS:'; printf ' <%s>' "$@"; printf ' PRIO=%s\n' "${CIZEN_BUILD_PRIORITY:-unset}"
@@ -1359,93 +1399,210 @@ source "$ROOT/ccfn.sh"
 SCRIPT="$ROOT/fake-engine.sh"
 build_and_exec "\$@"
 RUNNER
-  # El submenú va ahora a stdout, así que hay que aislar la fila del motor: si
-  # el patrón no aparece, es que la UI se tragó la salida (o al revés). El prompt
-  # no lleva salto de línea (lo pone el Enter que teclea el usuario, y con la
-  # entrada por tubería no hay eco), así que la fila del motor llega pegada a él.
   eng() { sed -n 's/^.*\(ARGS:.*\)$/\1/p'; }
-  out_clang="$(printf 'clang\n' | bash "$ROOT/cc-run.sh" baja none --absorb-rebels 2>/dev/null | eng)"
-  out_empty="$(printf '\n' | bash "$ROOT/cc-run.sh" baja none --absorb-rebels 2>/dev/null | eng)"
-  out_alta="$(printf 'gcc-14\n' | bash "$ROOT/cc-run.sh" alta none --absorb-rebels 2>/dev/null | eng)"
-  if [ "$out_clang" = "ARGS: <--absorb-rebels> <--no-ask-variant> <--cc> <clang> PRIO=unset" ]; then
-    rec ok "menú: elegir clang en el submenú llega al motor como --cc clang"
+  out_ask="$(bash "$ROOT/cc-run.sh" baja ask --absorb-rebels 2>/dev/null | eng)"
+  if [ "$out_ask" = "ARGS: <--absorb-rebels> PRIO=unset" ]; then
+    rec ok "menú: una build sin variante impuesta llega al motor tal cual, sin flags extra"
   else
-    rec fail "menú: --cc mal pasado al motor ('$out_clang')"
+    rec fail "menú: build_and_exec añade o quita algo de la llamada ('$out_ask')"
   fi
-  if [ "$out_empty" = "ARGS: <--absorb-rebels> <--no-ask-variant> PRIO=unset" ]; then
-    rec ok "menú: Enter en el submenú no añade --cc (el default del motor ya es auto)"
+  out_bore="$(bash "$ROOT/cc-run.sh" baja bore --absorb-rebels 2>/dev/null | eng)"
+  if [ "$out_bore" = "ARGS: <--absorb-rebels> <--patch> <bore> PRIO=unset" ]; then
+    rec ok "menú: la opción que ya impone bore sigue pasándolo como --patch"
   else
-    rec fail "menú: Enter añadió un argumento de más ('$out_empty')"
+    rec fail "menú: bore no llega al motor ('$out_bore')"
   fi
-  if [ "$out_alta" = "ARGS: <--absorb-rebels> <--no-ask-variant> <--cc> <gcc-14> PRIO=normal" ]; then
-    rec ok "menú: un compilador tecleado a mano (gcc-14) y la prioridad «alta» llegan ambos al motor"
+  out_alta="$(bash "$ROOT/cc-run.sh" alta ask --absorb-rebels 2>/dev/null | eng)"
+  if [ "$out_alta" = "ARGS: <--absorb-rebels> PRIO=normal" ]; then
+    rec ok "menú: la prioridad «alta» sigue llegando al motor por CIZEN_BUILD_PRIORITY"
   else
-    rec fail "menú: CC tecleado o prioridad mal pasados ('$out_alta')"
+    rec fail "menú: prioridad mal pasada ('$out_alta')"
   fi
-  # La UI de las preguntas va a stdout, no a stderr: es la razón de que la
-  # respuesta viva en una global. Si volviera a stderr, en cualquier sitio donde
-  # stderr no sea la terminal (log, pane, `| tee`, launcher con 2>/dev/null) el
-  # submenú desaparecería y solo se vería el prompt.
-  ui="$(printf 'gcc\n' | bash "$ROOT/cc-run.sh" baja none 2>/dev/null)"
-  ui_err="$(printf 'gcc\n' | bash "$ROOT/cc-run.sh" baja none 2>&1 >/dev/null)"
-  if printf '%s' "$ui" | grep -q 'CC (Enter usa el default)' \
-     && [ -z "$ui_err" ]; then
-    rec ok "menú: el submenú de CC va a stdout (visible también si stderr no es la terminal)"
+  # Y lo más importante: el menú no imprime NADA de UI de preferencias. La UI
+  # la imprime el motor, en su momento.
+  ui_menu="$(bash "$ROOT/cc-run.sh" baja ask --absorb-rebels 2>&1)"
+  if ! printf '%s' "$ui_menu" | grep -qE 'Variante|CC \(Enter|ask_cc|ask_variant'; then
+    rec ok "menú: build_and_exec no imprime ninguna UI de variante/compilador"
   else
-    rec fail "menú: el submenú de CC no va a stdout ('$ui_err')"
+    rec fail "menú: build_and_exec imprime UI de preferencias ('$ui_menu')"
   fi
-  # El prompt tiene que verse siempre: `read -p` solo lo escribe si stdin es una
-  # terminal, así que se imprime con printf antes de leer.
-  if printf '%s' "$ui" | grep -q 'CC .*\[Enter=.*auto.*\]: '; then
-    rec ok "menú: el prompt de CC se imprime siempre (no con `read -p`, que depende de stdin)"
+
+  # ── Motor: las dos preguntas, y solo con la respuesta SÍ ──
+  # Estructura: ask_build_prefs se llama exactamente una vez dentro del then de
+  # «if confirm_build_after_check» y ninguna vez en su else (la rama «no»).
+  blk="$(awk '/^  if confirm_build_after_check; then/{f=1} f&&/^  else$/{print "---ELSE---"; f=0} f{print}' "$MOTOR")"
+  then_part="$(printf '%s\n' "$blk" | sed '/^---ELSE---$/q')"
+  else_part="$(printf '%s\n' "$blk" | sed -n '/^---ELSE---$/,$p')"
+  if [ "$(printf '%s\n' "$then_part" | grep -c '^ *ask_build_prefs$')" = 1 ]; then
+    rec ok "motor: ask_build_prefs se invoca dentro de la rama SÍ de «¿Desea continuar?»"
   else
-    rec fail "menú: el prompt de CC no aparece ('$ui')"
+    rec fail "motor: ask_build_prefs no está (o está repetida) en la rama SÍ"
   fi
-  # ── El orden de las preguntas: variante antes que compilador ──
-  # La variante se preguntaba en el MOTOR, después de descargar, verificar
-  # firmas y validar la config: nueve minutos tarde y con el compilador ya
-  # preguntado. Ahora las dos van juntas y en ese orden, y el motor recibe
-  # --no-ask-variant para no volver a preguntar al final.
-  out_orden="$(printf '2\nclang\n' | bash "$ROOT/cc-run.sh" baja ask --absorb-rebels 2>&1)"
-  if [ "$(printf '%s\n' "$out_orden" | grep -n 'Variante (Enter usa el default)' | cut -d: -f1)" -lt \
-     "$(printf '%s\n' "$out_orden" | grep -n 'CC (Enter usa el default)' | cut -d: -f1)" ]; then
-    rec ok "menú: la variante se pregunta antes que el compilador"
+  if ! printf '%s\n' "$else_part" | grep -qE 'ask_build_prefs|ask_build_variant|ask_build_cc'; then
+    rec ok "motor: con la respuesta N no se pregunta ni la variante ni el compilador"
   else
-    rec fail "menú: el orden es compilador→variante, que es justo lo que se pidió cambiar ('$out_orden')"
+    rec fail "motor: se pregunta variante/compilador aunque el usuario haya dicho que no"
   fi
-  out_bore="$(printf '2\n' | bash "$ROOT/cc-run.sh" baja ask --absorb-rebels 2>/dev/null | eng)"
-  if [ "$out_bore" = "ARGS: <--absorb-rebels> <--patch> <bore> <--no-ask-variant> PRIO=unset" ]; then
-    rec ok "menú: la variante elegida llega al motor como --patch y con --no-ask-variant"
+  # El prompt al que se responde SÍ tiene que ser el de siempre: es el ancla de
+  # todo este comportamiento.
+  if grep -q '¿Desea continuar con la compilación del kernel \$VERSION? \[S/n\]' "$MOTOR"; then
+    rec ok "motor: el prompt de confirmación previo a las preguntas no ha cambiado"
   else
-    rec fail "menú: la variante no llega bien al motor ('$out_bore')"
+    rec fail "motor: el prompt «¿Desea continuar…?» ya no es el esperado"
   fi
-  out_vanilla="$(printf '1\ngcc\n' | bash "$ROOT/cc-run.sh" baja ask --absorb-rebels 2>/dev/null | eng)"
-  if [ "$out_vanilla" = "ARGS: <--absorb-rebels> <--no-ask-variant> <--cc> <gcc> PRIO=unset" ]; then
-    rec ok "menú: Vanilla no añade --patch pero tampoco deja que el motor pregunte al final"
+  # La UI de las dos preguntas, tal cual la pidió el usuario. Se comprueba
+  # RENDERIZADA (ejecutando las funciones del motor con una entrada tecleada),
+  # no leyendo el fuente: así lo que se testea es lo que se ve.
+  : > "$ROOT/prefs.sh"
+  extract_fn prefs_read          >> "$ROOT/prefs.sh"
+  extract_fn prefs_interactive   >> "$ROOT/prefs.sh"
+  extract_fn ask_build_variant   >> "$ROOT/prefs.sh"
+  extract_fn ask_build_cc        >> "$ROOT/prefs.sh"
+  cat > "$ROOT/prefs-run.sh" <<'PREFS'
+W=''; Y=''; N=''
+PATCH_NAMES=(); NO_ASK_VARIANT="${NO_ASK_VARIANT:-false}"; NO_ASK_CC="${NO_ASK_CC:-false}"
+CC_EXPLICIT="${CC_EXPLICIT:-false}"; CIZEN_CC="${CIZEN_CC:-auto}"; CC_LAUNCHER="${CC_LAUNCHER:-gcc}"
+log(){ :; }; ok(){ printf '  ok: %s\n' "$*"; }; warn(){ printf '  warn: %s\n' "$*"; }
+# shellcheck disable=SC1090
+source "$ROOT/prefs.sh"
+# El test es una tubería: no hay tty, así que se simula una sesión
+# interactiva y la lectura viene de stdin (no de /dev/tty, que sería la del
+# propio runner).
+prefs_interactive(){ return 0; }
+prefs_read(){ local __v=""; read -r __v || __v=""; printf -v "$1" '%s' "$__v"; }
+ask_build_variant
+ask_build_cc
+printf 'CHOICE variant=%s cc=%s\n' "${VARIANT_CHOICE:-vacio}" "${CC_CHOICE:-vacio}"
+PREFS
+  ui_p="$(printf '2\nclang\n' | bash "$ROOT/prefs-run.sh" 2>"$ROOT/prefs.err")"
+  ui_p_err="$(cat "$ROOT/prefs.err")"
+  if printf '%s' "$ui_p" | grep -q 'Variante (Enter usa el default)' \
+     && printf '%s' "$ui_p" | grep -q 'CC (Enter usa el default)' \
+     && [ -z "$ui_p_err" ]; then
+    rec ok "motor: los dos submenús se ven enteros y van a stdout (también si stderr no es la terminal)"
   else
-    rec fail "menú: Vanilla no se pasa bien ('$out_vanilla')"
+    rec fail "motor: submenús incompletos o no están en stdout ('$ui_p_err')"
   fi
-  # bore ya viene impuesto por la opción (7/8): no se pregunta, pero se pasa.
-  out_impl="$(printf 'clang\n' | bash "$ROOT/cc-run.sh" baja bore --absorb-rebels 2>/dev/null | eng)"
-  if [ "$out_impl" = "ARGS: <--absorb-rebels> <--patch> <bore> <--no-ask-variant> <--cc> <clang> PRIO=unset" ] &&
-     ! printf 'clang\n' | bash "$ROOT/cc-run.sh" baja bore --absorb-rebels 2>&1 | grep -q 'Variante (Enter'; then
-    rec ok "menú: la opción que ya impone bore no pregunta la variante (solo el compilador)"
+  for linea in '1  Vanilla (EEVDF)' '2  BORE' '3  PDS (prjc)' '4  BMQ (prjc)' \
+               '5  LFBMQ (prjc)' '6  MuQSS' 'Variante [Enter=1]: ' \
+               'auto  elige según el sistema' 'gcc   compilador GCC' \
+               'clang Clang/LLVM' 'otro  teclea TU compilador' \
+               'CC [Enter=auto]: '; do
+    if printf '%s' "$ui_p" | grep -qF -- "$linea"; then
+      rec ok "motor: sale «$linea»"
+    else
+      rec fail "motor: no sale «$linea» del submenú"
+    fi
+  done
+  if printf '%s' "$ui_p" | grep -q 'CHOICE variant=bore cc=clang'; then
+    rec ok "motor: 2 → bore y clang → las respuestas llegan en sus globales"
   else
-    rec fail "menú: la variante impuesta se pregunta igualmente o no se pasa ('$out_impl')"
+    rec fail "motor: las respuestas no llegan donde deben ('$ui_p')"
   fi
-  # El motor tiene que respetar el flag, o el menú preguntaría dos veces.
-  if grep -q 'NO_ASK_VARIANT' "$MOTOR" &&
-     grep -q 'Variante ya elegida por quien invoca el motor' "$MOTOR"; then
-    rec ok "sudo/motor: --no-ask-variant evita la pregunta duplicada de la variante"
+  # Enter = default: Vanilla, y el compilador que se deja tal cual (el motor ya
+  # lo resolvió al arrancar; no hay que volver a decidirlo).
+  ui_def="$(printf '\n\n' | bash "$ROOT/prefs-run.sh" 2>/dev/null)"
+  if printf '%s' "$ui_def" | grep -q 'CHOICE variant=vacio cc=vacio'; then
+    rec ok "motor: Enter en los dos = Vanilla + el compilador ya resuelto (no se re-pregunta)"
   else
-    rec fail "motor: --no-ask-variant no está respetado en choose_build_variant_after_check"
+    rec fail "motor: Enter no equivale a los defaults ('$ui_def')"
   fi
-  # El fallback del fork (ofrecer la última release del CachyOS) ahora también
-  # aplica a las opciones que no son la 14, no solo a variant.
-  if [ "$(grep -c 'fork_fallback_for' "$MENU")" -ge 3 ]; then
-    rec ok "menú: el fallback del fork se usa en la 14 y en las opciones de build con variante"
+  # Los alias también (una palabra suelta, como siempre).
+  ui_alias="$(printf 'muqss\ngcc-14\n' | bash "$ROOT/prefs-run.sh" 2>/dev/null)"
+  if printf '%s' "$ui_alias" | grep -q 'CHOICE variant=muqss cc=gcc-14'; then
+    rec ok "motor: alias por nombre (muqss / gcc-14) aceptados tal cual"
   else
-    rec fail "menú: el fallback del fork sigue siendo exclusivo de la 14"
+    rec fail "motor: los alias no se aceptan ('$ui_alias')"
+  fi
+  # Una respuesta que no vale repregunta, no se traga.
+  ui_bad="$(printf '9\n7\n6\nx\n' | bash "$ROOT/prefs-run.sh" 2>/dev/null)"
+  if printf '%s' "$ui_bad" | grep -q 'Respuesta no válida' \
+     && printf '%s' "$ui_bad" | grep -q 'CHOICE variant=muqss'; then
+    rec ok "motor: una respuesta inválida repregunta y no se cuela como elección"
+  else
+    rec fail "motor: respuesta inválida aceptada en silencio ('$ui_bad')"
+  fi
+  # Quien ya lo dijo (--cc explícito) no se pregunta otra vez.
+  ui_cc="$(CIZEN_CC=gcc-14 CC_EXPLICIT=true NO_ASK_CC=true NO_ASK_VARIANT=true \
+            bash "$ROOT/prefs-run.sh" 2>/dev/null <<<'')"
+  if ! printf '%s' "$ui_cc" | grep -qE 'Variante|CC .*\[Enter='; then
+    rec ok "motor: con --cc explícito (o --no-ask-cc) no se imprime ningún submenú"
+  else
+    rec fail "motor: se pregunta el compilador aunque ya venga decidido ('$ui_cc')"
+  fi
+  # Sin terminal: se avisa y se sigue con los defaults, en vez de colgarse
+  # leyendo de un stdin que no existe.
+  ui_notty="$(printf '\n\n' | bash -c '
+    W=""; Y=""; N=""; PATCH_NAMES=(); NO_ASK_VARIANT=false; NO_ASK_CC=false
+    CC_EXPLICIT=false; CIZEN_CC=auto; CC_LAUNCHER=gcc
+    log(){ :; }; ok(){ printf "  ok: %s\n" "$*"; }; warn(){ printf "  warn: %s\n" "$*"; }
+    prefs_interactive(){ return 1; }
+    source "'"$ROOT"'/prefs.sh"
+    ask_build_variant; ask_build_cc
+    printf "CHOICE variant=%s cc=%s\n" "${VARIANT_CHOICE:-vacio}" "${CC_CHOICE:-vacio}"' 2>&1)"
+  if printf '%s' "$ui_notty" | grep -q 'warn: Sin terminal interactiva' \
+     && printf '%s' "$ui_notty" | grep -q 'CHOICE variant=vacio cc=vacio'; then
+    rec ok "motor: sin terminal no se pregunta y se continúa con los defaults"
+  else
+    rec fail "motor: sin terminal no cae en los defaults ('$ui_notty')"
+  fi
+  # Orden: variante antes que compilador, siempre.
+  if sed -n '/^ask_build_prefs() {/,/^}/p' "$MOTOR" | grep -nE '^ *(ask_build_variant|ask_build_cc)$' \
+       | head -2 | cut -d: -f2 | tr -d ' ' | paste -sd'|' - | grep -qx 'ask_build_variant|ask_build_cc'; then
+    rec ok "motor: la variante se pregunta antes que el compilador"
+  else
+    rec fail "motor: orden de las preguntas distinto de variante→compilador"
+  fi
+  # La UI a stdout, no a stderr (si stderr no es la terminal, el submenú
+  # desaparecería), y el prompt impreso, no `read -p`.
+  if grep -q 'prefs_read()' "$MOTOR" && ! grep -q "read -r -t 300 -p '  %bVariante" "$MOTOR"; then
+    rec ok "motor: las preguntas leen de /dev/tty con el prompt ya impreso (visible sin terminal en stderr)"
+  else
+    rec fail "motor: la UI de las preguntas depende de stderr o de `read -p`"
+  fi
+  # Quien llama puede silenciarlas (14, o quien ya las preguntó por su cuenta).
+  if grep -q 'NO_ASK_VARIANT' "$MOTOR" && grep -q 'NO_ASK_CC' "$MOTOR" \
+     && grep -q 'Variante ya elegida por quien invoca el motor' "$MOTOR" \
+     && grep -q 'Pregunta del compilador desactivada' "$MOTOR"; then
+    rec ok "motor: --no-ask-variant y --no-ask-cc evitan la pregunta duplicada"
+  else
+    rec fail "motor: --no-ask-cc / --no-ask-variant no están respetados"
+  fi
+  # Un --cc explícito ES una elección hecha: no se vuelve a preguntar.
+  if grep -q 'CC_EXPLICIT=true' "$MOTOR" && grep -q 'Compilador ya indicado explícitamente' "$MOTOR"; then
+    rec ok "motor: --cc explícito no se vuelve a preguntar"
+  else
+    rec fail "motor: se pregunta el compilador aunque se haya pasado --cc"
+  fi
+  # Elegir compilador después de validar tiene que re-resolver y revalidar: si no,
+  # la config se validó con un CC y se compila con otro (y LTO puede quedarse
+  # puesto con gcc, que no lo soporta).
+  for trozo in 'apply_cc_choice()' '_resolve_cc_compiler ||' 'KCONFIG_CC_OPTS=()' \
+               'CIZEN_LLVM_LTO=0' 'require_cc_toolchain; then' 'revalidate_config_chain' \
+               'LTO (${CIZEN_LLVM_LTO}) exige clang'; do
+    if grep -qF -- "$trozo" "$MOTOR"; then
+      rec ok "motor: la elección tardía de CC llega a «$trozo»"
+    else
+      rec fail "motor: la elección tardía de CC no llega a «$trozo» (config y build se desincronizarían)"
+    fi
+  done
+  # Un scheduler de solo-fork sobre un árbol vanilla no puede "aplicarse y ya":
+  # o se relanza con el árbol del fork, o se dice por qué no.
+  if grep -q 'fork_release_guard' "$MOTOR" && grep -q 'fork_release_guard "\$VARIANT_CHOICE"' "$MOTOR"; then
+    rec ok "motor: la elección de scheduler se comprueba contra el árbol antes de aplicarla"
+  else
+    rec fail "motor: no se comprueba que el scheduler elegido exista en el árbol actual"
+  fi
+  if grep -q 'exec "\$ENGINE_SELF" .*--tree cachyos --sched "\$2"' "$MOTOR"; then
+    rec ok "motor: el relanzamiento al árbol del fork lleva --tree cachyos y el scheduler"
+  else
+    rec fail "motor: el relanzamiento al fork no pasa --tree cachyos (volvería a fallar igual)"
+  fi
+  if ! grep -q 'se continúa compilando Vanilla' "$MOTOR" \
+     && ! sed -n '/^ask_build_prefs() {/,/^}/p' "$MOTOR" | grep -q 'se continúa compilando Vanilla'; then
+    rec ok "motor: si el scheduler elegido no se puede aplicar, se aborta (no degrada a Vanilla en silencio)"
+  else
+    rec fail "motor: un scheduler pedido que no se aplica degrada a Vanilla en silencio"
   fi
 
   # ── Kconfig: el índice no sobrevive a un parche, y los tipos se respetan ──

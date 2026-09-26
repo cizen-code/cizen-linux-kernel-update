@@ -200,68 +200,13 @@ opt() { # $1=número $2=nombre $3=descripción
 }
 
 # ── Respuestas de las preguntas del menú ────────────────────────
-# Toda la UI (submenú + prompt) se escribe en stdout y la respuesta queda en una
-# de estas variables globales. Antes era al revés —UI a stderr y respuesta a
-# stdout para capturarla con `$( )`— y ese truco tiene un agujero: si stderr no
-# es la terminal (un log, un pane, `| tee`, un launcher que lo manda a
-# /dev/null) el submenú desaparece y solo queda el prompt pelado. Con la
-# respuesta en una variable no hay nada que capturar: el bloque se imprime
-# entero, en orden, y en el mismo flujo que el resto del menú.
-ASK_CC=""        # respuesta de ask_cc        (vacía = el default del motor)
-ASK_VARIANT=""   # respuesta de ask_variant   (eevdf|bore|pds|bmq|lfbmq|muqss)
+# v27.31.37: el menú ya NO pregunta variante ni compilador. Las dos preguntas
+# viven en el motor (ask_build_prefs) y solo se hacen cuando ya está validada
+# la configuración y el usuario ha respondido SÍ a «¿Desea continuar con la
+# compilación?»: preguntar antes de validar es hacer.download de 300 MB, y
+# revertir, por algo que igual no se va a usar. Este fichero solo decide qué
+# ejecutar; quién y con qué se responde en el motor.
 FORK_CHOICE=""   # respuesta de fork_fallback_for (vacía = la versión pedida)
-
-# ── Elección de compilador (compartida por TODAS las opciones de build) ──
-# v27.31.24: preguntar el compilador solo en la opción 14 (variant) dejaba al
-# resto de builds —que son las que se usan a diario— atadas al default, sin
-# forma de forzar gcc o clang cuando toca (p. ej. un fallo de LTO con clang, o
-# al revés, comparar compiladores). Ahora toda opción que compila pregunta.
-ask_cc() {
-  ASK_CC=""
-  printf '\n  %bCC%b (Enter usa el default):\n' "$W" "$N"
-  printf '    %bauto%b  elige según el sistema (clang si LTO/toolchain LLVM viable; si no gcc) (default)\n' "$W" "$N"
-  printf '    %bgcc%b   compilador GCC\n' "$W" "$N"
-  printf '    %bclang%b Clang/LLVM (necesario para el LTO)\n' "$W" "$N"
-  printf '    %botro%b  teclea TU compilador (p. ej. gcc-14, clang-17 o una ruta). Se exigirá como dependencia si falta.\n' "$W" "$N"
-  # El prompt se imprime con printf y no con `read -p`: bash solo escribe el
-  # prompt de `read -p` si stdin es una terminal, y este tiene que verse
-  # siempre. Tampoco se compone en una variable, que es lo que obliga a `read
-  # -p "...%b..." "$W" "$N" cc` a terminar leyendo de la variable "".
-  printf '  %bCC%b [Enter=%bauto%b]: ' "$W" "$N" "$Y" "$N"
-  read -r ASK_CC
-}
-
-# ── Elección de variante (scheduler del proyecto) ──
-# v27.31.28: esto vivía en el motor, que lo preguntaba DESPUÉS de descargar,
-# verificar firmas y validar la config: nueve minutos después de elegir la
-# opción, y con el compilador ya preguntado al principio. Preguntar las dos
-# cosas juntas y en este orden (variante → compilador) es lo que se pidió, y de
-# paso el motor sabe la variante desde el primer segundo: un check valida lo que
-# se va a compilar y una variante de solo-fork se detecta antes de gastar la
-# descarga, en vez de abortar a mitad.
-# Igual que ask_cc: la UI a stdout y la respuesta en ASK_VARIANT.
-ask_variant() {
-  local v
-  ASK_VARIANT=""
-  printf '\n  %bVariante%b (Enter usa el default):\n' "$W" "$N"
-  printf '    %b1%b  Vanilla (EEVDF)\n' "$W" "$N"
-  printf '    %b2%b  BORE\n' "$W" "$N"
-  printf '    %b3%b  PDS (prjc)\n' "$W" "$N"
-  printf '    %b4%b  BMQ (prjc)\n' "$W" "$N"
-  printf '    %b5%b  LFBMQ (prjc)\n' "$W" "$N"
-  printf '    %b6%b  MuQSS\n' "$W" "$N"
-  printf '  %bVariante%b [Enter=%b1%b]: ' "$W" "$N" "$Y" "$N"
-  read -r v
-  case "${v:-1}" in
-    1|vanilla|Vanilla|v|V|eevdf|EEVDF) ASK_VARIANT="eevdf" ;;
-    2|bore|Bore|b|B)                 ASK_VARIANT="bore" ;;
-    3|pds|PDS|p|P)                   ASK_VARIANT="pds" ;;
-    4|bmq|BMQ|q|Q)                   ASK_VARIANT="bmq" ;;
-    5|lfbmq|LFBMQ|l|L)               ASK_VARIANT="lfbmq" ;;
-    6|muqss|Muqss|MUQSS|m|M)         ASK_VARIANT="muqss" ;;
-    *)                               ASK_VARIANT="eevdf" ;;
-  esac
-}
 
 # Si la variante solo existe en el fork CachyOS y la versión pedida no está
 # publicada allí, ofrece la última del fork en lugar de dejar que el build aborte
@@ -283,29 +228,21 @@ fork_fallback_for() { # $1=variante
   esac
 }
 
-# Lanza un build preguntando antes la variante y luego el compilador, en ese orden.
+# Lanza un build. NO pregunta nada: el motor se encarga de la variante y del
+# compilador, en ese orden, cuando ya sabe que la compilación va a empezar.
 #   $1 = prioridad (baja|alta)
-#   $2 = variante: ask (preguntar) | bore (ya la impone la opción) | none
+#   $2 = variante: ask (la pregunta el motor) | bore (ya la impone la opción)
 #   $3.. = argumentos del motor
-# El default del motor para el compilador ya es "auto", así que Enter (vacío) no
-# añade nada; lo tecleado se pasa tal cual y el motor resuelve auto/gcc/clang/...
 build_and_exec() {
   local prio="$1" vmode="$2"; shift 2
-  local version="" patch_arg=""
+  local patch_arg=""
   case "$vmode" in
-    ask)
-      ask_variant
-      [ "$ASK_VARIANT" = eevdf ] || patch_arg="$ASK_VARIANT"
-      fork_fallback_for "$ASK_VARIANT"
-      version="$FORK_CHOICE"
-      ;;
+    ask) ;;   # la pregunta el motor, después de validar la config
     bore) patch_arg="bore" ;;
   esac
-  ask_cc
   [ "$prio" = alta ] && export CIZEN_BUILD_PRIORITY=normal
   # shellcheck disable=SC2086
-  set -- ${version:+"$version"} "$@" ${patch_arg:+--patch "$patch_arg"} \
-    --no-ask-variant ${ASK_CC:+--cc "$ASK_CC"}
+  set -- "$@" ${patch_arg:+--patch "$patch_arg"}
   exec "$SCRIPT" "$@"
 }
 
@@ -384,21 +321,18 @@ while true; do
         # no está publicada allí, se ofrece la última del fork de esa línea en
         # lugar de dejar que el build aborte. Sin TTY (o sin fallback) se sigue
         # con la versión pedida: el motor explica la causa con claridad.
-        fork_fallback_for "$sched"
-        use_version="$FORK_CHOICE"
-        [ -n "$use_version" ] \
-          && printf '  %bOK: %s + %s.%b\n' "$W" "$use_version" "$sched" "$N"
-        # El compilador se pregunta UNA vez, después de saber qué versión y qué
-        # scheduler se van a compilar: antes se preguntaba dos veces (la primera
-        # se quedaba sin usar) porque la oferta del fork se intercaló en medio.
-        ask_cc
-        args="--absorb-rebels"
-        [ -n "$use_version" ] && args="$use_version $args"
-        [ -n "$sched" ] && args="$args --sched $sched"
-        [ -n "$ASK_CC" ] && args="$args --cc $ASK_CC"
-       # v27.31.28: la 14 ya preguntó la variante (su prompt de Scheduler) y el
-       # compilador; sin esto el motor la volvería a preguntar al final.
-       args="$args --no-ask-variant"
+         fork_fallback_for "$sched"
+         use_version="$FORK_CHOICE"
+         [ -n "$use_version" ] \
+           && printf '  %bOK: %s + %s.%b\n' "$W" "$use_version" "$sched" "$N"
+         args="--absorb-rebels"
+         [ -n "$use_version" ] && args="$use_version $args"
+         [ -n "$sched" ] && args="$args --sched $sched"
+        # v27.31.37: la 14 ya preguntó el scheduler (su prompt propio, con
+        # «inherit»), así que el motor no vuelve a preguntar la variante; el
+        # COMPILADOR sí lo pregunta él, después de validar la configuración y
+        # solo si la respuesta a «¿Desea continuar?» es SÍ.
+        args="$args --no-ask-variant"
        # shellcheck disable=SC2086
        exec "$SCRIPT" $args ;;
     15) build_and_exec baja ask --absorb-rebels --ntsync ;;
