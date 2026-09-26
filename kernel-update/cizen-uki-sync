@@ -199,6 +199,14 @@ build_uki() {
     if [ -n "$osrel_file" ]; then
       args+=(--os-release=@"$osrel_file")
     fi
+    # --uname fija la versión del kernel en la UKI (sección .uname). Sin esto
+    # ukify la autodetecta y avisa ("Kernel version not specified, starting
+    # autodetection 😖"): en multi-kernel puede quedarse con otra versión, y la
+    # UKI se firma antes de que exista el /lib/modules definitivo. OJO: el flag
+    # es --uname, no --version (este último imprime la versión de ukify y sale).
+    if [ -n "$rel" ]; then
+      args+=(--uname="$rel")
+    fi
     # Si el kernel Cizen usa initramfs (preset mkinitcpio), se integra en la
     # UKI; si no existe el archivo, la UKI queda sin initrd (kernel autosuficiente).
     initrd="/boot/initramfs-$CIZEN_UKI_PKGBASE.img"

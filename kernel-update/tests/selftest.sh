@@ -2763,6 +2763,54 @@ else
   printf '  (sin %s: se omiten los tests de krollback)\n' "$KROLLBACK"
 fi
 
+# --- v27.31.30: la UKI se construye con ukify y sin --uname el propio ukify
+# avisa ("Kernel version not specified, starting autodetection 😖") y adivina la
+# versión por su cuenta: con varios kernels instalados puede quedarse con otra,
+# y la UKI queda firmada con una .uname que no corresponde. Trampa: el flag es
+# --uname, NO --version (este imprime la versión de ukify y sale con rc=0 sin
+# construir nada, o sea: UKI vacía "con éxito").
+UKISYNC="$(dirname "$MOTOR")/cizen-uki-sync"
+if [ -r "$UKISYNC" ]; then
+  UKIREL="7.9.9-cizen-v3"
+  mkdir -p "$ROOT/ukibuild/usr/lib/modules/$UKIREL" "$ROOT/ukifake"
+  : > "$ROOT/ukibuild/usr/lib/modules/$UKIREL/vmlinuz"
+  printf 'root=UUID=cizen-test rw\n' > "$ROOT/ukibuild/cmdline"
+  cat > "$ROOT/ukifake/ukify" <<'UKIFY'
+#!/bin/bash
+printf '%s\n' "$@" > "$UKIFY_ARGS"
+UKIFY
+  chmod +x "$ROOT/ukifake/ukify"
+  sed -n '/^build_uki() {/,/^}/p' "$UKISYNC" > "$ROOT/ukibuild/build_uki.sh"
+  cat > "$ROOT/ukibuild/probe.sh" <<PROBE
+set -u
+CIZEN_UKI_SUFFIX="-cizen-v3"
+CIZEN_UKI_PKGBASE="linux-cizen-test"
+CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK=0
+export UKIFY_ARGS="$ROOT/ukibuild/args"
+PATH="$ROOT/ukifake:\$PATH"
+ok() { :; }
+warn() { :; }
+info() { :; }
+# shellcheck disable=SC1090
+source "$ROOT/ukibuild/build_uki.sh"
+build_uki "$ROOT/ukibuild/usr/lib/modules/$UKIREL/vmlinuz" \
+          "$ROOT/ukibuild/cmdline" "$ROOT/ukibuild/out.efi" >/dev/null 2>&1
+PROBE
+  bash "$ROOT/ukibuild/probe.sh"
+  if grep -qx -- "--uname=$UKIREL" "$ROOT/ukibuild/args" 2>/dev/null; then
+    rec ok "uki: ukify recibe --uname con la versión del kernel (sin autodetección)"
+  else
+    rec fail "uki: ukify NO recibe --uname=$UKIREL (args: $(tr '\n' ' ' < "$ROOT/ukibuild/args" 2>/dev/null))"
+  fi
+  if grep -q -- '--version' "$ROOT/ukibuild/args" 2>/dev/null; then
+    rec fail "uki: ukify recibe --version (imprime su versión y sale: UKI sin construir)"
+  else
+    rec ok "uki: no se usa --version, que en ukify es la versión del programa"
+  fi
+else
+  printf '  (sin %s: se omiten los tests de la UKI)\n' "$UKISYNC"
+fi
+
 # --- resumen ---
 echo
 printf 'Totales: %d ok, %d fail\n' "$PASS" "$FAIL"

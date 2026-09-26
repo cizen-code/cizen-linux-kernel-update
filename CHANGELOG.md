@@ -1,3 +1,27 @@
+## [27.31.30] - 2026-09-26
+
+Ruido de `ukify` al construir la UKI, visible en el build de 7.2.8 + BORE.
+
+```
+Kernel version not specified, starting autodetection 😖.
+Found uname version: 7.2.8-cizen-v3
+```
+
+`ukify build` recibe ahora `--uname` con la versión del kernel (la misma que ya se
+usaba para el `.osrel`), en las **dos** copias de la llamada: el motor y
+`cizen-uki-sync`. Antes ukify la deducía por su cuenta, y esa deducción es una
+adivinanza: recorre `/usr/lib/modules` y con varios kernels instalados puede
+quedarse con otra versión, de modo que la UKI queda firmada con una sección
+`.uname` que no corresponde a la imagen que contiene. Además, con `set -u` en el
+camino importa que el valor venga de la ruta ya resuelta y no de otro sitio.
+
+Ojo al flag: es `--uname`, **no** `--version`. `--version` en `ukify` imprime la
+versión del programa y sale con rc=0, o sea que la UKI se daría por construida
+y no existiría. El selftest fija las dos cosas: que `--uname` llegue, y que
+`--version` no se cuele.
+
+Selftest: 305 -> 307.
+
 ## [27.31.29] - 2026-09-26
 
 Regresiones de v27.31.28, cazadas con un `--check` real contra 7.2.8 + BORE.

@@ -250,6 +250,14 @@ Configurable con `CIZEN_BOOT_TRIES` (0 = UKI plana, sin boot counting). El
 guard de `kernel-update-verify.sh` (check GUARD) avisa en el login siguiente si
 el kernel arrancado no es el último Cizen instalado.
 
+El `+3` no es una UKI aparte: es **la misma** con el número de intentos que
+quedan, y la anterior se borra a propósito (si no, el bootloader arrancaría el
+kernel nuevo sin contador y esto no serviría de nada). Consecuencia útil: hasta
+que arrancas **una** vez con éxito, el `default_uki` del preset de mkinitcpio
+(`/boot/EFI/Linux/arch-linux-cizen-v3.efi`) no existe en disco, porque el
+fichero en ese momento se llama `arch-linux-cizen-v3+3.efi`. No es un fallo del
+build.
+
 ### Firma de la UKI (Secure Boot)
 
 Al confirmar la solicitud de compilación (build o recompilación), el motor

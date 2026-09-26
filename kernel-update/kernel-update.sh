@@ -135,7 +135,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.29"
+SCRIPT_VERSION="27.31.30"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -7906,6 +7906,14 @@ build_cizen_uki() {
             --os-release=@"$osrel_file"
             --output="$out"
         )
+        # --uname fija la versión del kernel en la UKI (sección .uname). Sin esto
+        # ukify la autodetecta y avisa ("Kernel version not specified, starting
+        # autodetection 😖"): en multi-kernel puede quedarse con otra versión, y la
+        # UKI se firma antes de que exista el /lib/modules definitivo. OJO: el flag
+        # es --uname, no --version (este último imprime la versión de ukify y sale).
+        if [ -n "$rel" ]; then
+            args+=(--uname="$rel")
+        fi
         # Si el kernel Cizen usa initramfs (preset mkinitcpio) se integra en la
         # UKI; si no existe el archivo, la UKI queda sin initrd (kernel
         # autosuficiente). Mismo comportamiento que cizen-uki-sync/build_uki.
