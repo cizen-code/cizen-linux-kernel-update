@@ -136,7 +136,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.34"
+SCRIPT_VERSION="27.31.35"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -7779,7 +7779,7 @@ cizen_uki_cleanup_variants() {
     local -A seen=()
     base="${CIZEN_UKI_NAME%.efi}"
     current="$(cizen_uki_efi_name)"
-    for r in /efi /boot/efi /boot; do
+    for r in /boot /efi /boot/efi; do
         [ -d "$r" ] || continue
         while IFS= read -r f; do
             [ -n "$f" ] || continue
@@ -7839,7 +7839,7 @@ prepare_cizen_cmdline_file() {
 
 detect_cizen_esp_root() {
     local r fstype
-    for r in /efi /boot/efi /boot; do
+    for r in /boot /efi /boot/efi; do
         [ -d "$r" ] || continue
         fstype="$(findmnt -n -M "$r" -o FSTYPE 2>/dev/null || true)"
         if [[ "$fstype" =~ ^(vfat|msdos|fuseblk)$ ]]; then
@@ -7851,18 +7851,25 @@ detect_cizen_esp_root() {
 }
 
 # Objetivos = ficheros del ESP que se llaman $name, uno por cada FICHERO.
-# /efi, /boot/efi y /boot se recorren porque el ESP puede estar en cualquiera,
+# /boot, /efi y /boot/efi se recorren porque el ESP puede estar en cualquiera,
 # pero eso duplica: en vfat sin CaseSensitive (el caso normal) /boot/efi y
 # /boot/EFI son el MISMO directorio y 'sort -u' solo deduplica cadenas — el UKI
 # salía dos veces, se escribía dos veces y se firmaba dos veces. Se deduplica por
 # (dispositivo, inodo), la identidad real del fichero; sin stat (permiso
 # denegado en /boot sin sudo) se degrada al nombre, como antes.
+#
+# EL ORDEN DE LAS RAÍCES IMPORTA, y por eso empieza por /boot: cuando dos
+# raíces llegan al mismo fichero gana la primera, y /boot es el punto de montaje
+# real del ESP, así que gana su grafía en disco (/boot/EFI/…). Firmar la grafía
+# de un alias crea una entrada NUEVA en la BD de sbctl para un fichero que ya
+# estaba inscrito con su nombre bueno; en vfat las dos rutas existen siempre, así
+# que no rompe nada, pero cada sync volvía a añadir la clave de más.
 find_cizen_uki_targets() {
     local name="$1" r f key
     local -a found=()
     local -A seen=()
 
-    for r in /efi /boot/efi /boot; do
+    for r in /boot /efi /boot/efi; do
         [ -d "$r" ] || continue
         while IFS= read -r f; do
             [ -n "$f" ] || continue
@@ -8372,13 +8379,25 @@ sbctl_pk_enrolled() {
 # Copias del gestor a firmar: la fuente del paquete (la re-firma el hook de sbctl
 # al actualizar systemd) y las copias reales de arranque en el ESP.
 collect_systemd_boot_targets() {
-    local s r f
+    local s r f key
+    local -A seen=()
     [ -s /usr/lib/systemd/boot/efi/systemd-bootx64.efi ] && \
         printf '%s\n' /usr/lib/systemd/boot/efi/systemd-bootx64.efi
-    for r in /efi /boot/efi /boot; do
+    # Misma deduplicación por inodo que find_cizen_uki_targets: en vfat
+    # /boot/efi y /boot/EFI son el mismo directorio, así que el gestor salía
+    # dos veces con dos grafías y 'sort -u' (cadenas) no lo arreglaba. Con
+    # /boot primero gana la grafía del punto de montaje real, que es la que
+    # ya está inscrita en la BD de sbctl.
+    for r in /boot /efi /boot/efi; do
         [ -d "$r" ] || continue
         while IFS= read -r f; do
-            [ -n "$f" ] && printf '%s\n' "$f"
+            [ -n "$f" ] || continue
+            key="$(sudo stat -c '%d:%i' -- "$f" 2>/dev/null || true)"
+            if [ -n "$key" ]; then
+                [ -n "${seen[$key]:-}" ] && continue
+                seen[$key]="$f"
+            fi
+            printf '%s\n' "$f"
         done < <(sudo find "$r" -maxdepth 5 -type f \
             \( -iname 'systemd-bootx64.efi' -o -iname 'BOOTX64.EFI' \) \
             2>/dev/null || true)

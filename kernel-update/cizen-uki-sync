@@ -148,7 +148,7 @@ prepare_cmdline_file() {
 
 detect_esp_root() {
   local r fstype
-  for r in /efi /boot/efi /boot; do
+  for r in /boot /efi /boot/efi; do
     [ -d "$r" ] || continue
     fstype="$(findmnt -n -M "$r" -o FSTYPE 2>/dev/null || true)"
     if [[ "$fstype" =~ ^(vfat|msdos|fuseblk)$ ]]; then
@@ -160,19 +160,27 @@ detect_esp_root() {
 }
 
 # Objetivos = ficheros del ESP que se llaman $name, uno por cada FICHERO.
-# Recorremos /efi, /boot/efi y /boot porque el ESP puede estar montado en
+# Recorremos /boot, /efi y /boot/efi porque el ESP puede estar montado en
 # cualquiera, pero eso duplica: en vfat sin CaseSensitive (el caso normal)
 # /boot/efi y /boot/EFI son el MISMO directorio, y 'sort -u' solo deduplica
 # cadenas, no ficheros — el UKI salía dos veces y se escribía y firmaba dos
 # veces. Se deduplica por (dispositivo, inodo), que es la identidad real del
 # fichero; sin stat (permiso denegado en /boot sin sudo) se degrada al nombre,
 # que es el comportamiento de siempre.
+#
+# EL ORDEN DE LAS RAÍCES IMPORTA, y por eso empieza por /boot: cuando dos
+# raíces llegan al mismo fichero gana la primera, y /boot es el punto de montaje
+# real del ESP, así que gana su grafía en disco (/boot/EFI/…). Firmar la
+# grafía de un alias creaba una entrada NUEVA en la BD de sbctl para un
+# fichero que ya estaba inscrito con su nombre bueno: en vfat las dos rutas
+# existen siempre, así que no rompe nada, pero cada sync volvía a añadir la clave
+# de más. Con /boot primero se firma siempre con la misma ruta.
 find_uki_targets() {
   local name="$1" r f key
   local -a found=()
   local -A seen=()
 
-  for r in /efi /boot/efi /boot; do
+  for r in /boot /efi /boot/efi; do
     [ -d "$r" ] || continue
     while IFS= read -r f; do
       [ -n "$f" ] || continue
@@ -317,7 +325,7 @@ cleanup_uki_variants() {
   local -A seen=()
   base="${CIZEN_UKI_NAME%.efi}"
   current="$(uki_efi_name)"
-  for r in /efi /boot/efi /boot; do
+  for r in /boot /efi /boot/efi; do
     [ -d "$r" ] || continue
     while IFS= read -r f; do
       [ -n "$f" ] || continue

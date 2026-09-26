@@ -1,3 +1,35 @@
+## [27.31.35] - 2026-09-26
+
+Firmar siempre con la misma ruta: la grafía del alias meteía claves de más en la BD.
+
+La deduplicación por inodo de 27.31.33 funciona, pero elige la grafía de la
+**primera raíz** que encuentra el fichero, y el orden era `/efi`, `/boot/efi`,
+`/boot`. En este ESP (vfat, `/boot` es el punto de montaje) ganaba `/boot/efi`,
+así que cada sync firmaba `/boot/efi/Linux/arch-linux-cizen-v3.efi` y
+`sbctl sign --save` **inscribía una clave nueva** para un fichero que ya estaba
+en la BD con su grafía buena, `/boot/EFI/…`. Con las dos claves en la BD,
+`sbctl sign-all` firma el mismo UKI dos veces y `sbctl verify` lo lista dos
+veces. No rompe nada —en vfat las dos rutas son el mismo directorio para
+siempre, así que ninguna entrada puede quedar caduca— pero es ruido que se
+acumula en cada actualización de kernel.
+
+- **Las siete listas de raíces empiezan por `/boot`** (`/boot /efi /boot/efi`) en
+  los dos scripts: cuando dos rutas llevan al mismo fichero gana la primera, y
+  `/boot` es el punto de montaje real, así que gana **su grafía en disco**. Es el
+  mismo orden en los siete sitios (los dos `find_uki_targets`, los dos
+  `cleanup_variants`, los dos `detect_esp_root` y `collect_systemd_boot_targets`)
+  para que no vuelva a colarse uno por cambiar solo uno.
+- **`collect_systemd_boot_targets` también deduplica por inodo**: tenía el mismo
+  fallo que la UKI (el `sort -u` de su consumidor deduplica cadenas, no
+  ficheros), así que el gestor también se podía firmar dos veces con dos grafías.
+  El resto del comportamiento no cambia.
+
+Selftest: 322 -> 330. Los ocho nuevos, en rojo contra el código de 27.31.34
+(los siete que comprueban el orden de las raíces, más el que comprueba que el
+gestor deduplica por inodo). Los dos probes funcionales de la deduplicación
+siguen igual a propósito: sustituyen la lista de raíces entera por `$TEST_ROOTS`,
+así que no pueden medir el orden; para eso están los siete de grep.
+
 ## [27.31.34] - 2026-09-26
 
 v27.31.33 se llevó el sync entero por delante en producción.

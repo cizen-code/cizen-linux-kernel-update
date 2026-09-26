@@ -3003,31 +3003,38 @@ find() {
 }
 FAKE
   # find_uki_targets + cleanup_uki_variants + el resolutor de nombres, con la
-  # lista de raíces sustituida por el ESP falso.
+  # lista de raíces sustituida por el ESP falso (las dos grafías posibles de esa
+  # lista, para que el arnés no dependa de en qué orden la escribió el código).
+  # OJO: al sustituir la lista entera por $TEST_ROOTS, el orden del código deja
+  # demeasurable aquí — eso lo fijan los tests de grep de más abajo. Lo que sí
+  # miden estos dos es la deduplicación: de varias grafías del mismo inodo gana
+  # la primera, y con $TEST_ROOTS en orden de punto de montaje el superviviente
+  # es la grafía buena.
   { sed -n '/^uki_efi_name() {/,/^}/p; /^find_uki_targets() {/,/^}/p; /^cleanup_uki_variants() {/,/^}/p' \
       "$UKISYNC" \
-    | sed 's|^\( *\)for r in /efi /boot/efi /boot; do|\1for r in ${TEST_ROOTS}; do|'
+    | sed -e 's|^\( *\)for r in /boot /efi /boot/efi; do|\1for r in ${TEST_ROOTS}; do|' \
+           -e 's|^\( *\)for r in /efi /boot/efi /boot; do|\1for r in ${TEST_ROOTS}; do|'
     cat "$ROOT/fakeesp.sh"; } > "$ROOT/tgt.sh"
-  n_t="$(FAKE_ESP="$ROOT/esp" TEST_ROOTS="$ROOT/esp/efi $ROOT/esp/boot/efi $ROOT/esp/boot" \
+  n_t="$(FAKE_ESP="$ROOT/esp" TEST_ROOTS="$ROOT/esp/boot $ROOT/esp/efi $ROOT/esp/boot/efi" \
     bash -c 'set -u; SUDO=(); . "$0"
       CIZEN_UKI_NAME=arch-linux-cizen-v3.efi; CIZEN_BOOT_TRIES=0
-      find_uki_targets arch-linux-cizen-v3.efi' "$ROOT/tgt.sh" 2>/dev/null | wc -l)"
-  if [ "$n_t" = 1 ]; then
-    rec ok "uki: el UKI se localiza una sola vez aunque /boot/efi y /boot/EFI sean el mismo ESP"
+      find_uki_targets arch-linux-cizen-v3.efi' "$ROOT/tgt.sh" 2>/dev/null)"
+  if [ "$(printf '%s\n' "$n_t" | wc -l)" = 1 ] && [ "$n_t" = "$ROOT/esp/boot/EFI/Linux/arch-linux-cizen-v3.efi" ]; then
+    rec ok "uki: el UKI se localiza una sola vez, con la grafía del punto de montaje real"
   else
-    rec fail "uki: find_uki_targets devolvió $n_t objetivos (esperado 1): duplica por grafía del ESP"
+    rec fail "uki: find_uki_targets devolvió [$(printf '%s' "$n_t" | tr '\n' ' ')]: duplica o elige un alias del ESP"
   fi
   # El cleanup tampoco puede intentar borrar dos veces la misma variante: rm
   # interceptado que solo registra (así el fixture sobrevive al test).
   : > "$ROOT/rm.log"
-  FAKE_ESP="$ROOT/esp" TEST_ROOTS="$ROOT/esp/efi $ROOT/esp/boot/efi $ROOT/esp/boot" \
+  FAKE_ESP="$ROOT/esp" TEST_ROOTS="$ROOT/esp/boot $ROOT/esp/efi $ROOT/esp/boot/efi" \
     RM_LOG="$ROOT/rm.log" bash -c 'set -u; SUDO=(); . "$0"
       rm() { printf "%s\n" "${*: -1}" >> "$RM_LOG"; }
       CIZEN_UKI_NAME=arch-linux-cizen-v3.efi; CIZEN_BOOT_TRIES=0
       cleanup_uki_variants' "$ROOT/tgt.sh" 2>/dev/null
   n_rm="$(wc -l < "$ROOT/rm.log")"
   if [ "${n_rm:-0}" = 1 ] \
-     && grep -q 'arch-linux-cizen-v3+3.efi' "$ROOT/rm.log" \
+     && grep -q "$ROOT/esp/boot/EFI/Linux/arch-linux-cizen-v3+3.efi" "$ROOT/rm.log" \
      && ! grep -q 'arch-linux-cizen-v3\.efi$' "$ROOT/rm.log"; then
     rec ok "uki: cleanup_uki_variants borra la variante +N una sola vez y respeta el nombre plano"
   else
@@ -3043,6 +3050,34 @@ FAKE
     rec ok "uki: cizen_uki_cleanup_variants deduplica por inodo (no borra dos veces la misma variante)"
   else
     rec fail "uki: cizen_uki_cleanup_variants no deduplica por inodo"
+  fi
+
+  # h) v27.31.35: el orden de las raíces decide con qué GRAFÍA se firma, y eso
+  #    es lo que mete claves de más en la BD de sbctl. Esto es lo que mide el
+  #    orden de verdad (los dos probes de arriba no lo pueden: sustituyen la
+  #    lista entera por $TEST_ROOTS). En vfat /boot/efi y
+  #    /boot/EFI son el mismo fichero; si gana la primera raíz que lo encuentra
+  #    y esa es un alias, 'sbctl sign --save' inscribe una clave NUEVA para un
+  #    fichero que ya estaba inscrito con su nombre bueno (inocuo, pero en cada
+  #    sync). Por eso /boot —el punto de montaje real— va el primero.
+  for f in find_uki_targets detect_esp_root cleanup_uki_variants; do
+    if sed -n "/^$f() {/,/^}/p" "$UKISYNC" | grep -q 'for r in /boot /efi /boot/efi'; then
+      rec ok "uki: $f recorre /boot primero (gana la grafía del punto de montaje real)"
+    else
+      rec fail "uki: $f no empieza por /boot; firmaría la grafía de un alias del ESP"
+    fi
+  done
+  for f in find_cizen_uki_targets detect_cizen_esp_root cizen_uki_cleanup_variants collect_systemd_boot_targets; do
+    if sed -n "/^$f() {/,/^}/p" "$MOTOR" | grep -q 'for r in /boot /efi /boot/efi'; then
+      rec ok "uki: $f (motor) recorre /boot primero"
+    else
+      rec fail "uki: $f (motor) no empieza por /boot; firmaría la grafía de un alias del ESP"
+    fi
+  done
+  if sed -n '/^collect_systemd_boot_targets() {/,/^}/p' "$MOTOR" | grep -q "stat -c '%d:%i'"; then
+    rec ok "uki: el gestor también se deduplica por inodo (si no, se firma dos veces con dos grafías)"
+  else
+    rec fail "uki: collect_systemd_boot_targets no deduplica por inodo; 'sort -u' solo deduplica cadenas"
   fi
 
   # g) v27.31.34: un comentario que pierde el '#' NO lo caza ni 'bash -n' ni
