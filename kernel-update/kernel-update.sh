@@ -9322,6 +9322,43 @@ touch "$BUILD_MARKER"
 inject_build_overlay
 apply_config_requests || fatal "Falló scripts/config al aplicar el perfil."
 apply_config_fragments || fatal "Falló scripts/config al aplicar los frags."
+
+# ============================================================
+# Preparar firmware DMC para i915 (v27.32.0)
+# El firmware i915/kbl_dmc_ver1_04.bin puede venir comprimido como .zst en
+# linux-firmware. CONFIG_EXTRA_FIRMWARE lo incluye en el kernel built-in, pero
+# requiere el archivo descomprimido en /lib/firmware/. Este paso lo descomprime
+# si existe la versión comprimida y falta la descomprimida.
+# ============================================================
+prepare_i915_dmc_firmware() {
+  local fw_dir="/lib/firmware/i915"
+  local compressed="${fw_dir}/kbl_dmc_ver1_04.bin.zst"
+  local decompressed="${fw_dir}/kbl_dmc_ver1_04.bin"
+
+  if [ -f "$compressed" ] && [ ! -s "$decompressed" ]; then
+    if command -v zstd >/dev/null 2>&1; then
+      if [ -w "$fw_dir" ] || [ -w "/lib/firmware" ]; then
+        zstd -d "$compressed" -o "$decompressed" 2>/dev/null || {
+          warn "No se pudo descomprimir $compressed (fallo de permisos)."
+        }
+        if [ -s "$decompressed" ]; then
+          ok "Firmware DMC preparado: $(basename "$decompressed")"
+        fi
+      else
+        # Sin permisos de escritura: intentar con sudo
+        if sudo -n zstd -d "$compressed" -o "$decompressed" 2>/dev/null; then
+          ok "Firmware DMC preparado con sudo: $(basename "$decompressed")"
+        else
+          warn "Permisos insuficientes para descomprimir $compressed."
+        fi
+      fi
+    else
+      warn "zstd no está instalado; no se pudo descomprimir el firmware DMC."
+    fi
+  fi
+}
+
+prepare_i915_dmc_firmware
 apply_cachy_misc_symbols
 
 # Auditoría oficial Kconfig.
