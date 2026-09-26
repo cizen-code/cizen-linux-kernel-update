@@ -80,6 +80,26 @@ compilador antes de arrancar:
   CC [Enter=auto]:
 ```
 
+### Privilegios y sudo
+
+El build necesita sudo para lo de siempre (montar el tmpfs, instalar, sincronizar
+la UKI, firmar). El allowlist NOPASSWD de este host cubre `mount`, `umount`,
+`install`, `pacman`, `swapon`, `swapoff` y `systemctl`, pero no `chown`, `mkdir`,
+`rm` ni `sbctl`, así que **hace falta contraseña**.
+
+El motor lo comprueba al arrancar (`preflight_sudo`): si hay ticket vigente no
+pregunta nada; si no, lo pide una vez y, si falla, explica qué falta y cómo
+comprobarlo en vez de abortar con una línea de código. Si el allowlist cubriera
+todo lo imprescindible, sigue sin ticket y avisa de qué pasos pedirán contraseña.
+
+Ojo: **el ticket de sudo caduca a los 5 minutos** (default) y un build dura 20+,
+así que la pregunta sale igualmente al final. Si te equivocas ahí, el paquete
+sigue vivo en el tmpfs:
+
+```sh
+sudo pacman -U <ruta-del-pkg-en-el-tmpfs>   # no desmontes nada todavía
+```
+
 En el menú interactivo, el rollback es la **opción 9** (`cizen-menu`), que además
 muestra en la propia etiqueta a qué se vuelve:
 

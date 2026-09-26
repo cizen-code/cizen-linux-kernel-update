@@ -134,7 +134,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.26"
+SCRIPT_VERSION="27.31.27"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -1786,6 +1786,149 @@ check_sudo_capabilities() {
 }
 
 # ============================================================
+# PRIVILEGIOS: por qué sudo es un prerrequisito y no un trámite
+# ============================================================
+# Un `sudo -v` fallido abortaba el build con el ERR trap y un
+# "Error 1 en línea 8614: sudo -v" que no dice ni por qué falló ni qué hacer.
+# Con el ticket caducado (sudo caduca a los 5 minutos por defecto, y un build
+# dura 20+) la pregunta sale igualmente, pero al final, cuando ya has gastado la
+# compilación.
+#
+# La contraseña NO es opcional en general: el allowlist NOPASSWD de este host
+# cubre mount/umount/install/pacman/swapon/swapoff/systemctl, pero el motor
+# necesita además chown, mkdir, sbctl, cizen-uki-sync... Por eso "seguir sin
+# ticket" solo es válido si todo lo imprescindible está cubierto, y eso es lo
+# que se comprueba en vez de asumirlo.
+#
+# Inventario de las operaciones que el motor hace con sudo en el camino normal
+# de un build. No es la lista de cada `sudo x` del script (hay llamadas
+# condicionales, de otros backends y de mensajes al usuario), sino la de lo que
+# se usa de verdad aquí; si añades una operación privilegiada al camino normal,
+# añádela también (hay un test que lo vigila).
+SUDO_OPS_REQUERIDOS=(mount umount install pacman chown mkdir rm)
+SUDO_OPS_OPCIONALES=(swapon swapoff mv cp find stat test sync cat tee od tar
+                     du openssl make sbctl mokutil fuser cizen-uki-sync)
+
+# Comandos que el allowlist NOPASSWD cubre, uno por línea y solo el basename.
+# `sudo -n -l` no necesita contraseña, así que esto se puede saber siempre, haya
+# ticket o no.
+#
+# Solo se leen los bloques NOPASSWD: el resto de la salida de `sudo -l` no es una
+# lista de comandos, y sus rutas (secure_path, Defaults!/usr/bin/visudo) producían
+# basura tipo "bin", "sbin" o incluso "binRunas" al pegarse con la línea
+# siguiente. Antes de filtrar se unen las líneas de continuación que usa sudo
+# para las listas largas, y un "NOPASSWD: ALL" se marca como cobertura total.
+sudo_nopasswd_cover() {
+  local lista
+  # OJO con el `&&`: dentro de una tubería se come la cola entera
+  # (`... | grep -qx ALL && { ... } | sed | grep | sort` solo ejecutaba el resto
+  # si aparecía un "ALL"), así que el chequeo va en su propia sentencia.
+  lista="$(sudo -n -l 2>/dev/null |
+    awk '
+      {
+        if (cont) { linea = linea $0; cont = 0 } else { linea = $0 }
+        if (linea ~ /\\$/) { sub(/\\$/, "", linea); cont = 1 } else { print linea }
+      }
+      END { if (cont) print linea }
+    ' |
+    awk '
+      /NOPASSWD:/ {
+        sub(/^.*NOPASSWD:[ \t]*/, "")
+        gsub(/\\/, " ")
+        print
+      }
+    ' |
+    tr ',' '\n' |
+    sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+  if printf '%s\n' "$lista" | grep -qx 'ALL'; then
+    printf '*\n'
+    return 0
+  fi
+  printf '%s\n' "$lista" |
+    grep -oE '/[a-zA-Z0-9._/+-]*/[a-zA-Z0-9._+-]+' | sed 's|.*/||' | sort -u
+}
+
+# Operaciones de un grupo que el allowlist no cubre. Vacío = todo cubierto.
+sudo_missing_ops() { # $1=requeridos|opcionales
+  local -a ops=()
+  case "${1:-requeridos}" in
+    opcionales) ops=("${SUDO_OPS_OPCIONALES[@]}") ;;
+    *)          ops=("${SUDO_OPS_REQUERIDOS[@]}") ;;
+  esac
+  local cover op
+  cover="$(sudo_nopasswd_cover)"
+  # '*' = NOPASSWD: ALL: no falta nada, y sin este case cada operación saldría
+  # como faltante porque "*" no es igual a ningún nombre de comando.
+  [ "$cover" = "*" ] && return 0
+  local out=""
+  for op in "${ops[@]}"; do
+    printf '%s\n' "$cover" | grep -qx -- "$op" || out="${out:+$out }$op"
+  done
+  printf '%s' "$out"
+}
+
+# Explica el hueco en vez de dejar que el ERR trap suelte una línea de código.
+sudo_explain_no_ticket() { # $1=motivo $2=requeridos que faltan $3=opcionales que faltan
+  local motivo="$1" faltan="$2" opcionales="$3"
+  local user="${SUDO_USER:-$(id -un)}" cubiertos
+  cubiertos="$(sudo_nopasswd_cover | tr '\n' ' ')"
+  [ "$cubiertos" = "* " ] && cubiertos="todo (allowlist NOPASSWD: ALL)"
+  warn "sudo sin ticket vigente: $motivo"
+  if [ -n "$cubiertos" ]; then
+    log "  Sí dispensan contraseña (allowlist NOPASSWD): $cubiertos"
+  fi
+  if [ -n "$faltan" ]; then
+    warn "  Y el build necesita privilegios que NO están en esa lista: $faltan"
+  fi
+  if [ -n "$opcionales" ]; then
+    warn "  Además, esto pedirá contraseña más adelante si hace falta: $opcionales"
+  fi
+  echo
+  info "Comprueba la contraseña en una terminal, sin el build de por medio:"
+  printf '    sudo -k; sudo -v\n'
+  printf "  Si tampoco la acepta ahí, no es cosa del motor: tu contraseña de $user no es la que estás tecleando (o el teclado está en otro layout). 'passwd -S %s' dice cuándo se cambió por última vez.\n" "$(id -un)"
+  printf '    passwd -S %s\n' "$(id -un)"
+}
+
+# Preflight de privilegios. Devuelve 0 si el build puede continuar.
+preflight_sudo() { # [1]="tras compilar" para el mensaje del segundo prompt
+  local fase="${1:-}" user motivo faltan opcionales
+
+  # 1) Ya hay ticket: no preguntar nada (ni se puede si no hay tty).
+  if sudo -n true 2>/dev/null; then
+    return 0
+  fi
+
+  # 2) Sin ticket: hay que pedirlo, pero solo si hay a quién preguntar. Un
+  #    build no-tty (cron, CI) no puede autenticarse: se dice, no se reintenta.
+  if [ -t 0 ] && [ -t 1 ]; then
+    if sudo -v; then
+      return 0
+    fi
+    motivo="sudo rechazó la contraseña de ${SUDO_USER:-$(id -un)} tras 3 intentos"
+  else
+    motivo="no hay terminal para pedir la contraseña de ${SUDO_USER:-$(id -un)}"
+  fi
+
+  # 3) Ni ticket ni prompt posible: ver exactamente qué falta antes de decidir.
+  faltan="$(sudo_missing_ops requeridos)"
+  opcionales="$(sudo_missing_ops opcionales)"
+  sudo_explain_no_ticket "$motivo" "$faltan" "$opcionales"
+
+  if [ -n "$faltan" ]; then
+    if [ -n "$fase" ]; then
+      fatal "$fase: sudo rechaza la contraseña y faltan privilegios ($faltan). El build NO se pierde: el paquete está en el tmpfs y puedes instalarlo a mano con 'sudo pacman -U <pkg>'. No desmontes $TMPFS_ROOT (CIZEN_KEEP_TMPFS=1)."
+    fi
+    fatal "sudo rechaza la contraseña y faltan privilegios ($faltan): no se puede montar el tmpfs ni instalar el kernel. Arregla la contraseña (ver arriba) y repite; aún no se ha compilado nada."
+  fi
+
+  # Todo lo imprescindible va por NOPASSWD: se puede seguir sin ticket.
+  warn "Se sigue sin ticket sudo: lo imprescindible está en el allowlist NOPASSWD."
+  [ -n "$opcionales" ] && warn "  Si alguna de estas lo necesita, pedirá contraseña en su momento: $opcionales"
+  return 0
+}
+
+# ============================================================
 # ESPACIO / TMPFS / LOCK / DIRECTORIOS
 # ============================================================
 get_avail_mb() {
@@ -1905,7 +2048,7 @@ prepare_tmpfs_build() {
     owner_uid="$(id -u)"
     owner_gid="$(id -g)"
     log "Montando tmpfs de $TMPFS_SIZE para la compilación: $TMPFS_ROOT"
-    sudo -v
+    sudo -v >/dev/null 2>&1 || true   # el preflight ya validó esto; no repreguntar
     if ! sudo mount -t tmpfs -o "size=$TMPFS_SIZE,mode=0755,uid=$owner_uid,gid=$owner_gid,exec,nosuid,nodev,huge=advise" tmpfs "$TMPFS_ROOT"; then
       fatal "No se pudo montar el tmpfs de compilación en $TMPFS_ROOT."
     fi
@@ -8611,7 +8754,11 @@ if [ "$KEEP_SRC" = true ]; then
   info "--keep-src: las fuentes ya se conservan siempre en el tmpfs entre ejecuciones; esta bandera no cambia el comportamiento."
 fi
 
-sudo -v
+# v27.31.27: preflight en vez de `sudo -v` a pelo. Antes, una contraseña mal
+# tecleada abortaba con "Error 1 en línea 8614: sudo -v" sin explicación, y sin
+# ticket no se puede ni montar el tmpfs ni instalar. Ahora o hay ticket, o se
+# explica qué falta y se sigue solo si el allowlist NOPASSWD lo cubre todo.
+preflight_sudo
 
 # Verificación temprana de que las operaciones privilegiadas (mount/umount,
 # pacman, escritura en el ESP, etc.) están permitidas por sudo, antes de
@@ -9150,8 +9297,11 @@ notify_desktop "Kernel Cizen: compilación terminada" "$VERSION-cizen-v3 ($((DUR
 restore_package_revision_override
 restore_package_identity_override
 
-# Obtener sudo antes de modificar el sistema.
-sudo -v
+# Obtener sudo antes de modificar el sistema. Tras 20+ minutos de compilación el
+# ticket ha caducado (sudo: 5 min por defecto), así que esta pregunta es
+# legítima; lo que no vale es abortar con un "Error N en línea" y que parezca
+# que se perdió el build: el paquete está en el tmpfs y se puede instalar a mano.
+preflight_sudo "tras compilar"
 
 # Snapshot btrfs readonly del root (feature 4). Red de seguridad opcional.
 create_btrfs_snapshot

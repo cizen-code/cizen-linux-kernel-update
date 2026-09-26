@@ -1,3 +1,49 @@
+## [27.31.27] - 2026-09-25
+
+Si sudo rechaza la contraseña, el motor lo dice y qué hacer con ello, en vez de
+soltar una línea de código.
+
+Lo que pasaba: un `sudo -v` fallido abortaba el build por el ERR trap con
+`Error 1 en línea 8614: sudo -v`, sin decir por qué ni qué hacer. Y como el
+ticket de sudo caduca a los 5 minutos (default) mientras un build dura 20+, el
+segundo prompt caía **después** de compilar, que es el peor sitio posible para
+perder el trabajo por una contraseña mal tecleada.
+
+```
+WARN: sudo sin ticket vigente: sudo rechazó la contraseña de cizen tras 3 intentos
+LOG:   Sí dispensan contraseña (allowlist NOPASSWD): install mount pacman swapoff swapon systemctl umount
+WARN:  Y el build necesita privilegios que NO están en esa lista: chown mkdir rm
+WARN:  Además, esto pedirá contraseña más adelante si hace falta: mv cp find stat test sync cat tee od tar du openssl make sbctl mokutil fuser cizen-uki-sync
+
+INFO: Comprueba la contraseña en una terminal, sin el build de por medio:
+    sudo -k; sudo -v
+  Si tampoco la acepta ahí, no es cosa del motor: tu contraseña de cizen no es la
+  que estás tecleando (o el teclado está en otro layout). 'passwd -S cizen' dice
+  cuándo se cambió por última vez.
+    passwd -S cizen
+FATAL: sudo rechaza la contraseña y faltan privilegios (chown mkdir rm): no se
+       puede montar el tmpfs ni instalar el kernel. Arregla la contraseña (ver
+       arriba) y repite; aún no se ha compilado nada.
+```
+
+- **`preflight_sudo()`** sustituye a los tres `sudo -v` pelados. Con ticket
+  vigente no pregunta nada; sin ticket y sin tty (cron, CI) lo dice en vez de
+  reintentar a ciegas.
+- **Sigue adelante sin ticket cuando puede.** Se enumera lo que el build necesita
+  de verdad (`SUDO_OPS_REQUERIDOS`) y se contrasta con el allowlist NOPASSWD real,
+  leído de `sudo -n -l` (que no necesita contraseña). Si está todo cubierto, avisa
+  y continúa; si falta algo, aborta diciendo exactamente qué.
+- **El mensaje tras compilar no dice "se ha perdido el build"**, porque no es
+  cierto: el paquete sigue en el tmpfs y se puede instalar con `sudo pacman -U`,
+  sin desmontar nada.
+- La lista de cubiertos sale de los bloques `NOPASSWD:` de `sudo -l` y no del
+  resto de su salida: `secure_path` y `Defaults!/usr/bin/visudo` producían
+  "bin", "sbin" y "binRunas" en el aviso. También se unen las continuaciones de
+  línea con las que sudo parte las listas largas, y se reconoce `NOPASSWD: ALL`.
+- 12 tests nuevos con un `sudo` falso que cubre las ramas: con ticket, sin
+  contraseña, con allowlist suficiente, con `NOPASSWD: ALL`, y la limpieza de la
+  salida de `sudo -l`. Suite: 285 ok, 0 fail.
+
 ## [27.31.26] - 2026-09-25
 
 El compilador se elige al vuelo en cualquier build, no solo en `variant`.

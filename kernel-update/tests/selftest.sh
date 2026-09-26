@@ -1374,6 +1374,167 @@ RUNNER
   else
     rec fail "menú: el submenú de CC no se ve (si fuera a stdout se perdería en el \$)"
   fi
+  # ── sudo: fallar pronto y con explicación, no con una línea de código ──
+  # Un `sudo -v` pelado que falla aborta con el ERR trap ("Error 1 en línea
+  # 8614: sudo -v"), que no dice por qué ni qué hacer; y como el ticket caduca a
+  # los 5 minutos, el segundo prompt cae tras la compilación, cuando 20 minutos
+  # ya están gastados. Aquí se ejercita el preflight con un sudo falso.
+  if grep -qE '^\s*sudo -v\s*$' "$MOTOR"; then
+    rec fail "sudo: queda un 'sudo -v' que aborta el build con el ERR trap en vez de usar preflight_sudo"
+  else
+    rec ok "sudo: ningún 'sudo -v' pelado (usa preflight_sudo o es best-effort)"
+  fi
+  if [ "$(grep -c 'preflight_sudo' "$MOTOR")" -ge 3 ]; then
+    rec ok "sudo: preflight_sudo tanto al arrancar como tras compilar"
+  else
+    rec fail "sudo: preflight_sudo no cubre los dos puntos donde caduca el ticket"
+  fi
+  # El inventario de operaciones privilegiadas tiene que seguir existiendo: si el
+  # motor empieza a usar un comando nuevo, el aviso "no puede seguir" lo nombra.
+  descuadre=""
+  for op in mount umount install pacman chown mkdir rm; do
+    grep -q "sudo $op" "$MOTOR" || descuadre="$descuadre $op(al-motor)"
+    grep -qE "^SUDO_OPS_REQUERIDOS=.*\b$op\b" "$MOTOR" || descuadre="$descuadre $op(inventario)"
+  done
+  if [ -z "$descuadre" ]; then
+    rec ok "sudo: el inventario de operaciones privilegiadas está sincronizado con el motor"
+  else
+    rec fail "sudo: inventario de operaciones desincronizado:$descuadre"
+  fi
+
+  # Un sed por rango: con dos rangos en la misma expresión GNU sed deja el
+  # primero abierto y duplica las líneas de los Intermediate (parece un bug del
+  # propio GNU sed; verificado con un fichero mínimo).
+  : > "$ROOT/sudofn.sh"
+  sed -n '/^SUDO_OPS_REQUERIDOS=/,/)/p'      "$MOTOR" >> "$ROOT/sudofn.sh"
+  sed -n '/^SUDO_OPS_OPCIONALES=/,/)/p'     "$MOTOR" >> "$ROOT/sudofn.sh"
+  sed -n '/^sudo_nopasswd_cover() {/,/^}/p' "$MOTOR" >> "$ROOT/sudofn.sh"
+  sed -n '/^sudo_missing_ops() {/,/^}/p'    "$MOTOR" >> "$ROOT/sudofn.sh"
+  sed -n '/^sudo_explain_no_ticket() {/,/^}/p' "$MOTOR" >> "$ROOT/sudofn.sh"
+  sed -n '/^preflight_sudo() {/,/^}/p'      "$MOTOR" >> "$ROOT/sudofn.sh"
+  if ! bash -n "$ROOT/sudofn.sh" 2>/dev/null; then
+    rec fail "sudo: no se pudieron extraer las funciones del preflight (el sed de los tests quedó desfasado)"
+    sudofn_ok=false
+  else
+    sudofn_ok=true
+  fi
+  cat > "$ROOT/sudo-stub.sh" <<'STUB'
+warn() { echo "WARN: $*"; }
+info() { echo "INFO: $*"; }
+log()  { echo "LOG: $*"; }
+ok()   { echo "OK: $*"; }
+fatal(){ echo "FATAL: $*"; exit 9; }
+STUB
+  mkdir -p "$ROOT/fakebin"
+  # sudo falso, con el comportamiento elegido por FAKE_SUDO:
+  #   ticket   -> `sudo -n true` funciona (ticket vigente)
+  #   passwd   -> `sudo -v` falla como cuando la contraseña no es la correcta
+  #   nopasswd -> el allowlist cubre lo imprescindible y `sudo -v` falla
+  cat > "$ROOT/fakebin/sudo" <<'FAKESUDO'
+#!/bin/bash
+case "$FAKE_SUDO" in
+  ticket) exit 0 ;;
+  passwd|nopasswd|nopasswdall)
+    if [ "$1" = "-n" ] && [ "$2" = "-l" ]; then
+      # Ruido real de `sudo -l`: nada de esto es una lista de comandos, y sus
+      # rutas deben filtrarse (si no, salen "bin", "sbin", "visudo", "binRunas").
+      echo "Matching Defaults entries for cizen on archlinux:"
+      echo "    secure_path=/usr/local/sbin\\:/usr/local/bin\\:/usr/bin"
+      echo "Runas and Command-specific defaults for cizen:"
+      echo "    Defaults!/usr/bin/visudo env_keep+=\"SUDO_EDITOR EDITOR VISUAL\""
+      echo "    (ALL) ALL"
+      if [ "$FAKE_SUDO" = nopasswd ]; then
+        # con continuación de línea, como sudo envuelve las listas largas
+        echo "    (root) NOPASSWD: /usr/bin/mount, /usr/bin/umount, \\"
+        echo "        /usr/bin/install, /usr/bin/pacman, /usr/bin/chown, \\"
+        echo "        /usr/bin/mkdir, /usr/bin/rm, /usr/bin/swapon, /usr/bin/swapoff, \\"
+        echo "        /usr/bin/systemctl"
+      elif [ "$FAKE_SUDO" = nopasswdall ]; then
+        echo "    (root) NOPASSWD: ALL"
+      else
+        echo "    (root) NOPASSWD: /usr/bin/mount, /usr/bin/umount, /usr/bin/install, /usr/bin/pacman"
+      fi
+      exit 0
+    fi
+    [ "$1" = "-n" ] && [ "$2" = "true" ] && exit 1
+    echo "[sudo] password for cizen: " >&2
+    echo "Sorry, try again." >&2
+    echo "sudo: 3 incorrect password attempts" >&2
+    exit 1 ;;
+esac
+exit 1
+FAKESUDO
+  chmod +x "$ROOT/fakebin/sudo"
+  cat > "$ROOT/sudo-run.sh" <<'SRUN'
+PATH="$ROOT/fakebin:$PATH"; export PATH
+# shellcheck disable=SC1090,SC1091
+source "$ROOT/sudofn.sh"
+source "$ROOT/sudo-stub.sh"
+TMPFS_ROOT=/tmp/fake-tmpfs
+preflight_sudo
+echo "RC=$?"
+SRUN
+  if [ "$sudofn_ok" = true ]; then
+  out_ticket="$(FAKE_SUDO=ticket bash "$ROOT/sudo-run.sh" 2>&1)"
+  case "$out_ticket" in
+    *"RC=0"*) rec ok "sudo: con ticket vigente el preflight no preguntar y sigue" ;;
+    *)        rec fail "sudo: con ticket vigente el preflight falla ('$out_ticket')" ;;
+  esac
+  out_passwd="$(FAKE_SUDO=passwd bash "$ROOT/sudo-run.sh" 2>&1)"
+  if printf '%s' "$out_passwd" | grep -q "sin ticket vigente" &&
+     printf '%s' "$out_passwd" | grep -q "necesita privilegios que NO están en esa lista"; then
+    rec ok "sudo: sin ticket explica qué falta en vez de abortar con una línea de código"
+  else
+    rec fail "sudo: el preflight no explica el hueco de privilegios ('$out_passwd')"
+  fi
+  if printf '%s' "$out_passwd" | grep -q "sudo -k; sudo -v" &&
+     printf '%s' "$out_passwd" | grep -q "passwd -S"; then
+    rec ok "sudo: el aviso dice cómo comprobar la contraseña (sudo -v a secas, y passwd si tampoco entra)"
+  else
+    rec fail "sudo: el aviso no dice cómo resolverlo ('$out_passwd')"
+  fi
+  if printf '%s' "$out_passwd" | grep -q "FATAL:" &&
+     printf '%s' "$out_passwd" | grep -q "aún no se ha compilado nada"; then
+    rec ok "sudo: si faltan privilegios, avisa de que aún no se ha compilado nada"
+  else
+    rec fail "sudo: falta el aviso de que no se pierde trabajo ('$out_passwd')"
+  fi
+  out_np="$(FAKE_SUDO=nopasswd bash "$ROOT/sudo-run.sh" 2>&1)"
+  if printf '%s' "$out_np" | grep -q "Se sigue sin ticket sudo" && printf '%s' "$out_np" | grep -q "RC=0"; then
+    rec ok "sudo: con el allowlist cubriendo lo imprescindible sigue sin ticket en vez de rendirse"
+  else
+    rec fail "sudo: no aprovecha un allowlist NOPASSWD suficiente ('$out_np')"
+  fi
+  if printf '%s' "$out_np" | grep -q "pedirá contraseña más adelante" &&
+     printf '%s' "$out_np" | grep -q "cizen-uki-sync"; then
+    rec ok "sudo: avisa de qué operaciones pedirán contraseña después (no se rompe a media instalación)"
+  else
+    rec fail "sudo: no avisa de las operaciones que pedirán contraseña ('$out_np')"
+  fi
+  # La lista de cubiertos sale de `sudo -l`, cuya salida tiene más cosas que no
+  # son comandos (secure_path, Defaults!, "Runas and Command-specific..."). Si se
+  # cuela, el aviso le dice al usuario que tiene cubiertos "bin" o "visudo".
+  cubiertos="$(printf '%s\n' "$out_np" | sed -n 's/.*NOPASSWD): //p')"
+  if [ -n "$cubiertos" ] && ! printf '%s' "$cubiertos" | grep -qE 'bin|sbin|visudo|Runas'; then
+    rec ok "sudo: la lista de cubiertos sale limpia (sin rutas de secure_path ni de Defaults)"
+  else
+    rec fail "sudo: la lista de cubiertos arrastra basura de 'sudo -l' ('$cubiertos')"
+  fi
+  # sudo también usa continuaciones de línea para listas largas: si no se unen,
+  # la segunda mitad de la lista se pierde y parece que falta un comando cubierto.
+  if ! printf '%s' "$out_np" | grep -q "Y el build necesita privilegios"; then
+    rec ok "sudo: lee listas NOPASSWD partidas en varias líneas (las que envuelve sudo)"
+  else
+    rec fail "sudo: no se unen las continuaciones de línea de 'sudo -l'; falta algo que sí está cubierto"
+  fi
+  out_all="$(FAKE_SUDO=nopasswdall bash "$ROOT/sudo-run.sh" 2>&1)"
+  if printf '%s' "$out_all" | grep -q "RC=0" && ! printf '%s' "$out_all" | grep -q "FATAL:"; then
+    rec ok "sudo: con NOPASSWD: ALL no se para a preguntar nada"
+  else
+    rec fail "sudo: no reconoce un NOPASSWD: ALL ('$out_all')"
+  fi
+  fi
+
   # Sin red el menú no debe avisar ni bloquear (fail-open), y la pregunta de la
   # versión alternativa solo se hace en terminal.
   if grep -q '\[ -n "\$tags" \] || return 1' "$MENU" \
