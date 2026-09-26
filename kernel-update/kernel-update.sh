@@ -136,7 +136,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.36"
+SCRIPT_VERSION="27.31.37"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -336,8 +336,11 @@ export MAKEFLAGS="-j$JOBS"
 # ── Colores ─────────────────────────────────────────────────
 if [ -t 1 ]; then
   R=$'\033[0;31m'; G=$'\033[0;32m'; Y=$'\033[1;33m'; B=$'\033[0;34m'; C=$'\033[0;36m'; N=$'\033[0m'
+  # v27.31.37: blanco+negrita para las cabeceras de los submenús del motor
+  # (Variante/CC), igual que las usa el menú.
+  W=$'\033[1;37m'
 else
-  R=""; G=""; Y=""; B=""; C=""; N=""
+  R=""; G=""; Y=""; B=""; C=""; N=""; W=""
 fi
 
 log(){  printf '%s[%s]%s %s\n' "$B" "$(date +%H:%M:%S)" "$N" "$*"; }
@@ -399,6 +402,18 @@ CIZEN_SCHED="${CIZEN_SCHED:-inherit}"
 # es el último recurso para quien llama al motor por CLI. Si quien llama ya la
 # hizo (el menú), se desactiva con --no-ask-variant.
 NO_ASK_VARIANT="${NO_ASK_VARIANT:-false}"
+# v27.31.37: la pregunta del COMPILADOR también se hace aquí y no en el menú, y
+# por el mismo motivo (se pregunta cuando ya se sabe que se va a compilar, no
+# antes). --no-ask-cc la desactiva; además, si el compilador vino explícito
+# (--cc / CIZEN_CC) no se pregunta: tu elección escrita es una elección hecha.
+NO_ASK_CC="${NO_ASK_CC:-false}"
+CC_EXPLICIT=false
+[ "${CIZEN_CC:-auto}" != "auto" ] && CC_EXPLICIT=true
+# v27.31.37: argv original, para poder relanzar la run con otra versión (el
+# scheduler de solo-fork pide la release del fork, que es OTRO árbol: no se
+# puede seguir en esta run porque lo ya descargado y validado es el vanilla).
+ENGINE_SELF=""
+ENGINE_ARGV=()
 # Árbol de fuentes del kernel: auto (vanilla salvo que un scheduler seleccionado
 # exija el fork CachyOS) | vanilla (kernel.org) | cachyos (fork CachyOS/linux).
 # Los schedulers PRJC (pds/bmq/lfbmq) y MuQSS solo se publican como parches
@@ -580,8 +595,17 @@ _resolve_cc_compiler() {
 # ============================================================
 # ARGUMENTOS
 # ============================================================
+# v27.31.37: argv original ANTES de que los shift lo consuman, para poder
+# relanzar la run con otra versión (fork_release_guard). readlink -f porque la
+# run cambia de cwd (al árbol) y un $0 relativo no valdría al re-ejecutar.
+ENGINE_SELF="$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")"
+ENGINE_ARGV=("$@")
 while [ $# -gt 0 ]; do
   case "$1" in
+    --no-ask-cc)
+      NO_ASK_CC=true; shift ;;
+    --ask-cc)
+      NO_ASK_CC=false; shift ;;
     --check-update)
       CHECK_UPDATE=true; shift ;;
     --check)
@@ -656,9 +680,9 @@ while [ $# -gt 0 ]; do
       shift ;;
     --cc)
       CIZEN_CC="${2:-}"; [ -n "$CIZEN_CC" ] || { err "--cc requiere auto|gcc|clang, una versión (gcc-14, clang-17) o una ruta a tu compilador"; exit 1; }
-      shift 2 ;;
+      CC_EXPLICIT=true; shift 2 ;;
     --cc=*)
-      CIZEN_CC="${1#--cc=}"; shift ;;
+      CIZEN_CC="${1#--cc=}"; CC_EXPLICIT=true; shift ;;
     --lto-thin)
       CIZEN_LLVM_LTO=thin; shift ;;
     --lto-full)
@@ -1675,20 +1699,37 @@ install_dependency_packages() {
   return 1
 }
 
-check_prerequisites() {
-  local cmd pkg rc _ccb
-  local -a tools=(awk bash bc bison cat ccache cmp cp date df du find findmnt flex flock fuser grep gcc gpg head id ls make mktemp mount nproc pacman pahole perl rm sbctl sed sleep sort stat tar tr umount wget xargs xz timeout cizen-uki-sync)
-  local -a missing_cmds=() missing_pkgs=()
-
+require_cc_toolchain() {
+  local _ccb
   # Compilador de preferencia (--cc / CIZEN_CC): la familia clang exige ld.lld
   # (LLVM=1) y, con clang genérico, también clang. Un compilador CONCRETO
   # (gcc-14 / clang-17 / ruta) se exige igual que cualquier dependencia: si es
   # versionado se ofrece su paquete Arch homónimo (gcc14/clang17) vía el flujo
   # estándar de instalación; una ruta personal debe existir (no hay paquete que
   # adivinar) y se aborta si no. Nunca se degrada: tu elección es vinculante.
+  #
+  # v27.31.37: extraído de check_prerequisites para poder exigir la toolchain
+  # también cuando el compilador se elige TARDE (preguntado tras confirmar que
+  # se va a compilar): si el gcc se cambia por clang ahí, la toolchain LLVM se
+  # pide igual que en el arranque.
+  #
+  # NO instala: accumulates en CC_MISSING_CMDS/CC_MISSING_PKGS y devuelve 1 si
+  # falta algo, para que quien llame decida (en el arranque se reúna todo junto
+  # en un solo pacman, como siempre; en la pregunta tardía, lo que hace falta).
+  CC_MISSING_CMDS=()
+  CC_MISSING_PKGS=()
   if [ "$CC_FAMILY" = "clang" ]; then
-    tools+=(ld.lld llvm-ar llvm-nm llvm-objcopy llvm-strip llvm-objdump llvm-readelf)
-    [ "$CC_LAUNCHER" = "clang" ] && tools+=(clang)
+    for _ccb in ld.lld llvm-ar llvm-nm llvm-objcopy llvm-strip llvm-objdump llvm-readelf; do
+      command -v "$_ccb" >/dev/null 2>&1 && continue
+      [ -n "${TOOL_PKG[$_ccb]:-}" ] || \
+        fatal "Falta dependencia sin paquete Arch asociado: $_ccb (instálala manualmente y reintenta)."
+      CC_MISSING_CMDS+=("$_ccb")
+      CC_MISSING_PKGS+=("${TOOL_PKG[$_ccb]}")
+    done
+    if [ "$CC_LAUNCHER" = "clang" ] && ! command -v clang >/dev/null 2>&1; then
+      CC_MISSING_CMDS+=(clang)
+      CC_MISSING_PKGS+=("${TOOL_PKG[clang]}")
+    fi
   fi
   case "$CC_LAUNCHER" in
     gcc|clang) ;;
@@ -1696,8 +1737,8 @@ check_prerequisites() {
       _ccb="$(basename -- "$CC_LAUNCHER")"
       if [[ "$_ccb" =~ ^(gcc|clang)[-_]?[0-9]+$ ]]; then
         if ! command -v -- "$CC_LAUNCHER" >/dev/null 2>&1; then
-          missing_cmds+=("$CC_LAUNCHER")
-          missing_pkgs+=("${_ccb//-/}")
+          CC_MISSING_CMDS+=("$CC_LAUNCHER")
+          CC_MISSING_PKGS+=("${_ccb//-/}")
         fi
       else
         command -v -- "$CC_LAUNCHER" >/dev/null 2>&1 || \
@@ -1706,6 +1747,22 @@ check_prerequisites() {
       unset _ccb
       ;;
   esac
+  [ "${#CC_MISSING_PKGS[@]}" -eq 0 ]
+}
+
+check_prerequisites() {
+  local cmd pkg rc
+  local -a tools=(awk bash bc bison cat ccache cmp cp date df du find findmnt flex flock fuser grep gcc gpg head id ls make mktemp mount nproc pacman pahole perl rm sbctl sed sleep sort stat tar tr umount wget xargs xz timeout cizen-uki-sync)
+  local -a missing_cmds=() missing_pkgs=()
+
+  # Compilador de preferencia: su toolchain va a la MISMA lista que el resto de
+  # dependencias, para que falte lo que falte se instale en un solo pacman.
+  # v27.31.37: la comprobación vive en require_cc_toolchain (la reusa también
+  # la pregunta tardía del compilador).
+  if ! require_cc_toolchain; then
+    missing_cmds+=("${CC_MISSING_CMDS[@]}")
+    missing_pkgs+=("${CC_MISSING_PKGS[@]}")
+  fi
 
   for cmd in "${tools[@]}"; do
     if command -v "$cmd" >/dev/null 2>&1; then
@@ -7961,11 +8018,40 @@ build_cizen_uki() {
             args+=(--initrd="$initrd")
             ok "Incluyendo initramfs: $initrd"
         fi
+        # Microcódigo Intel temprano (early microcode CPIO) embebido en la UKI.
+        # Sin esto ukify no incluye la actualización y el kernel arranca con la
+        # revisión de la BIOS, dejando expuestas vulnerabilidades especulativas.
+        local ucode_tmp="" ucode_dir="" cpuid_hex="" ucode_bin="" ucode_rev=""
+        cpuid_hex="$(awk -F': ' '\
+            /vendor_id/   { vend=$2 }\
+            /cpu family/  { fam=sprintf("%02x",$2+0) }\
+            /^model[[:space:]]*:/ { mod=sprintf("%02x",$2+0) }\
+            /stepping/    { step=sprintf("%02x",$2+0) }\
+            END { if (vend~/Intel/) printf "%s-%s-%s",fam,mod,step }\
+        ' /proc/cpuinfo)"
+        ucode_bin="/usr/lib/firmware/intel-ucode/${cpuid_hex}"
+        if [ -f "$ucode_bin" ]; then
+            ucode_dir="$(mktemp -d /tmp/cizen-ucode-dir.XXXXXX)" && \
+            ucode_tmp="$(mktemp /tmp/cizen-ucode.XXXXXX)" && {
+                mkdir -p "$ucode_dir/kernel/x86/microcode"
+                cp "$ucode_bin" "$ucode_dir/kernel/x86/microcode/GenuineIntel.bin"
+                (cd "$ucode_dir" && find . -mindepth 1 | sort | \
+                  cpio -o -H newc --reproducible 2>/dev/null) > "$ucode_tmp"
+                rm -rf "$ucode_dir"
+                args+=(--microcode="$ucode_tmp")
+                ucode_rev="$(od -An -tx4 -j4 -N4 "$ucode_bin" | tr -d ' \n')"
+                ok "Microcodigo Intel: CPUID=${cpuid_hex} rev=0x${ucode_rev}"
+            } || {
+                warn "No pude generar CPIO de microcodigo; continuando sin el."
+                rm -rf "$ucode_dir" 2>/dev/null; ucode_tmp=""
+            }
+        fi
         if "${args[@]}"; then
             rm -f "$osrel_file"
+            [ -n "$ucode_tmp" ] && rm -f "$ucode_tmp"
             return 0
         fi
-        warn "ukify falló; intento fallback con objcopy."
+        [ -n "$ucode_tmp" ] && rm -f "$ucode_tmp"
     fi
 
     stub=""
@@ -9372,6 +9458,25 @@ confirm_build_after_check() {
 # perfil (overlay) + frags + auditoría + validación, tras materializar los
 # símbolos del parche en los arrays efectivos. V27.30.0: generaliza la cadena
 # que antes solo sabía de BORE para soportar PDS/BMQ/LFBMQ/MUQSS.
+revalidate_config_chain() { # $1=etiqueta para los mensajes ("bore", "clang", ...)
+  local why="${1:-la configuración}"
+  log "Reconfigurando por ${why} (olddefconfig + perfil + auditoría + validación)..."
+  if ! make "${KCONFIG_CC_OPTS[@]}" olddefconfig; then
+    err "olddefconfig falló al reconfigurar por ${why}."
+    return 1
+  fi
+  inject_build_overlay
+  apply_config_requests || { err "scripts/config falló al re-aplicar el perfil (${why})."; return 1; }
+  apply_config_fragments || { err "frags fallaron (${why})."; return 1; }
+  run_kconfig_audit || { err "Auditoría Kconfig fallida (${why})."; return 1; }
+  validate_config || {
+    local rc=$?
+    err "Re-validación fallida (${why}) (rc=$rc)."
+    return 1
+  }
+  return 0
+}
+
 apply_patch_and_recheck() {
   local __pn="$1"
   if ! apply_patch_plugin "$__pn"; then
@@ -9379,68 +9484,238 @@ apply_patch_and_recheck() {
   fi
   build_effective_arrays
   check_profile_contradictions
-  log "Reconfigurando con ${PATCH_DISP_NAME:-$__pn} aplicado (olddefconfig + perfil + auditoría + validación)..."
-  if ! make "${KCONFIG_CC_OPTS[@]}" olddefconfig; then
-    err "olddefconfig falló tras aplicar ${PATCH_DISP_NAME:-$__pn}."
+  if ! revalidate_config_chain "${PATCH_DISP_NAME:-$__pn}"; then
+    err "No se pudo dejar la configuración lista con ${PATCH_DISP_NAME:-$__pn} aplicado."
     return 1
   fi
-  inject_build_overlay
-  apply_config_requests || { err "scripts/config falló al re-aplicar el perfil con ${PATCH_DISP_NAME:-$__pn}."; return 1; }
-  apply_config_fragments || { err "frags fallaron tras ${PATCH_DISP_NAME:-$__pn}."; return 1; }
-  run_kconfig_audit || { err "Auditoría Kconfig tras aplicar ${PATCH_DISP_NAME:-$__pn} fallida."; return 1; }
-  validate_config || {
-    local rc=$?
-    err "Re-validación tras aplicar ${PATCH_DISP_NAME:-$__pn} fallida (rc=$rc)."
-    return 1
-  }
   ok "${PATCH_DISP_NAME:-$__pn} aplicado y configuración re-validada."
   return 0
 }
 
-choose_build_variant_after_check() {
-  local choice __pn=""
+# ── Preguntas de preferencia: scheduler y compilador (v27.31.37) ──
+# Se preguntan AQUÍ, y no en el menú antes de empezar, por una razón concreta:
+# hasta que la config no está validada no tiene sentido elegir, y el usuario no
+# quiere.validar diez minutos para que después se le pregunte por un scheduler
+# que igual no va a compilar. En el flujo con --check la pregunta va detrás de
+# «¿Desea continuar con la compilación?»: si la respuesta es NO no se pregunta
+# nada; si es SÍ se pregunta y lo elegido se aplica antes de compilar. El menú
+# (options 1-5, 7, 8, 15, 16) ya no pregunta nada de esto: solo lanza el motor.
+#
+# La UI (submenú + prompt) va a stdout y la respuesta a una global, sin $( ):
+# así el bloque se ve siempre, también cuando stderr no es la terminal.
+VARIANT_CHOICE=""
+CC_CHOICE=""
 
+prefs_read() { # $1=nombre de la variable que recibe lo tecleado
+  local __v=""
+  if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    read -r -t 300 __v < /dev/tty || __v=""
+  else
+    read -r -t 300 __v || __v=""
+  fi
+  printf -v "$1" '%s' "$__v"
+}
+
+prefs_interactive() { [ -t 0 ] || [ -t 1 ]; }
+
+# Scheduler del proyecto. Devuelve el nombre en VARIANT_CHOICE (vacío = Vanilla).
+# NO aplica nada todavía: lo aplica ask_build_prefs, y solo si de verdad cambió
+# algo, para que variante y compilador compartan una única revalidación.
+ask_build_variant() {
+  VARIANT_CHOICE=""
   if [ "${#PATCH_NAMES[@]}" -gt 0 ]; then
     log "Variante ya solicitada explícitamente (${PATCH_NAMES[*]}); se omite la pregunta."
     return 0
   fi
-
   if [ "$NO_ASK_VARIANT" = true ]; then
     log "Variante ya elegida por quien invoca el motor (--no-ask-variant); se omite la pregunta."
     return 0
   fi
-
-  if ! [ -t 0 ] && ! [ -t 1 ]; then
-    warn "Sin terminal interactiva; se continúa con la variante Vanilla."
+  if ! prefs_interactive; then
+    warn "Sin terminal interactiva; se continúa con la variante Vanilla (EEVDF)."
     return 0
   fi
-
-  echo
-  printf '  1) Vanilla (EEVDF)\n  2) BORE\n  3) PDS (prjc)\n  4) BMQ (prjc)\n  5) LFBMQ (prjc)\n  6) MuQSS\n'
+  local choice
+  printf '\n  %bVariante%b (Enter usa el default):\n' "$W" "$N"
+  printf '    %b1%b  Vanilla (EEVDF)\n' "$W" "$N"
+  printf '    %b2%b  BORE\n' "$W" "$N"
+  printf '    %b3%b  PDS (prjc)\n' "$W" "$N"
+  printf '    %b4%b  BMQ (prjc)\n' "$W" "$N"
+  printf '    %b5%b  LFBMQ (prjc)\n' "$W" "$N"
+  printf '    %b6%b  MuQSS\n' "$W" "$N"
   while true; do
-    read -r -t 300 -p "  Elija la variante de compilación [1] > " choice < /dev/tty || choice=""
+    printf '  %bVariante%b [Enter=%b1%b]: ' "$W" "$N" "$Y" "$N"
+    prefs_read choice
     case "${choice:-1}" in
-      1|vanilla|Vanilla|v|V|eevdf|EEVDF)
-        ok "Variante Vanilla (scheduler EEVDF estándar)."
-        return 0
-        ;;
-      2|bore|Bore|b|B)              __pn="bore";   break ;;
-      3|pds|PDS|p|P)                __pn="pds";    break ;;
-      4|bmq|BMQ|q|Q)                __pn="bmq";    break ;;
-      5|lfbmq|LFBMQ|l|L)            __pn="lfbmq";  break ;;
-      6|muqss|Muqss|MUQSS|m|M)      __pn="muqss";  break ;;
-      *)
-        warn "Respuesta no válida. Responda 1-6, un nombre (b/p/q/l/m) o Enter para Vanilla."
-        ;;
+      1|vanilla|Vanilla|v|V|eevdf|EEVDF) VARIANT_CHOICE=""; break ;;
+      2|bore|Bore|b|B)              VARIANT_CHOICE="bore";   break ;;
+      3|pds|PDS|p|P)                VARIANT_CHOICE="pds";    break ;;
+      4|bmq|BMQ|q|Q)                VARIANT_CHOICE="bmq";    break ;;
+      5|lfbmq|LFBMQ|l|L)            VARIANT_CHOICE="lfbmq";  break ;;
+      6|muqss|Muqss|MUQSS|m|M)      VARIANT_CHOICE="muqss";  break ;;
+      *) warn "Respuesta no válida. Responde 1-6, un nombre (b/p/q/l/m) o Enter para Vanilla." ;;
     esac
   done
+  if [ -n "$VARIANT_CHOICE" ]; then
+    log "Variante elegida: ${VARIANT_CHOICE}."
+  else
+    ok "Variante Vanilla (scheduler EEVDF estándar)."
+  fi
+  return 0
+}
 
-  if [ -n "$__pn" ]; then
-    PATCH_NAMES+=("$__pn")
-    if apply_patch_and_recheck "$__pn"; then
-      ok "Se compilará con el scheduler ${PATCH_DISP_NAME:-$__pn}."
+# Compilador de preferencia. Devuelve la elección en CC_CHOICE (vacío = auto, el
+# default que ya se resolvió al arrancar). NO reconfigura todavía: lo hace
+# apply_cc_choice, junto con la revalidación que la variante pueda necesitar.
+ask_build_cc() {
+  CC_CHOICE=""
+  if [ "$CC_EXPLICIT" = true ]; then
+    log "Compilador ya indicado explícitamente (${CIZEN_CC}); se omite la pregunta."
+    return 0
+  fi
+  if [ "$NO_ASK_CC" = true ]; then
+    log "Pregunta del compilador desactivada (--no-ask-cc)."
+    return 0
+  fi
+  if ! prefs_interactive; then
+    warn "Sin terminal interactiva; se continúa con el compilador ya resuelto (${CC_LAUNCHER})."
+    return 0
+  fi
+  local choice
+  printf '\n  %bCC%b (Enter usa el default):\n' "$W" "$N"
+  printf '    %bauto%b  elige según el sistema (clang si LTO/toolchain LLVM viable; si no gcc) (default)\n' "$W" "$N"
+  printf '    %bgcc%b   compilador GCC\n' "$W" "$N"
+  printf '    %bclang%b Clang/LLVM (necesario para el LTO)\n' "$W" "$N"
+  printf '    %botro%b  teclea TU compilador (p. ej. gcc-14, clang-17 o una ruta). Se exigirá como dependencia si falta.\n' "$W" "$N"
+  printf '  %bCC%b [Enter=%bauto%b]: ' "$W" "$N" "$Y" "$N"
+  prefs_read choice
+  CC_CHOICE="$choice"
+  return 0
+}
+
+# Aplica la elección de compilador: re-resuelve familia/binario, rehace la
+# decisión de LTO (solo viable con clang), reconstruye KCONFIG_CC_OPTS —que es
+# lo que usan las fases de config— y exige la toolchain. MAKE_CC_OPTS se arma
+# después, en el flujo principal, así que sale solo con CC_FAMILY/CC_LAUNCHER.
+apply_cc_choice() {
+  local prev_fam="$CC_FAMILY" prev_launcher="$CC_LAUNCHER" prev_lto="$CIZEN_LLVM_LTO"
+  local want="${1:-}"
+  if [ -z "$want" ] || [ "$want" = "$prev_launcher" ] \
+     || { [ "$want" = auto ] && [ "$CIZEN_CC" = auto ]; }; then
+    return 1   # nada que cambiar
+  fi
+  CIZEN_CC="$want"
+  _resolve_cc_compiler || fatal "Compilador no válido: $want (use auto, gcc, clang, gcc-14, clang-17 o una ruta)."
+  if [ "$CIZEN_LLVM_LTO" != "0" ] && [ "$CC_FAMILY" = "gcc" ]; then
+    warn "LTO (${CIZEN_LLVM_LTO}) exige clang; el compilador elegido es GCC (${CC_LAUNCHER}); se ignora el LTO."
+    CIZEN_LLVM_LTO=0
+  fi
+  # Las fases de config deben ver el MISMO compilador que la build (v27.31.7).
+  KCONFIG_CC_OPTS=()
+  if [ "$CC_FAMILY" = "clang" ]; then
+    KCONFIG_CC_OPTS+=('LLVM=1')
+  fi
+  case "$CC_LAUNCHER" in
+    gcc|clang) ;;
+    *) KCONFIG_CC_OPTS+=("CC=$CC_LAUNCHER" "HOSTCC=$CC_LAUNCHER") ;;
+  esac
+  if ! require_cc_toolchain; then
+    if ! install_dependency_packages "compilar con ${CC_LAUNCHER}" "${CC_MISSING_PKGS[@]}"; then
+      fatal "Faltan herramientas para ${CC_LAUNCHER}: ${CC_MISSING_CMDS[*]} (sudo pacman -S ${CC_MISSING_PKGS[*]})."
+    fi
+  fi
+  ok "Compilador: ${CC_LAUNCHER} (familia ${CC_FAMILY})."
+  if [ "$prev_lto" != "$CIZEN_LLVM_LTO" ]; then
+    log "LTO: ${CIZEN_LLVM_LTO} (antes ${prev_lto}, reevaluado con ${CC_LAUNCHER})."
+  fi
+  return 0
+}
+
+# El scheduler elegido (pds/bmq/lfbmq/muqss) solo existe en el árbol del fork
+# CachyOS: apply_patch_plugin lo rechaza si KERNEL_TREE != cachyos. Y el árbol
+# que hay ahora mismo en el tmpfs es el de ESTA versión con ESTE árbol, ya
+# descargado y validado; no se puede cambiar a mitad de run. Así que, si se
+# elige uno de esos y esta run no está ya sobre el fork, hay que relanzarla
+# con --tree cachyos (y con la release del fork si la versión pedida aún no está
+# publicada allí). Se explica y se pregunta; nunca se degrada en silencio.
+relaunch_with_version() { # $1=versión $2=scheduler $3=cc (opcional)
+  local -a a=()
+  local x skip=0
+  for x in ${ENGINE_ARGV[@]:-}; do
+    [ "$skip" = 1 ] && { skip=0; continue; }
+    case "$x" in
+      --sched|--cc|--tree) skip=1; continue ;;
+      --sched=*|--cc=*|--tree=*) continue ;;
+    esac
+    # La versión posicional es la que se sustituye por $1.
+    [[ "$x" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] && continue
+    a+=("$x")
+  done
+  log "Relanzando: $ENGINE_SELF ${a[*]} $1 --tree cachyos --sched $2 ${3:+--cc $3} --no-ask-variant --no-ask-cc"
+  exec "$ENGINE_SELF" ${a[@]:-} "$1" --tree cachyos --sched "$2" \
+    ${3:+--cc "$3"} --no-ask-variant --no-ask-cc
+}
+
+fork_release_guard() { # $1=scheduler elegido (vacío = vanilla)
+  local v="${1:-}" ans ver="$VERSION" fb="" nota=""
+  case "$v" in pds|bmq|lfbmq|muqss) ;; *) return 0 ;; esac
+  # Esta run ya está sobre el árbol del fork: el parche se aplica sin más.
+  [ "$KERNEL_TREE" = cachyos ] && return 0
+  # El fork tiene que publicar la versión pedida; si no, se ofrece su última
+  # release de la misma línea (cachyos_release_tagrel no aborta: devuelve 1).
+  if ! cachyos_release_tagrel "$ver"; then
+    fb="$CACHYOS_LATEST_MINOR"
+    if [ -n "$fb" ]; then
+      nota="El fork CachyOS aún no publica $VERSION; su última release de esa línea es $fb."
     else
-      warn "No se pudo aplicar '$__pn'; se continúa compilando Vanilla (EEVDF)."
+      nota="El fork CachyOS no publica $VERSION ni ninguna release de la línea ${VERSION%.*}.x."
+    fi
+    [ -n "${CACHYOS_SEEN_TAGS:-}" ] && nota="$nota Últimos tags del fork: ${CACHYOS_SEEN_TAGS}"
+    ver="${fb:-$ver}"
+  fi
+  echo
+  warn "$nota"
+  warn "El scheduler $v solo existe en el árbol del fork CachyOS (esta run está sobre '$KERNEL_TREE'),"
+  warn "así que hay que empezar de nuevo con: $VERSION → $ver + --tree cachyos + --sched $v"
+  if prefs_interactive; then
+    printf '  ¿Relanzar la compilación con %s (%s)? [S/n]: ' "$ver" "$v"
+    prefs_read ans
+    case "${ans:-S}" in
+      [SsYy]*) relaunch_with_version "$ver" "$v" "$CC_CHOICE" ;;
+      *) fatal "No se puede elegir $v sin el árbol del fork; elige Vanilla o BORE, o relanza con $ver." ;;
+    esac
+  fi
+  fatal "El scheduler $v requiere --tree cachyos y la versión $ver del fork; relánzalo o elige Vanilla/BORE para $VERSION."
+}
+
+# Pregunta las dos cosas y aplica lo que haya cambiado, con UNA sola
+# revalidación de la config (variante y compilador tocan los mismos símbolos).
+ask_build_prefs() {
+  ask_build_variant
+  fork_release_guard "$VARIANT_CHOICE"
+  ask_build_cc
+
+  local cc_changed=0
+  apply_cc_choice "$CC_CHOICE" && cc_changed=1
+
+  if [ -n "$VARIANT_CHOICE" ]; then
+    PATCH_NAMES+=("$VARIANT_CHOICE")
+    if ! apply_patch_plugin "$VARIANT_CHOICE"; then
+      unset 'PATCH_NAMES[${#PATCH_NAMES[@]}-1]'
+      fatal "No se pudo aplicar el scheduler ${VARIANT_CHOICE} sobre $VERSION; no se degrada a otro en silencio."
+    fi
+    build_effective_arrays
+    check_profile_contradictions
+    ok "Se compilará con el scheduler ${PATCH_DISP_NAME:-$VARIANT_CHOICE}."
+  fi
+
+  if [ -n "$VARIANT_CHOICE" ] || [ "$cc_changed" = 1 ]; then
+    local why="el scheduler ${PATCH_DISP_NAME:-$VARIANT_CHOICE} y el compilador $CC_LAUNCHER"
+    [ -n "$VARIANT_CHOICE" ] || why="el compilador $CC_LAUNCHER"
+    if revalidate_config_chain "$why"; then
+      ok "Configuración lista para compilar con ${VARIANT_CHOICE:-eevdf} + $CC_LAUNCHER."
+    else
+      fatal "La configuración no quedó lista con lo elegido (${why}); no se empieza a compilar."
     fi
   fi
   return 0
@@ -9448,7 +9723,9 @@ choose_build_variant_after_check() {
 
 if [ "$CHECK_ONLY" = true ]; then
   if confirm_build_after_check; then
-    choose_build_variant_after_check
+    # v27.31.37: aquí, y solo si la respuesta fue SÍ. Con la validación
+    # hecha y la decisión tomada, se pregunta el scheduler y el compilador.
+    ask_build_prefs
     ok "Perfecto. La configuración está validada; continuamos con la compilación de $VERSION."
     CHECK_ONLY=false
   else
@@ -9460,6 +9737,13 @@ if [ "$CHECK_ONLY" = true ]; then
     cleanup_success
     exit 0
   fi
+else
+  # v27.31.37: build directo (sin --check): no hay un "¿Desea continuar?" detrás
+  # —no lo hay porque no se haValidado nada todavía—, pero sí un momento
+  # equivalente: la config está lista y aún no se ha compilado ni un objeto. Se
+  # pregunta aquí y no en el menú por lo mismo: elegir scheduler/compilador
+  # tiene sentido cuando ya se sabe que la build va a empezar.
+  ask_build_prefs
 fi
 
 # Firma de la UKI (Secure Boot): nueva opción sugerida en la solicitud de
