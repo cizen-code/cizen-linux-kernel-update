@@ -3044,6 +3044,31 @@ FAKE
   else
     rec fail "uki: cizen_uki_cleanup_variants no deduplica por inodo"
   fi
+
+  # g) v27.31.34: un comentario que pierde el '#' NO lo caza ni 'bash -n' ni
+  #    shellcheck. '# /boot/efi y /boot/EFI son el MISMO directorio' sin el '#'
+  #    es una ORDEN perfectamente válida ('/boot/efi' con argumentos), así que
+  #    pasa las dos revisiones estáticas y solo revienta al ejecutarse: aquí
+  #    abortó el sync entero en producción con 'line 165: /boot/efi: Is a
+  #    directory'. Deuda de v27.31.33 (§32.12).
+  #    Humo de verdad: ejecutar el script. Con un suffix inexistente no hay
+  #    kernel que buscar, así que debe morir con SU propio mensaje y solo con él.
+  smoke="$(CIZEN_UKI_SUFFIX=-cizen-inexistente bash "$UKISYNC" --dry-run 2>&1 || true)"
+  if printf '%s' "$smoke" | grep -q 'No encontré ningún kernel Cizen' \
+     && ! printf '%s' "$smoke" | grep -qiE 'is a directory|command not found|syntax error|no such file or directory'; then
+    rec ok "uki: el sync arranca limpio y muere con su propio mensaje (humo de --dry-run)"
+  else
+    rec fail "uki: el sync escupió errores al arrancar: $(printf '%s' "$smoke" | tr '\n' ' ')"
+  fi
+  # El motor, con su parser de opciones: una opción inválida solo puede dar
+  # su propio mensaje de error.
+  smoke_m="$(timeout 60 bash "$MOTOR" --opcion-inventada 2>&1 || true)"
+  if printf '%s' "$smoke_m" | grep -q 'Opción desconocida: --opcion-inventada' \
+     && ! printf '%s' "$smoke_m" | grep -qiE 'is a directory|command not found|syntax error|no such file or directory'; then
+    rec ok "uki: el motor arranca limpio y rechaza lo que no es una opción (humo del parser)"
+  else
+    rec fail "uki: el motor escupió errores al arrancar: $(printf '%s' "$smoke_m" | tr '\n' ' ')"
+  fi
 else
   printf '  (sin %s: se omiten los tests del nombre de UKI)\n' "$UKISYNC"
 fi

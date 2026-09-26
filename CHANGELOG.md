@@ -1,3 +1,31 @@
+## [27.31.34] - 2026-09-26
+
+v27.31.33 se llevó el sync entero por delante en producción.
+
+Una línea del comentario nuevo se quedó sin su `#`:
+
+```
+/boot/efi y /boot/EFI son el MISMO directorio, y 'sort -u' solo deduplica
+```
+
+Como orden es **sintaxis válida** — `/boot/efi` con argumentos — así que ni
+`bash -n` ni shellcheck la miran: solo revienta al ejecutarse, y lo hizo como
+`line 165: /boot/efi: Is a directory` (como root) o `Permission denied` (sin
+root), con el script muerto antes de su primera línea de log. Deployed y
+documentado sin que nada lo viera: ni el selftest (extrae las funciones por
+rango, y el comentario queda fuera), ni el test de paridad de la unit, ni el
+`bash -n` de despliegue. Todo lo demás de 27.31.33 era correcto y sigue igual.
+
+El arreglo es el `#`; lo que no debe repetirse es el agujero de verificación,
+así que ahora hay **humo de verdad**: el selftest ejecuta `cizen-uki-sync
+--dry-run` con un suffix inexistente (donde no puede encontrar kernel y solo
+puede morir con su propio mensaje) y `kernel-update.sh` con una opción
+inventada, y exige que la salida sea exactamente la esperada **sin ningún
+`Is a directory`, `command not found` ni `syntax error`**. Dos tests que fallan
+si una línea suelta vuelve a colarse en el flujo.
+
+Selftest: 320 -> 322. Los dos nuevos, en rojo contra el código de 27.31.33.
+
 ## [27.31.33] - 2026-09-26
 
 El UKI se escribía y firmaba dos veces en cada sincronización.

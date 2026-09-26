@@ -162,7 +162,7 @@ detect_esp_root() {
 # Objetivos = ficheros del ESP que se llaman $name, uno por cada FICHERO.
 # Recorremos /efi, /boot/efi y /boot porque el ESP puede estar montado en
 # cualquiera, pero eso duplica: en vfat sin CaseSensitive (el caso normal)
-/boot/efi y /boot/EFI son el MISMO directorio, y 'sort -u' solo deduplica
+# /boot/efi y /boot/EFI son el MISMO directorio, y 'sort -u' solo deduplica
 # cadenas, no ficheros — el UKI salía dos veces y se escribía y firmaba dos
 # veces. Se deduplica por (dispositivo, inodo), que es la identidad real del
 # fichero; sin stat (permiso denegado en /boot sin sudo) se degrada al nombre,
