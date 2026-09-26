@@ -94,6 +94,7 @@
 #   CIZEN_DOWNLOADER=wget ./kernel-update.sh <versión>       # fuerza el wget clásico
 #   CIZEN_NO_AUTOINSTALL=1 ./kernel-update.sh <versión>      # sin prompts de instalación
 #   KERNEL_BUILD_ROOT=/tmp/kbuild ./kernel-update.sh <versión>
+#   ./kernel-update.sh --save-auto-renames   # persiste los renombres detectados
 #   ./kernel-update.sh --rename VIEJO=NUEVO
 #   ./kernel-update.sh --list-renames
 #   CIZEN_KERNEL_TRACK=longterm ./kernel-update.sh   # seguir LTS mayor en vez de stable
@@ -134,7 +135,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.27"
+SCRIPT_VERSION="27.31.28"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -241,6 +242,9 @@ declare -a PATCHES_APPLIED=()
 # Símbolos Kconfig que aportan los parches aplicados y BTF: entran en ENABLE y
 # se reconocen como rebeldes esperados (no ensucian la auditoría ni --strict).
 declare -a PATCH_ENABLE_ALL=() PATCH_REBEL_ALL=()
+# v27.31.28: símbolos que aporta un parche pero NO son booleanos (int/hex/string).
+# No se fuerzan a "=y": se dejan al valor que declara el propio parche.
+declare -a PATCH_VALUE_SYMBOLS=()
 # Símbolos que un parche obliga a DESACTIVAR para fijar una "choice" Kconfig
 # (p. ej. elegir SCHED_PDS exige CONFIG_SCHED_BMQ=n). Selectores de scheduler.
 declare -a PATCH_DISABLE_ALL=()
@@ -390,6 +394,10 @@ CIZEN_CPU_OPT="${CIZEN_CPU_OPT:-inherit}"
 CIZEN_TIMER_FREQ="${CIZEN_TIMER_FREQ:-inherit}"
 # Scheduler de compilación: inherit | eevdf (vanilla) | bore | pds | bmq | lfbmq | muqss.
 CIZEN_SCHED="${CIZEN_SCHED:-inherit}"
+# v27.31.28: la pregunta interactiva de variante (choose_build_variant_after_check)
+# es el último recurso para quien llama al motor por CLI. Si quien llama ya la
+# hizo (el menú), se desactiva con --no-ask-variant.
+NO_ASK_VARIANT="${NO_ASK_VARIANT:-false}"
 # Árbol de fuentes del kernel: auto (vanilla salvo que un scheduler seleccionado
 # exija el fork CachyOS) | vanilla (kernel.org) | cachyos (fork CachyOS/linux).
 # Los schedulers PRJC (pds/bmq/lfbmq) y MuQSS solo se publican como parches
@@ -639,6 +647,8 @@ while [ $# -gt 0 ]; do
       else
         err "--rename requiere VIEJO=NUEVO"; exit 1
       fi ;;
+    --save-auto-renames)
+      SAVE_AUTO_RENAMES=true ;;
     --rename=*)
       DO_RENAME=true
       RENAME_PAIR="${1#--rename=}"
@@ -680,6 +690,13 @@ while [ $# -gt 0 ]; do
       shift 2 ;;
     --tree=*)
       CIZEN_KERNEL_TREE="${1#--tree=}"; shift ;;
+    --no-ask-variant)
+      # v27.31.28: el menú ya preguntó la variante (antes que el compilador) y no
+      # tiene sentido que el motor vuelva a preguntar 9 minutos después, con la
+      # descarga y la validación ya gastadas.
+      NO_ASK_VARIANT=true; shift ;;
+    --ask-variant)
+      NO_ASK_VARIANT=false; shift ;;
     --ntsync)
       CIZEN_PATCH_NTSYNC=1; shift ;;
     --no-ntsync)
@@ -855,6 +872,11 @@ fi
 # RENAME MAP
 # ============================================================
 declare -A RENAME_MAP=()
+# v27.31.28: renombres detectados solo (no confirmados por el usuario). Se
+# aplican en memoria siempre; para que sobrevivan al siguiente kernel hay que
+# pasar --save-auto-renames.
+declare -A AUTO_RENAMES=()
+SAVE_AUTO_RENAMES=false
 
 do_rename() {
   local pair="$1" old new tmp line found=false
@@ -5483,8 +5505,18 @@ apply_patch_register() {
   local p="$1" s
   PATCHES_APPLIED+=("$p")
   for s in "${PATCH_SYMBOLS[@]:-}"; do
-    PATCH_ENABLE_ALL+=("$s")
-    PATCH_REBEL_ALL+=("$s")
+    # Solo los booleanos se fuerzan a =y. Un símbolo int/hex/string al que se le
+    # pone "=y" no es un valor válido: olddefconfig lo revierte a su default y
+    # el validador lo cuenta como activación no satisfecha para siempre.
+    case "$(kconfig_symbol_type "$s")" in
+      bool|tristate|"")
+        PATCH_ENABLE_ALL+=("$s")
+        PATCH_REBEL_ALL+=("$s")
+        ;;
+      *)
+        PATCH_VALUE_SYMBOLS+=("$s")
+        ;;
+    esac
   done
   # Elección de variante dentro de la "choice" Kconfig del scheduler.
   for s in "${PATCH_CHOICE_DISABLE[@]:-}"; do
@@ -5650,6 +5682,9 @@ apply_patch_plugin() {
     return 1
   fi
 
+  # El parche acaba de cambiar el árbol (y sus Kconfig): el índice de símbolos se
+  # tira aquí, o el validador no verá los símbolos que el propio parche introduce.
+  kconfig_index_invalidate
   apply_patch_register "$name"
   _sched_alt_rtmutex_futex_fixup
   ok "${PATCH_DESC:-${PATCH_DISP_NAME:-$name}} aplicado (${PATCH_SYMBOLS[0]:-símbolos nuevos}) sobre fuentes $VERSION."
@@ -6069,6 +6104,8 @@ config_symbol_state() {
 # símbolo aparezca previamente en .config; Kconfig puede materializarlo después
 # de olddefconfig. El resultado se cachea durante la ejecución.
 declare -A KCONFIG_SYMBOL_KNOWN=()
+declare -A KCONFIG_SYMBOL_TYPE=()
+KCONFIG_TYPE_INDEX_BUILT=false
 KCONFIG_SYMBOL_INDEX_BUILT=false
 
 build_kconfig_symbol_index() {
@@ -6100,6 +6137,158 @@ kconfig_symbol_known() {
   local sym="$1"
   build_kconfig_symbol_index
   [ -n "${KCONFIG_SYMBOL_KNOWN[$sym]:-}" ]
+}
+
+# v27.31.28: el índice se cachea una sola vez por proceso, así que un parche que
+# añade símbolos Kconfig (BORE mete config SCHED_BORE en init/Kconfig y config
+# MIN_BASE_SLICE_NS en kernel/Kconfig.hz) llegaba al validador con el índice del
+# árbol SIN parchear. Resultado: "ENABLE: CONFIG_SCHED_BORE no existe en esta
+# versión" para un símbolo que existe, y un "--rename" que no arreglaba nada.
+# Cualquier cambio en el árbol tiene que tirar el índice.
+kconfig_index_invalidate() {
+  KCONFIG_SYMBOL_KNOWN=()
+  KCONFIG_TYPE_INDEX_BUILT=false
+  KCONFIG_SYMBOL_INDEX_BUILT=false
+}
+
+# Tipo Kconfig de un símbolo: bool | tristate | int | hex | string (vacío = bool,
+# que es el tipo por defecto de Kconfig si el bloque no lo declara).
+# v27.31.28: hace falta porque PATCH_SYMBOLS asumía que todo era booleano y
+# forzaba a "=y" símbolos que no lo son. MIN_BASE_SLICE_NS es `int` (lo declara
+# el parche BORE en kernel/Kconfig.hz): scripts/config le ponía CONFIG_...=y,
+# olddefconfig lo devolvía a su default y la validación se quedaba en 37/38
+# para siempre, sin decir de qué símbolo se trataba.
+build_kconfig_type_index() {
+  [ "$KCONFIG_TYPE_INDEX_BUILT" = true ] && return 0
+  local pair sym tipo
+  while read -r sym tipo; do
+    [ -n "$sym" ] || continue
+    KCONFIG_SYMBOL_TYPE["$sym"]="$tipo"
+  done < <(
+    find "$SRC" \( -name 'Kconfig' -o -name 'Kconfig.*' \) -print0 2>/dev/null |
+      xargs -0 -r cat 2>/dev/null |
+      awk '
+        /^[[:space:]]*(menuconfig|config)[[:space:]]+[A-Za-z0-9_]+/ {
+          if (sym != "") print sym, tipo
+          sym = $2; tipo = ""; next
+        }
+        sym != "" && tipo == "" &&
+          match($0, /^[[:space:]]*(bool|tristate|int|hex|string|def_bool|def_tristate|def_int|def_hex|def_string)([[:space:]]|$)/) {
+          tipo = substr($0, RSTART, RLENGTH); gsub(/[[:space:]]/, "", tipo); sub(/^def_/, "", tipo)
+        }
+        END { if (sym != "") print sym, tipo }
+      ' 2>/dev/null | sort -u || true
+  )
+  KCONFIG_TYPE_INDEX_BUILT=true
+}
+
+kconfig_symbol_type() { # vacío = bool (el tipo por defecto de Kconfig)
+  build_kconfig_type_index
+  printf '%s' "${KCONFIG_SYMBOL_TYPE[$1]:-}"
+}
+
+# v27.31.28: renombrado automático. Busca el símbolo más parecido entre los que
+# SÍ existen en el Kconfig de esta versión y lo devuelve SOLO si hay un
+# candidato único y claramente mejor que el segundo. Con dos candidatos
+#empatados no se inventa nada: es mejor pedir confirmación que activar el
+#símbolo equivocado en un kernel que se está a punto de arrancar.
+kconfig_auto_candidate() { # $1 = símbolo desconocido
+  local sym="$1" best="" second=0 best_score=0 tie=0
+  local s c i n cp score suffix
+  build_kconfig_symbol_index
+  [ "${#KCONFIG_SYMBOL_KNOWN[@]}" -gt 0 ] || return 0
+  s="${sym#CONFIG_}"
+  n=${#s}
+  for c in "${!KCONFIG_SYMBOL_KNOWN[@]}"; do
+    c="${c#CONFIG_}"
+    # Filtro barato: un renombrado conserva el principio o el final.
+    if [ "${c:0:3}" != "${s:0:3}" ] && [ "${c: -4}" != "${s: -4}" ]; then
+      continue
+    fi
+    cp=0
+    i=0
+    while [ "$i" -lt "$n" ] && [ "$i" -lt "${#c}" ] && [ "${s:$i:1}" = "${c:$i:1}" ]; do
+      cp=$((cp + 1)); i=$((i + 1))
+    done
+    suffix=0
+    while [ "$suffix" -lt "$n" ] && [ "$suffix" -lt "${#c}" ] \
+       && [ "${s:$((n - suffix - 1)):1}" = "${c:$(( ${#c} - suffix - 1 )):1}" ]; do
+      suffix=$((suffix + 1))
+    done
+    # Un parecido solo cuenta si comparten un trozo reconocible: 5 al principio
+    # o 6 al final (p. ej. FOO_BAR -> FOO_BAR_NEW / FOO -> NEW_FOO).
+    if [ "$cp" -lt 5 ] && [ "$suffix" -lt 6 ]; then
+      continue
+    fi
+    score=$((cp + suffix))
+    if [ "$score" -gt "$best_score" ]; then
+      second=$best_score; best_score=$score; best="$c"; tie=0
+    elif [ "$score" -eq "$best_score" ] && [ -n "$best" ]; then
+      tie=1
+    elif [ "$score" -gt "$second" ]; then
+      second=$score
+    fi
+  done
+  if [ -n "$best" ] && [ "$tie" = 0 ] && [ "$best_score" -gt "$second" ]; then
+    printf '%s' "$best"
+  fi
+  return 0
+}
+
+# Resuelve automáticamente los símbolos de las listas efectivas que no existen en
+# el Kconfig de esta versión. Se aplica a todas (ENABLE/DISABLE/CRITICAL/SETVAL/
+# SETSTR) porque un renombrado no distingue: si el perfil pide FOO y aquí se llama
+# BAR, hay que renombrarlo en todas partes. Lo que se resuelve queda anotado en
+# APPLIED_RENAMES y se informa; con --save-auto-renames se persiste en el mapa.
+auto_resolve_effective_symbols() {
+  local o cand
+  local -a nn=()
+  local any=false
+  [ -d "$SRC" ] || return 0
+  build_kconfig_symbol_index
+  for o in "${EFF_ENABLE[@]}" "${EFF_DISABLE[@]}" "${EFF_CRITICAL[@]}" \
+           "${!EFF_SETVAL[@]}" "${!EFF_SETSTR[@]}"; do
+    [ -n "$o" ] || continue
+    if kconfig_symbol_known "$o"; then
+      nn+=("$o"); continue
+    fi
+    cand="$(kconfig_auto_candidate "$o")"
+    if [ -n "$cand" ]; then
+      nn+=("$cand")
+      APPLIED_RENAMES["$o"]="$cand"
+      AUTO_RENAMES["$o"]="$cand"
+      any=true
+    else
+      nn+=("$o")
+    fi
+  done
+  # Se reconstruyen las listas limpias, sin duplicados y con el orden original.
+  if [ "$any" = true ]; then
+    local -A seen=()
+    local -a e=() d=() c=() sv=() ss=()
+    for o in "${EFF_ENABLE[@]}"; do
+      cand="${APPLIED_RENAMES[$o]:-$o}"; [ -n "${seen[e$cand]:-}" ] || { seen[e$cand]=1; e+=("$cand"); }
+    done
+    for o in "${EFF_DISABLE[@]}"; do
+      cand="${APPLIED_RENAMES[$o]:-$o}"; [ -n "${seen[d$cand]:-}" ] || { seen[d$cand]=1; d+=("$cand"); }
+    done
+    for o in "${EFF_CRITICAL[@]}"; do
+      cand="${APPLIED_RENAMES[$o]:-$o}"; [ -n "${seen[c$cand]:-}" ] || { seen[c$cand]=1; c+=("$cand"); }
+    done
+    local -A seen2=()
+    for o in "${!EFF_SETVAL[@]}"; do
+      cand="${APPLIED_RENAMES[$o]:-$o}"; [ -n "${seen2[$cand]:-}" ] || { seen2[$cand]=1; sv+=("$cand=$>${EFF_SETVAL[$o]}"); }
+    done
+    seen2=()
+    for o in "${!EFF_SETSTR[@]}"; do
+      cand="${APPLIED_RENAMES[$o]:-$o}"; [ -n "${seen2[$cand]:-}" ] || { seen2[$cand]=1; ss+=("$cand=$>${EFF_SETSTR[$o]}"); }
+    done
+    EFF_ENABLE=("${e[@]}"); EFF_DISABLE=("${d[@]}"); EFF_CRITICAL=("${c[@]}")
+    EFF_SETVAL=(); EFF_SETSTR=()
+    local x
+    for x in "${sv[@]}"; do EFF_SETVAL["${x%%=*>}"]="${x#*=>}"; done
+    for x in "${ss[@]}"; do EFF_SETSTR["${x%%=*>}"]="${x#*=>}"; done
+  fi
 }
 
 # ============================================================
@@ -6294,6 +6483,11 @@ apply_config_requests() {
   local o rc=0
   local -a args=()
 
+  # Antes de tocar nada: si el perfil pide un símbolo que esta versión llama de
+  # otra forma, se resuelve solo (cuando el candidato es único) y se avisa de lo
+  # que se renombró, en vez de saltar el símbolo y dejar la validación cojea.
+  auto_resolve_effective_symbols
+
   if [ "${PROFILE_CHANGED:-false}" = true ]; then
     log "Preparando ${#EFF_ENABLE[@]} activaciones, ${#EFF_DISABLE[@]} desactivaciones, ${#EFF_SETVAL[@]} valores numéricos y ${#EFF_SETSTR[@]} valores de texto..."
   else
@@ -6304,7 +6498,8 @@ apply_config_requests() {
     if kconfig_symbol_known "$o"; then
       args+=(--enable "$o")
     else
-      warn "ENABLE: CONFIG_$o no existe en esta versión; si Kconfig lo renombró, regístralo con: $0 --rename $o=NUEVO_NOMBRE"
+      warn "ENABLE: CONFIG_$o no existe en esta versión ni tiene un renombrado inequívoco en su Kconfig; se omite."
+      warn "       (si ya sabes cómo se llama aquí: $0 --rename $o=OTRO_NOMBRE)"
     fi
   done
 
@@ -6499,6 +6694,15 @@ validate_config() {
     ok "[DISABLE]  $disable_ok/${#EFF_DISABLE[@]} desactivaciones resueltas ($expected_rebels rebeldes esperados)"
     ok "[SETVAL]   $setval_ok/${#EFF_SETVAL[@]} valores numéricos"
     ok "[SETSTR]   $setstr_ok/${#EFF_SETSTR[@]} valores de texto"
+    # v27.31.28: "37/38 activaciones satisfechas" sin decir cuál era una de las
+    # cosas que más costó depurar: ahora los que faltan se nombran uno a uno.
+    if [ "${#ENABLE_FAIL[@]}" -gt 0 ]; then
+      warn "[ENABLE]   ${#ENABLE_FAIL[@]} activación(es) sin satisfacer:"
+      for x in "${ENABLE_FAIL[@]}"; do warn "              $x"; done
+    fi
+    if [ "${#PATCH_VALUE_SYMBOLS[@]:-}" -gt 0 ]; then
+      info "Símbolos de valor que aportan los parches (no booleanos: se deja su default, no se fuerzan a =y): ${PATCH_VALUE_SYMBOLS[*]}"
+    fi
   else
     err "Se detectaron $fatal_count fallos FATALES en la configuración."
     for x in "${CRIT_FAIL[@]}"; do err "  [CRÍTICO] $x"; done
@@ -6522,6 +6726,21 @@ validate_config() {
   if [ "${#PATCH_RETIRED_ALL[@]}" -gt 0 ]; then
     info "Símbolos retirados por el scheduler alternativo activo (dependen de !SCHED_ALT; los pidió el perfil pero este kernel no puede habilitarlos):"
     for x in "${PATCH_RETIRED_ALL[@]:-}"; do info "    $x"; done
+  fi
+
+  if [ "${#AUTO_RENAMES[@]}" -gt 0 ]; then
+    ok "Renombres detectados y aplicados por similarities en el Kconfig de $VERSION:"
+    while IFS= read -r opt; do
+      printf '    %s → %s\n' "$opt" "${AUTO_RENAMES[$opt]}"
+    done < <(printf '%s\n' "${!AUTO_RENAMES[@]}" | sort)
+    if [ "$SAVE_AUTO_RENAMES" = true ]; then
+      for opt in "${!AUTO_RENAMES[@]}"; do
+        do_rename "$opt=${AUTO_RENAMES[$opt]}" >/dev/null
+      done
+      ok "Renombres guardados en $RENAME_MAP_FILE (--save-auto-renames)."
+    else
+      info "Solo duran esta ejecución: pasa --save-auto-renames (o añade $0 --rename VIEJO=NUEVO) si quieres recordarlos."
+    fi
   fi
 
   if [ "${#APPLIED_RENAMES[@]}" -gt 0 ]; then
@@ -9033,6 +9252,11 @@ choose_build_variant_after_check() {
 
   if [ "${#PATCH_NAMES[@]}" -gt 0 ]; then
     log "Variante ya solicitada explícitamente (${PATCH_NAMES[*]}); se omite la pregunta."
+    return 0
+  fi
+
+  if [ "$NO_ASK_VARIANT" = true ]; then
+    log "Variante ya elegida por quien invoca el motor (--no-ask-variant); se omite la pregunta."
     return 0
   fi
 

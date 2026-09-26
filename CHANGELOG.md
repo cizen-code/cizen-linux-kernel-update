@@ -1,3 +1,69 @@
+## [27.31.28] - 2026-09-26
+
+La variante se pregunta antes que el compilador, y los símbolos Kconfig se
+resuelven solos (con el tipo correcto y diciendo qué símbolo falla).
+
+**1) Variante antes que compilador.** Elegías la opción, preguntaba el
+compilador, y la variante se preguntaba **al final**: después de descargar
+(600 MB), verificar firmas y validar la config. Nueve minutos tarde, con la
+decisión ya tomada sobre un tarball que igual no servía. Ahora las dos preguntas
+van juntas y en ese orden, y el motor recibe `--no-ask-variant` para no
+preguntar dos veces:
+
+```
+  Variante (Enter usa el default):
+    1  Vanilla (EEVDF)      4  BMQ (prjc)
+    2  BORE                 5  LFBMQ (prjc)
+    3  PDS (prjc)           6  MuQSS
+  Variante [Enter=1]: 2
+  CC [Enter=auto]: clang
+```
+
+De paso, el motor sabe la variante desde el primer segundo, así que una variante
+de solo-fork se detecta **antes** de gastar la descarga. La oferta de la última
+release del CachyOS, que antes solo vivía en la opción 14, se reutiliza en
+todas las de build.
+
+**2) Símbolos Kconfig: se acaba el "no existe en esta versión" falso.** El
+índice de símbolos se cacheaba una sola vez por proceso, **antes** de aplicar el
+parche BORE. Al validar, el motor decía:
+
+```
+WARN: ENABLE: CONFIG_SCHED_BORE no existe en esta versión; si Kconfig lo
+      renombró, regístralo con: kernel-update.sh --rename SCHED_BORE=NUEVO_NOMBRE
+[ENABLE] 37/38 activaciones satisfechas
+```
+
+Un símbolo que el propio parche acababa de añadir en `init/Kconfig`, con un
+`--rename` que no arreglaba nada (no era un renombre: era caché). Y el `37/38`
+sin decir cuál. Tres arreglos:
+
+- **El índice se tira cuando un parche toca el árbol**, así que ve lo que el
+  parche introduce.
+- **Los tipos se respetan.** `PATCH_SYMBOLS` asumía que todo era booleano y
+  ponía `=y` a lo que no lo era. `MIN_BASE_SLICE_NS` es un `int` (lo declara BORE
+  en `kernel/Kconfig.hz`): un `=y` no es un valor válido, `olddefconfig` lo
+  devuelve a su default y el `37/38` se quedaba ahí para siempre. Los no
+  booleanos van ahora a su propia lista y se deja su default.
+- **Renombrado automático.** Si un símbolo no existe en esta versión, se busca
+  el más parecido entre los 21.718 que sí existen, y se aplica **solo** si hay
+  un candidato único y claramente mejor que el segundo. Con empate no se inventa
+  nada: es preferible preguntar a activar el símbolo equivocado en un kernel que
+  se va a arrancar. `--save-auto-renames` los deja escritos para el siguiente.
+
+```
+INFO: Renombres detectados y aplicados por similitud en el Kconfig de 7.2.8:
+        PREEMPT_DYNAMIC_KSYMS → PREEMPT_RT
+```
+
+Y el resumen de validación nombra lo que falta, en vez de solo contarlo:
+
+```
+[ENABLE]   37/38 activaciones satisfechas
+WARN: [ENABLE] 1 activación(es) sin satisfacer:
+              CONFIG_MIN_BASE_SLICE_NS no existe
+```
+
 ## [27.31.27] - 2026-09-25
 
 Si sudo rechaza la contraseña, el motor lo dice y qué hacer con ello, en vez de

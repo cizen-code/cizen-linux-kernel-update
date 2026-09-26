@@ -68,10 +68,18 @@ Ahora el motor copia a `$ROLLBACK_DIR` el **paquete que acaba de instalar** (y
 solo ese: "actual + previo"), junto a un manifiesto `rollback.info` con
 pkgbase, pkgver, release y scheduler:
 
-Todas las opciones que compilan (1, 2, 3, 4, 5, 7, 8, 14, 15, 16) preguntan el
-compilador antes de arrancar:
+Todas las opciones que compilan (1, 2, 3, 4, 5, 7, 8, 14, 15, 16) preguntan la
+**variante** y después el **compilador**, antes de arrancar (desde v27.31.28; antes
+el compilador se preguntaba al principio pero la variante al final, después de
+descargar y validar):
 
 ```
+  Variante (Enter usa el default):
+    1  Vanilla (EEVDF)      4  BMQ (prjc)
+    2  BORE                 5  LFBMQ (prjc)
+    3  PDS (prjc)           6  MuQSS
+  Variante [Enter=1]:
+
   CC (Enter usa el default):
     auto  elige según el sistema (clang si LTO/toolchain LLVM viable; si no gcc) (default)
     gcc   compilador GCC
@@ -79,6 +87,23 @@ compilador antes de arrancar:
     otro  teclea TU compilador (p. ej. gcc-14, clang-17 o una ruta). Se exigirá como dependencia si falta.
   CC [Enter=auto]:
 ```
+
+### Símbolos Kconfig que cambian de nombre
+
+Un perfil pide símbolos por nombre, y el kernel los va renombrando. Desde
+v27.31.28 el motor no se limita a avisar: si un símbolo que pide el perfil no
+existe en la versión que se va a compilar, busca el más parecido entre los ~21.700
+símbolos que sí existen y aplica el renombrado **solo si hay un candidato único**
+(con empate no inventa nada, porque activar el símbolo equivocado en un kernel
+que se va a arrancar es peor que preguntar). Se informa de cada renombrado
+aplicado y con `--save-auto-renames` quedan escritos para el siguiente kernel.
+
+El índice de símbolos se rehace cuando un parche modifica el árbol, así que los
+símbolos que introduce un parche (BORE añade `SCHED_BORE` y `MIN_BASE_SLICE_NS`)
+ya no se dan por inexistentes. Y se respeta el **tipo** de cada símbolo: los no
+booleanos (`int`, `hex`, `string`) se dejan en su valor por defecto en vez de
+forzarlos a `=y`, que es un valor que `olddefconfig` revierte. El resumen de
+validación nombra los símbolos que no quedan satisfechos, no solo los cuenta.
 
 ### Privilegios y sudo
 
@@ -163,6 +188,7 @@ vuelve al comportamiento anterior (solo archive de ficheros).
 | force | `kernel-update.sh --force` | Recompila forzando |
 | check-update | `kernel-update.sh --check-update` | Consulta la release estable sin modificar nada |
 | list-renames | `kernel-update.sh --list-renames` | Muestra el mapa de renombres de config |
+| save-auto-renames | `kernel-update.sh --save-auto-renames` | Guarda en ese mapa los renombres que el motor detectó solo (v27.31.28). Sin este flag solo valen para esa ejecución |
 | absorb-rebels | `kernel-update.sh <ver> --absorb-rebels` | Mueve a `EXPECTED_REBELS` los símbolos que Kconfig conserva por dependencias, dejando el perfil limpio. Desde v27.25.1 el propio check lo ofrece interactivamente antes de compilar (si la auditoría reporta que Kconfig conserva desactivaciones), sin necesidad del flag |
 | no-prune | `kernel-update.sh <ver> --no-prune` | Desactiva la poda de módulos (default: activada) |
 | sign | `kernel-update.sh <ver> --sign` | Firma la UKI con sbctl (Secure Boot); recomendable antes de activar SB en la BIOS |

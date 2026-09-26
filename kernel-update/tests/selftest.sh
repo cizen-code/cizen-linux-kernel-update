@@ -1318,7 +1318,7 @@ cachyos-7.2.80-1" fork_tagrel 7.2.8)" ]; then
   # nueva compilando con exec a pelo, este test lo canta.
   faltan=""
   for n in 1 2 3 4 5 7 8 15 16; do
-    grep -qE "^ +$n\) build_and_exec " "$MENU" || faltan="$faltan $n"
+    grep -qE "^ +$n\) build_and_exec (baja|alta) (ask|bore|none) " "$MENU" || faltan="$faltan $n"
   done
   if [ -z "$faltan" ]; then
     rec ok "menú: las 9 opciones que compilan (1,2,3,4,5,7,8,15,16) pasan por build_and_exec (preguntan CC)"
@@ -1336,7 +1336,11 @@ cachyos-7.2.80-1" fork_tagrel 7.2.8)" ]; then
   # ask_cc escribe el submenú en stderr y lo tecleado en stdout: así la pregunta
   # se ve en la terminal y aun así se puede capturar con $( ). build_and_exec
   # solo añade --cc si se tecleó algo, porque el default del motor ya es auto.
-  sed -n '/^ask_cc() {/,/^}/p; /^build_and_exec() {/,/^}/p' "$MENU" > "$ROOT/ccfn.sh"
+  : > "$ROOT/ccfn.sh"
+  sed -n '/^ask_cc() {/,/^}/p'        "$MENU" >> "$ROOT/ccfn.sh"
+  sed -n '/^ask_variant() {/,/^}/p'    "$MENU" >> "$ROOT/ccfn.sh"
+  sed -n '/^fork_fallback_for() {/,/^}/p' "$MENU" >> "$ROOT/ccfn.sh"
+  sed -n '/^build_and_exec() {/,/^}/p' "$MENU" >> "$ROOT/ccfn.sh"
   cat > "$ROOT/fake-engine.sh" <<'FAKE'
 #!/bin/bash
 printf 'ARGS:'; printf ' <%s>' "$@"; printf ' PRIO=%s\n' "${CIZEN_BUILD_PRIORITY:-unset}"
@@ -1344,36 +1348,202 @@ FAKE
   chmod +x "$ROOT/fake-engine.sh"
   cat > "$ROOT/cc-run.sh" <<RUNNER
 W=''; G=''; Y=''; N=''
+FORK_MISSING=0; FORK_FALLBACK=''; REMOTE=''
 # shellcheck disable=SC1090
 source "$ROOT/ccfn.sh"
 SCRIPT="$ROOT/fake-engine.sh"
 build_and_exec "\$@"
 RUNNER
-  out_clang="$(printf 'clang\n' | bash "$ROOT/cc-run.sh" baja --absorb-rebels 2>/dev/null)"
-  out_empty="$(printf '\n' | bash "$ROOT/cc-run.sh" baja --absorb-rebels 2>/dev/null)"
-  out_alta="$(printf 'gcc-14\n' | bash "$ROOT/cc-run.sh" alta --absorb-rebels 2>/dev/null)"
-  if [ "$out_clang" = "ARGS: <--absorb-rebels> <--cc> <clang> PRIO=unset" ]; then
+  out_clang="$(printf 'clang\n' | bash "$ROOT/cc-run.sh" baja none --absorb-rebels 2>/dev/null)"
+  out_empty="$(printf '\n' | bash "$ROOT/cc-run.sh" baja none --absorb-rebels 2>/dev/null)"
+  out_alta="$(printf 'gcc-14\n' | bash "$ROOT/cc-run.sh" alta none --absorb-rebels 2>/dev/null)"
+  if [ "$out_clang" = "ARGS: <--absorb-rebels> <--no-ask-variant> <--cc> <clang> PRIO=unset" ]; then
     rec ok "menú: elegir clang en el submenú llega al motor como --cc clang"
   else
     rec fail "menú: --cc mal pasado al motor ('$out_clang')"
   fi
-  if [ "$out_empty" = "ARGS: <--absorb-rebels> PRIO=unset" ]; then
+  if [ "$out_empty" = "ARGS: <--absorb-rebels> <--no-ask-variant> PRIO=unset" ]; then
     rec ok "menú: Enter en el submenú no añade --cc (el default del motor ya es auto)"
   else
     rec fail "menú: Enter añadió un argumento de más ('$out_empty')"
   fi
-  if [ "$out_alta" = "ARGS: <--absorb-rebels> <--cc> <gcc-14> PRIO=normal" ]; then
+  if [ "$out_alta" = "ARGS: <--absorb-rebels> <--no-ask-variant> <--cc> <gcc-14> PRIO=normal" ]; then
     rec ok "menú: un compilador tecleado a mano (gcc-14) y la prioridad «alta» llegan ambos al motor"
   else
     rec fail "menú: CC tecleado o prioridad mal pasados ('$out_alta')"
   fi
   # Si el submenú fuera a stdout desaparecería dentro del $(), es decir el
   # usuario no vería la pregunta. Por eso va a stderr.
-  if printf 'gcc\n' | bash "$ROOT/cc-run.sh" baja 2>&1 >/dev/null | grep -q 'CC (Enter usa el default)'; then
+  if printf 'gcc\n' | bash "$ROOT/cc-run.sh" baja none 2>&1 >/dev/null | grep -q 'CC (Enter usa el default)'; then
     rec ok "menú: el submenú de CC se ve en la terminal (va a stderr, no se pierde en el $)"
   else
     rec fail "menú: el submenú de CC no se ve (si fuera a stdout se perdería en el \$)"
   fi
+  # ── El orden de las preguntas: variante antes que compilador ──
+  # La variante se preguntaba en el MOTOR, después de descargar, verificar
+  # firmas y validar la config: nueve minutos tarde y con el compilador ya
+  # preguntado. Ahora las dos van juntas y en ese orden, y el motor recibe
+  # --no-ask-variant para no volver a preguntar al final.
+  out_orden="$(printf '2\nclang\n' | bash "$ROOT/cc-run.sh" baja ask --absorb-rebels 2>&1)"
+  if [ "$(printf '%s\n' "$out_orden" | grep -n 'Variante (Enter usa el default)' | cut -d: -f1)" -lt \
+     "$(printf '%s\n' "$out_orden" | grep -n 'CC (Enter usa el default)' | cut -d: -f1)" ]; then
+    rec ok "menú: la variante se pregunta antes que el compilador"
+  else
+    rec fail "menú: el orden es compilador→variante, que es justo lo que se pidió cambiar ('$out_orden')"
+  fi
+  out_bore="$(printf '2\n' | bash "$ROOT/cc-run.sh" baja ask --absorb-rebels 2>/dev/null)"
+  if [ "$out_bore" = "ARGS: <--absorb-rebels> <--patch> <bore> <--no-ask-variant> PRIO=unset" ]; then
+    rec ok "menú: la variante elegida llega al motor como --patch y con --no-ask-variant"
+  else
+    rec fail "menú: la variante no llega bien al motor ('$out_bore')"
+  fi
+  out_vanilla="$(printf '1\ngcc\n' | bash "$ROOT/cc-run.sh" baja ask --absorb-rebels 2>/dev/null)"
+  if [ "$out_vanilla" = "ARGS: <--absorb-rebels> <--no-ask-variant> <--cc> <gcc> PRIO=unset" ]; then
+    rec ok "menú: Vanilla no añade --patch pero tampoco deja que el motor pregunte al final"
+  else
+    rec fail "menú: Vanilla no se pasa bien ('$out_vanilla')"
+  fi
+  # bore ya viene impuesto por la opción (7/8): no se pregunta, pero se pasa.
+  out_impl="$(printf 'clang\n' | bash "$ROOT/cc-run.sh" baja bore --absorb-rebels 2>/dev/null)"
+  if [ "$out_impl" = "ARGS: <--absorb-rebels> <--patch> <bore> <--no-ask-variant> <--cc> <clang> PRIO=unset" ] &&
+     ! printf 'clang\n' | bash "$ROOT/cc-run.sh" baja bore --absorb-rebels 2>&1 | grep -q 'Variante (Enter'; then
+    rec ok "menú: la opción que ya impone bore no pregunta la variante (solo el compilador)"
+  else
+    rec fail "menú: la variante impuesta se pregunta igualmente o no se pasa ('$out_impl')"
+  fi
+  # El motor tiene que respetar el flag, o el menú preguntaría dos veces.
+  if grep -q 'NO_ASK_VARIANT' "$MOTOR" &&
+     grep -q 'Variante ya elegida por quien invoca el motor' "$MOTOR"; then
+    rec ok "sudo/motor: --no-ask-variant evita la pregunta duplicada de la variante"
+  else
+    rec fail "motor: --no-ask-variant no está respetado en choose_build_variant_after_check"
+  fi
+  # El fallback del fork (ofrecer la última release del CachyOS) ahora también
+  # aplica a las opciones que no son la 14, no solo a variant.
+  if [ "$(grep -c 'fork_fallback_for' "$MENU")" -ge 3 ]; then
+    rec ok "menú: el fallback del fork se usa en la 14 y en las opciones de build con variante"
+  else
+    rec fail "menú: el fallback del fork sigue siendo exclusivo de la 14"
+  fi
+
+  # ── Kconfig: el índice no sobrevive a un parche, y los tipos se respetan ──
+  # El bug que motivó esto: el índice de símbolos se cacheaba una sola vez por
+  # proceso, ANTES de aplicar el parche BORE. Al validar, el motor decía
+  # "CONFIG_SCHED_BORE no existe en esta versión" para un símbolo que el propio
+  # parche acababa de añadir en init/Kconfig, y proponía un --rename que no
+  # arreglaba nada (era cache, no renombre).
+  mkdir -p "$ROOT/src/init" "$ROOT/src/kernel"
+  cat > "$ROOT/src/init/Kconfig" <<'KCFG'
+config SCHED_BORE
+	bool "Enable BORE"
+	default y
+config FOO_BAR_A
+	bool
+config FOO_BAR_B
+	bool
+KCFG
+  cat > "$ROOT/src/kernel/Kconfig.hz" <<'KCFG'
+config HZ
+	int "Default HZ"
+	default 250
+config MIN_BASE_SLICE_NS
+	int "Minimal time slice"
+	default 2000000
+KCFG
+  cat > "$ROOT/kfn.sh" <<'EXTRACT'
+SRC="$ROOT/src"
+build_kconfig_symbol_index() { :
+}
+EXTRACT
+  : > "$ROOT/kfn.sh"
+  for f in kconfig_index_invalidate build_kconfig_symbol_index build_kconfig_type_index \
+           kconfig_symbol_type kconfig_symbol_known kconfig_auto_candidate; do
+    sed -n "/^$f() {/,/^}/p" "$MOTOR" >> "$ROOT/kfn.sh"
+  done
+  cat > "$ROOT/kprobe.sh" <<'PROBE'
+set -u
+SRC="$ROOT/src"
+declare -A KCONFIG_SYMBOL_KNOWN=() KCONFIG_SYMBOL_TYPE=()
+KCONFIG_TYPE_INDEX_BUILT=false
+KCONFIG_SYMBOL_INDEX_BUILT=false
+# shellcheck disable=SC1090
+source "$ROOT/kfn.sh"
+build_kconfig_symbol_index >/dev/null 2>&1
+build_kconfig_type_index  >/dev/null 2>&1
+printf 'TIPOS %s %s %s %s\n' \
+  "$(kconfig_symbol_type SCHED_BORE)" "$(kconfig_symbol_type HZ)" \
+  "$(kconfig_symbol_type MIN_BASE_SLICE_NS)" "$(kconfig_symbol_type FOO_BAR_A)"
+printf 'NUEVO %s\n' "$(kconfig_symbol_known NUEVO_DE_PATCH && echo sí || echo no)"
+printf 'CAND_BORE %s\n' "$(kconfig_auto_candidate SCHED_BORE_MITIGATION)"
+printf 'CAND_NSA %s\n' "$(kconfig_auto_candidate MIN_BASE_SLICE_NZ)"
+printf 'CAND_TIE %s\n' "$(kconfig_auto_candidate FOO_BAR_C)"
+printf 'CAND_FAR %s\n' "$(kconfig_auto_candidate X86_X2APIC_PRESERVE)"
+PROBE
+  if [ -s "$ROOT/kfn.sh" ]; then
+    p1="$(bash "$ROOT/kprobe.sh" 2>&1)"
+    if [ "$(printf '%s\n' "$p1" | grep '^TIPOS ')" = "TIPOS bool int int bool" ]; then
+      rec ok "kconfig: el índice distingue bool de int (un int no se fuerza a =y)"
+    else
+      rec fail "kconfig: tipos mal leídos ('$(printf '%s\n' "$p1" | grep '^TIPOS ')', esperado 'TIPOS bool int int bool')"
+    fi
+    if [ "$(printf '%s\n' "$p1" | grep '^NUEVO ')" = "NUEVO no" ]; then
+      rec ok "kconfig: un símbolo que aún no está en el árbol se detecta como desconocido"
+    else
+      rec fail "kconfig: símbolo inexistente dado por bueno"
+    fi
+    if [ "$(printf '%s\n' "$p1" | grep '^CAND_BORE ')" = "CAND_BORE SCHED_BORE" ] &&
+       [ "$(printf '%s\n' "$p1" | grep '^CAND_NSA ')" = "CAND_NSA MIN_BASE_SLICE_NS" ]; then
+      rec ok "kconfig: el renombrado automático encuentra el candidato único"
+    else
+      rec fail "kconfig: el renombrado automático no encuentra lo evidente ('$p1')"
+    fi
+    if [ "$(printf '%s\n' "$p1" | grep '^CAND_TIE ')" = "CAND_TIE " ]; then
+      rec ok "kconfig: con dos candidatos parecidos no se inventa ninguno"
+    else
+      rec fail "kconfig: ante un empate se elige un símbolo al azar ('$p1')"
+    fi
+    if [ "$(printf '%s\n' "$p1" | grep '^CAND_FAR ')" = "CAND_FAR " ]; then
+      rec ok "kconfig: un símbolo sin parecido real se omite en vez de renombrar por fuerza"
+    else
+      rec fail "kconfig: renombrado por la fuerza donde no hay parecido ('$p1')"
+    fi
+    # El parche añade un símbolo nuevo: si el índice no se tira, el validador va
+    # a decir que no existe y el build se queda en 37/38 sin explicación.
+    printf 'config NUEVO_DE_PATCH\n\tbool\n' >> "$ROOT/src/init/Kconfig"
+    if [ "$(bash "$ROOT/kprobe.sh" 2>&1 | grep '^NUEVO ')" = "NUEVO sí" ]; then
+      rec ok "kconfig: al invalidar el índice aparece el símbolo que añadió el parche"
+    else
+      rec fail "kconfig: el índice sobrevive al parche (bug del 37/38)"
+    fi
+  else
+    rec fail "kconfig: no se pudieron extraer las funciones del índice del motor"
+  fi
+  if grep -q 'kconfig_index_invalidate' "$MOTOR" &&
+     awk '/^  if ! patch -p1 -d "\$SRC"/,/^  apply_patch_register "\$name"/' "$MOTOR" |
+       grep -q 'kconfig_index_invalidate'; then
+    rec ok "kconfig: aplicar un parche tira el índice antes de registrar sus símbolos"
+  else
+    rec fail "kconfig: el parche no invalida el índice (el símbolo recién añadido saldría como inexistente)"
+  fi
+  if grep -q 'bool|tristate|"")' "$MOTOR" &&
+     grep -q 'PATCH_VALUE_SYMBOLS+=' "$MOTOR"; then
+    rec ok "kconfig: los símbolos no booleanos de un parche van a su propia lista, no a =y"
+  else
+    rec fail "kconfig: apply_patch_register sigue forzando a =y símbolos que no son booleanos"
+  fi
+  if grep -q 'activación(es) sin satisfacer' "$MOTOR" &&
+     grep -q 'ENABLE_FAIL\[@\]}' "$MOTOR"; then
+    rec ok "kconfig: el resumen de validación nombra los símbolos que faltan"
+  else
+    rec fail "kconfig: la validación sigue diciendo 37/38 sin decir de qué símbolo"
+  fi
+  if grep -q 'auto_resolve_effective_symbols' "$MOTOR" &&
+     grep -q 'save-auto-renames' "$MOTOR"; then
+    rec ok "kconfig: los renombres automáticos se aplican y se pueden guardar con --save-auto-renames"
+  else
+    rec fail "kconfig: los renombres automáticos no se aplican ni se pueden persistir"
+  fi
+
   # ── sudo: fallar pronto y con explicación, no con una línea de código ──
   # Un `sudo -v` pelado que falla aborta con el ERR trap ("Error 1 en línea
   # 8614: sudo -v"), que no dice por qué ni qué hacer; y como el ticket caduca a

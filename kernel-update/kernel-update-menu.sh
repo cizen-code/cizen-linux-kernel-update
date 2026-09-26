@@ -224,17 +224,79 @@ ask_cc() {
   printf '%s' "$cc"
 }
 
-# Lanza un build preguntando antes el compilador.
-#   $1 = prioridad (baja|alta)   $2.. = argumentos del motor
-# El default del motor ya es "auto", así que Enter (vacío) no añade nada; lo que
-# se teclee se pasa tal cual, y el motor resuelve auto/gcc/clang/gcc-14/... .
+# ── Elección de variante (scheduler del proyecto) ──
+# v27.31.28: esto vivía en el motor, que lo preguntaba DESPUÉS de descargar,
+# verificar firmas y validar la config: nueve minutos después de elegir la
+# opción, y con el compilador ya preguntado al principio. Preguntar las dos
+# cosas juntas y en este orden (variante → compilador) es lo que se pidió, y de
+# paso el motor sabe la variante desde el primer segundo: un check valida lo que
+# se va a compilar y una variante de solo-fork se detecta antes de gastar la
+# descarga, en vez de abortar a mitad.
+# Igual que ask_cc: el submenú a stderr, la elección a stdout.
+ask_variant() {
+  local v
+  printf '\n  %bVariante%b (Enter usa el default):\n' "$W" "$N" >&2
+  printf '    %b1%b  Vanilla (EEVDF)\n' "$W" "$N" >&2
+  printf '    %b2%b  BORE\n' "$W" "$N" >&2
+  printf '    %b3%b  PDS (prjc)\n' "$W" "$N" >&2
+  printf '    %b4%b  BMQ (prjc)\n' "$W" "$N" >&2
+  printf '    %b5%b  LFBMQ (prjc)\n' "$W" "$N" >&2
+  printf '    %b6%b  MuQSS\n' "$W" "$N" >&2
+  printf '  %bVariante%b [Enter=%b1%b]: ' "$W" "$N" "$Y" "$N" >&2
+  read -r v
+  case "${v:-1}" in
+    1|vanilla|Vanilla|v|V|eevdf|EEVDF) printf 'eevdf' ;;
+    2|bore|Bore|b|B)                 printf 'bore' ;;
+    3|pds|PDS|p|P)                   printf 'pds' ;;
+    4|bmq|BMQ|q|Q)                   printf 'bmq' ;;
+    5|lfbmq|LFBMQ|l|L)               printf 'lfbmq' ;;
+    6|muqss|Muqss|MUQSS|m|M)         printf 'muqss' ;;
+    *) printf 'eevdf' ;;
+  esac
+}
+
+# Si la variante solo existe en el fork CachyOS y la versión pedida no está
+# publicada allí, ofrece la última del fork en lugar de dejar que el build aborte
+# a mitad. Imprime por stdout la versión a usar (vacía = la que ya pedía).
+fork_fallback_for() { # $1=variante
+  local v="$1" ans
+  case "$v" in pds|bmq|lfbmq|muqss) ;; *) return 0 ;; esac
+  if [ "$FORK_MISSING" != 1 ] || [ -z "$FORK_FALLBACK" ] \
+     || [ "$FORK_FALLBACK" = "$REMOTE" ] || [ ! -t 0 ]; then
+    return 0
+  fi
+  printf '\n  %bEl fork CachyOS no tiene %s; su última release es %s.%b\n' \
+    "$Y" "$REMOTE" "$FORK_FALLBACK" "$N" >&2
+  printf '  ¿Compilar %s en su lugar? [S/n]: ' "$FORK_FALLBACK" >&2
+  read -r ans
+  case "${ans:-S}" in
+    [SsYy]*) printf '%s' "$FORK_FALLBACK" ;;
+  esac
+}
+
+# Lanza un build preguntando antes la variante y luego el compilador, en ese orden.
+#   $1 = prioridad (baja|alta)
+#   $2 = variante: ask (preguntar) | bore (ya la impone la opción) | none
+#   $3.. = argumentos del motor
+# El default del motor para el compilador ya es "auto", así que Enter (vacío) no
+# añade nada; lo tecleado se pasa tal cual y el motor resuelve auto/gcc/clang/...
 build_and_exec() {
-  local prio="$1"; shift
-  local cc
+  local prio="$1" vmode="$2"; shift 2
+  local version="" patch_arg="" cc v
+  case "$vmode" in
+    ask)
+      v="$(ask_variant)"
+      [ "$v" = eevdf ] || patch_arg="$v"
+      version="$(fork_fallback_for "$v")"
+      ;;
+    bore) patch_arg="bore" ;;
+  esac
   cc="$(ask_cc)"
-  [ "$prio" = "alta" ] && export CIZEN_BUILD_PRIORITY=normal
+  [ "$prio" = alta ] && export CIZEN_BUILD_PRIORITY=normal
   # shellcheck disable=SC2086
-  exec "$SCRIPT" "$@" ${cc:+--cc "$cc"}
+  set -- ${version:+"$version"} "$@" ${patch_arg:+--patch "$patch_arg"} \
+    --no-ask-variant ${cc:+--cc "$cc"}
+  exec "$SCRIPT" "$@"
 }
 
 echo "  ${W}Validación${N}"
@@ -270,14 +332,14 @@ rule
 while true; do
   read -r -p "${W}  [0-17] > ${N}" choice
   case "$choice" in
-    1) build_and_exec baja --absorb-rebels --check ;;
-    2) build_and_exec alta --absorb-rebels --check ;;
-    3) build_and_exec baja --absorb-rebels ;;
-    4) build_and_exec alta --absorb-rebels ;;
-    5) build_and_exec baja --force ;;
+    1) build_and_exec baja ask --absorb-rebels --check ;;
+    2) build_and_exec alta ask --absorb-rebels --check ;;
+    3) build_and_exec baja ask --absorb-rebels ;;
+    4) build_and_exec alta ask --absorb-rebels ;;
+    5) build_and_exec baja ask --force ;;
     6) exec "$SCRIPT" --check-update ;;
-    7) build_and_exec baja --absorb-rebels --patch bore ;;
-    8) build_and_exec alta --absorb-rebels --patch bore ;;
+    7) build_and_exec baja bore --absorb-rebels ;;
+    8) build_and_exec alta bore --absorb-rebels ;;
     9) if [ -x "$ROLLBACK_SCRIPT" ]; then
          exec "$ROLLBACK_SCRIPT"
        else
@@ -313,31 +375,25 @@ while true; do
        # no está publicada allí, se ofrece la última del fork de esa línea en
        # lugar de dejar que el build aborte. Sin TTY (o sin fallback) se sigue
        # con la versión pedida: el motor explica la causa con claridad.
-       use_version=""
-       case "$sched" in
-         pds|bmq|lfbmq|muqss)
-           if [ "$FORK_MISSING" = 1 ] && [ -n "$FORK_FALLBACK" ] \
-              && [ "$FORK_FALLBACK" != "$REMOTE" ] && [ -t 0 ]; then
-             printf '\n  %bEl fork CachyOS no tiene %s; su última release es %s.%b\n' \
-               "$Y" "$REMOTE" "$FORK_FALLBACK" "$N"
-             printf '  ¿Compilar %s en su lugar? [S/n]: ' "$FORK_FALLBACK"
-             read -r _ans
-             case "${_ans:-S}" in
-               [SsYy]*) use_version="$FORK_FALLBACK" ;;
-             esac
-             [ -n "$use_version" ] \
-               && printf '  %bOK: %s + %s.%b\n' "$W" "$use_version" "$sched" "$N"
-           fi
-           ;;
-       esac
+       # v27.31.16: si el scheduler elegido solo existe en el fork y la versión no está
+       # publicada allí, se ofrece la última del fork de esa línea en lugar de dejar que
+       # el build aborte. Sin TTY (o sin fallback) se sigue con la versión pedida: el
+       # motor explica la causa con claridad.
+       use_version="$(fork_fallback_for "$sched")"
+       [ -n "$use_version" ] \
+         && printf '  %bOK: %s + %s.%b\n' "$W" "$use_version" "$sched" "$N"
+       cc="$(ask_cc)"
        args="--absorb-rebels"
        [ -n "$use_version" ] && args="$use_version $args"
        [ -n "$sched" ] && args="$args --sched $sched"
        [ -n "$cc" ] && args="$args --cc $cc"
+       # v27.31.28: la 14 ya preguntó la variante (su prompt de Scheduler) y el
+       # compilador; sin esto el motor la volvería a preguntar al final.
+       args="$args --no-ask-variant"
        # shellcheck disable=SC2086
        exec "$SCRIPT" $args ;;
-    15) build_and_exec baja --absorb-rebels --ntsync ;;
-    16) build_and_exec baja --absorb-rebels --cachy ;;
+    15) build_and_exec baja ask --absorb-rebels --ntsync ;;
+    16) build_and_exec baja ask --absorb-rebels --cachy ;;
     17) exec /usr/local/bin/kernel-update/kernel-update-manager.sh ;;
     0) echo "  Saliendo."; exit 0 ;;
     *) printf '  %bOpción no válida: %s%b\n' "$R" "$choice" "$N" ;;
