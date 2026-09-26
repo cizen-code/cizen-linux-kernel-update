@@ -1327,15 +1327,20 @@ cachyos-7.2.80-1" fork_tagrel 7.2.8)" ]; then
   fi
   # La 14 reutiliza el submenú en vez de tener su propia copia: las dos copias ya
   # se habían desincronizado una vez (su prompt decía «lauto» y no «auto»).
-  if [ "$(grep -c 'CC%b (Enter usa el default)' "$MENU")" = 1 ] && grep -q 'cc="$(ask_cc)"' "$MENU"; then
-    rec ok "menú: la opción 14 reutiliza ask_cc en vez de duplicar el submenú"
+  # Y solo puede llamarlo una vez: preguntar dos veces hacía descartar la
+  # primera respuesta sin avisar.
+  if [ "$(grep -c 'CC%b (Enter usa el default)' "$MENU")" = 1 ] \
+     && [ "$(grep -c '^ *ask_cc$' "$MENU")" = 2 ] \
+     && ! printf '%s' "$MENU" | grep -q '="\$(ask_cc)"'; then
+    rec ok "menú: la opción 14 reutiliza ask_cc (y una sola vez) en vez de duplicar el submenú"
   else
-    rec fail "menú: submenú de CC duplicado (o la opción 14 sin ask_cc); volverían a divergir"
+    rec fail "menú: submenú de CC duplicado, ask_cc llamada de más o mediante \$() (volverían a divergir)"
   fi
 
-  # ask_cc escribe el submenú en stderr y lo tecleado en stdout: así la pregunta
-  # se ve en la terminal y aun así se puede capturar con $( ). build_and_exec
-  # solo añade --cc si se tecleó algo, porque el default del motor ya es auto.
+  # ask_cc imprime el submenú y el prompt en stdout y deja lo tecleado en la
+  # global ASK_CC: nada que capturar con $(), y por eso el bloque se ve aunque
+  # stderr no sea la terminal. build_and_exec solo añade --cc si se tecleó algo,
+  # porque el default del motor ya es auto.
   : > "$ROOT/ccfn.sh"
   sed -n '/^ask_cc() {/,/^}/p'        "$MENU" >> "$ROOT/ccfn.sh"
   sed -n '/^ask_variant() {/,/^}/p'    "$MENU" >> "$ROOT/ccfn.sh"
@@ -1354,9 +1359,14 @@ source "$ROOT/ccfn.sh"
 SCRIPT="$ROOT/fake-engine.sh"
 build_and_exec "\$@"
 RUNNER
-  out_clang="$(printf 'clang\n' | bash "$ROOT/cc-run.sh" baja none --absorb-rebels 2>/dev/null)"
-  out_empty="$(printf '\n' | bash "$ROOT/cc-run.sh" baja none --absorb-rebels 2>/dev/null)"
-  out_alta="$(printf 'gcc-14\n' | bash "$ROOT/cc-run.sh" alta none --absorb-rebels 2>/dev/null)"
+  # El submenú va ahora a stdout, así que hay que aislar la fila del motor: si
+  # el patrón no aparece, es que la UI se tragó la salida (o al revés). El prompt
+  # no lleva salto de línea (lo pone el Enter que teclea el usuario, y con la
+  # entrada por tubería no hay eco), así que la fila del motor llega pegada a él.
+  eng() { sed -n 's/^.*\(ARGS:.*\)$/\1/p'; }
+  out_clang="$(printf 'clang\n' | bash "$ROOT/cc-run.sh" baja none --absorb-rebels 2>/dev/null | eng)"
+  out_empty="$(printf '\n' | bash "$ROOT/cc-run.sh" baja none --absorb-rebels 2>/dev/null | eng)"
+  out_alta="$(printf 'gcc-14\n' | bash "$ROOT/cc-run.sh" alta none --absorb-rebels 2>/dev/null | eng)"
   if [ "$out_clang" = "ARGS: <--absorb-rebels> <--no-ask-variant> <--cc> <clang> PRIO=unset" ]; then
     rec ok "menú: elegir clang en el submenú llega al motor como --cc clang"
   else
@@ -1372,12 +1382,24 @@ RUNNER
   else
     rec fail "menú: CC tecleado o prioridad mal pasados ('$out_alta')"
   fi
-  # Si el submenú fuera a stdout desaparecería dentro del $(), es decir el
-  # usuario no vería la pregunta. Por eso va a stderr.
-  if printf 'gcc\n' | bash "$ROOT/cc-run.sh" baja none 2>&1 >/dev/null | grep -q 'CC (Enter usa el default)'; then
-    rec ok "menú: el submenú de CC se ve en la terminal (va a stderr, no se pierde en el $)"
+  # La UI de las preguntas va a stdout, no a stderr: es la razón de que la
+  # respuesta viva en una global. Si volviera a stderr, en cualquier sitio donde
+  # stderr no sea la terminal (log, pane, `| tee`, launcher con 2>/dev/null) el
+  # submenú desaparecería y solo se vería el prompt.
+  ui="$(printf 'gcc\n' | bash "$ROOT/cc-run.sh" baja none 2>/dev/null)"
+  ui_err="$(printf 'gcc\n' | bash "$ROOT/cc-run.sh" baja none 2>&1 >/dev/null)"
+  if printf '%s' "$ui" | grep -q 'CC (Enter usa el default)' \
+     && [ -z "$ui_err" ]; then
+    rec ok "menú: el submenú de CC va a stdout (visible también si stderr no es la terminal)"
   else
-    rec fail "menú: el submenú de CC no se ve (si fuera a stdout se perdería en el \$)"
+    rec fail "menú: el submenú de CC no va a stdout ('$ui_err')"
+  fi
+  # El prompt tiene que verse siempre: `read -p` solo lo escribe si stdin es una
+  # terminal, así que se imprime con printf antes de leer.
+  if printf '%s' "$ui" | grep -q 'CC .*\[Enter=.*auto.*\]: '; then
+    rec ok "menú: el prompt de CC se imprime siempre (no con `read -p`, que depende de stdin)"
+  else
+    rec fail "menú: el prompt de CC no aparece ('$ui')"
   fi
   # ── El orden de las preguntas: variante antes que compilador ──
   # La variante se preguntaba en el MOTOR, después de descargar, verificar
@@ -1391,20 +1413,20 @@ RUNNER
   else
     rec fail "menú: el orden es compilador→variante, que es justo lo que se pidió cambiar ('$out_orden')"
   fi
-  out_bore="$(printf '2\n' | bash "$ROOT/cc-run.sh" baja ask --absorb-rebels 2>/dev/null)"
+  out_bore="$(printf '2\n' | bash "$ROOT/cc-run.sh" baja ask --absorb-rebels 2>/dev/null | eng)"
   if [ "$out_bore" = "ARGS: <--absorb-rebels> <--patch> <bore> <--no-ask-variant> PRIO=unset" ]; then
     rec ok "menú: la variante elegida llega al motor como --patch y con --no-ask-variant"
   else
     rec fail "menú: la variante no llega bien al motor ('$out_bore')"
   fi
-  out_vanilla="$(printf '1\ngcc\n' | bash "$ROOT/cc-run.sh" baja ask --absorb-rebels 2>/dev/null)"
+  out_vanilla="$(printf '1\ngcc\n' | bash "$ROOT/cc-run.sh" baja ask --absorb-rebels 2>/dev/null | eng)"
   if [ "$out_vanilla" = "ARGS: <--absorb-rebels> <--no-ask-variant> <--cc> <gcc> PRIO=unset" ]; then
     rec ok "menú: Vanilla no añade --patch pero tampoco deja que el motor pregunte al final"
   else
     rec fail "menú: Vanilla no se pasa bien ('$out_vanilla')"
   fi
   # bore ya viene impuesto por la opción (7/8): no se pregunta, pero se pasa.
-  out_impl="$(printf 'clang\n' | bash "$ROOT/cc-run.sh" baja bore --absorb-rebels 2>/dev/null)"
+  out_impl="$(printf 'clang\n' | bash "$ROOT/cc-run.sh" baja bore --absorb-rebels 2>/dev/null | eng)"
   if [ "$out_impl" = "ARGS: <--absorb-rebels> <--patch> <bore> <--no-ask-variant> <--cc> <clang> PRIO=unset" ] &&
      ! printf 'clang\n' | bash "$ROOT/cc-run.sh" baja bore --absorb-rebels 2>&1 | grep -q 'Variante (Enter'; then
     rec ok "menú: la opción que ya impone bore no pregunta la variante (solo el compilador)"

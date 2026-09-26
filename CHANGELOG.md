@@ -1,3 +1,37 @@
+## [27.31.36] - 2026-09-26
+
+Los submenús del menú a stdout: se perdían enteros si stderr no era la terminal.
+
+Las tres preguntas del menú (variante, compilador y la oferta de la release del
+fork) imprimían su submenú y su prompt **a stderr** y devolvían la respuesta por
+stdout, para poder capturarla con `$( )`. El truco funciona en una terminal
+normal, pero en cuanto stderr no es la terminal el submenú **desaparece**: solo
+queda el prompt pelado, sin las opciones. Y hay sitios donde eso es lo que pasa:
+un log, un pane, un `| tee`, un launcher que manda stderr a `/dev/null` —el
+propio `kernel-update-notify.sh` lanza el menú con `setsid … >/dev/null 2>&1`—.
+
+- **La UI (submenú + prompt) va a stdout y la respuesta a una global**:
+  `ASK_CC`, `ASK_VARIANT` y `FORK_CHOICE`. Sin `$( )` que capturar, así que el
+  bloque se imprime entero, en orden, y en el mismo flujo que el resto del menú.
+  Lo que sigue yendo a stderr es el error fatal de arranque, que es un error y
+  no una pregunta.
+- **El prompt se imprime con `printf` y no con `read -p`**: bash solo escribe el
+  prompt de `read -p` si stdin es una terminal, así que tampoco dependía de eso.
+- **La opción 14 preguntaba el compilador dos veces** y **descartaba la primera
+  respuesta**: la llamada a `ask_cc` se había quedado antes de la oferta de la
+  release del fork (v27.31.16 la intercaló en medio) y la segunda la sobreescribía
+  sin avisar. Ahora se pregunta una vez, después de saber qué versión y qué
+  scheduler van a compilar. También se fue el bloque de comentario duplicado que
+  arrastraba esa función.
+
+Selftest: 330 -> 331. Los tres nuevos, en rojo contra el menú de 27.31.35: el
+submenú y el prompt en stdout (y stderr vacío), y la 14 llamando a `ask_cc` una
+sola vez y sin `$( )`. Los que comparaban la fila del motor con igualdad exacta ahora la filtran con
+`sed`: el prompt no lleva salto de línea —lo pone el Enter que teclea el
+usuario— y con la entrada por tubería no hay eco, así que la fila del motor
+llega pegada a él. Selector: 331 ok en el repo, 330 en el instalado (el que
+falta es el que compara la unit instalada consigo mismo).
+
 ## [27.31.35] - 2026-09-26
 
 Firmar siempre con la misma ruta: la grafía del alias meteía claves de más en la BD.
