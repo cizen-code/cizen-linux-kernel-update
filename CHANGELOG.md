@@ -1,3 +1,29 @@
+## [27.31.33] - 2026-09-26
+
+El UKI se escribía y firmaba dos veces en cada sincronización.
+
+Al buscar objetivos se recorren `/efi`, `/boot/efi` y `/boot` porque el ESP
+puede estar montado en cualquiera, pero el ESP de aquí es vfat y **vfat no
+distingue mayúsculas**: `/boot/efi` y `/boot/EFI` son el mismo directorio. El
+`find` de cada raíz devolvía el UKI, así que la lista tenía el mismo fichero dos
+veces con dos grafías, y `sort -u` no lo arreglaba porque deduplica cadenas, no
+ficheros. Resultado en la última actualización: la UKI se escribía dos veces y
+`sbctl sign --save` se ejecutaba dos veces (dos líneas de log, doble firma). Las
+variantes `+N` viejas también se intentaban borrar dos veces en el cleanup.
+
+La identidad real de un fichero es el par (dispositivo, inodo), así que ahora
+`find_uki_targets`, `cleanup_uki_variants`, `find_cizen_uki_targets` y
+`cizen_uki_cleanup_variants` deduplican por `stat -c '%d:%i'`: el primero que
+aparece gana y el resto se descarta. Sin `stat` (si no se puede leer `/boot` sin
+privilegios) se degrada al nombre de antes, que es el comportamiento de siempre.
+La BD de sbctl no se vio afectada: ya guardaba una sola entrada, porque las dos
+grafías son el mismo fichero.
+
+Selftest: 316 -> 320. Los cuatro nuevos, en rojo contra el código anterior
+(find_uki_targets devolvía 2 objetivos y el cleanup intentaba borrar la `+3`
+dos veces) y en verde con el nuevo. El falso ESP del test es un directorio real
+y un alias con otra grafía al mismo sitio, como hace vfat con mayúsculas.
+
 ## [27.31.32] - 2026-09-26
 
 La UKI con contador de intentos rompía cada `pacman -Syu`.

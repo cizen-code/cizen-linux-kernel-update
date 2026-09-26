@@ -159,14 +159,29 @@ detect_esp_root() {
   return 1
 }
 
+# Objetivos = ficheros del ESP que se llaman $name, uno por cada FICHERO.
+# Recorremos /efi, /boot/efi y /boot porque el ESP puede estar montado en
+# cualquiera, pero eso duplica: en vfat sin CaseSensitive (el caso normal)
+/boot/efi y /boot/EFI son el MISMO directorio, y 'sort -u' solo deduplica
+# cadenas, no ficheros — el UKI salía dos veces y se escribía y firmaba dos
+# veces. Se deduplica por (dispositivo, inodo), que es la identidad real del
+# fichero; sin stat (permiso denegado en /boot sin sudo) se degrada al nombre,
+# que es el comportamiento de siempre.
 find_uki_targets() {
-  local name="$1" r f
+  local name="$1" r f key
   local -a found=()
+  local -A seen=()
 
   for r in /efi /boot/efi /boot; do
     [ -d "$r" ] || continue
     while IFS= read -r f; do
-      [ -n "$f" ] && found+=("$f")
+      [ -n "$f" ] || continue
+      key="$("${SUDO[@]}" stat -c '%d:%i' -- "$f" 2>/dev/null || true)"
+      if [ -n "$key" ]; then
+        [ -n "${seen[$key]:-}" ] && continue
+        seen[$key]="$f"
+      fi
+      found+=("$f")
     done < <("${SUDO[@]}" find "$r" -maxdepth 5 -type f -iname "$name" 2>/dev/null || true)
   done
 
@@ -295,8 +310,11 @@ uki_efi_name() {
 # systemd-bless-boot y los contadores +N de boots anteriores) para que tras
 # cada sincronización solo quede la UKI vigente. Con el nombre plano activo,
 # esto elimina cualquier +N que hubiera quedado de un build con boot counting.
+# Deduplica por inodo como find_uki_targets: /boot/efi y /boot/EFI son el mismo
+# directorio en vfat, así que sin esto cada variante se borraba dos veces.
 cleanup_uki_variants() {
-  local base current r f
+  local base current r f key
+  local -A seen=()
   base="${CIZEN_UKI_NAME%.efi}"
   current="$(uki_efi_name)"
   for r in /efi /boot/efi /boot; do
@@ -304,6 +322,11 @@ cleanup_uki_variants() {
     while IFS= read -r f; do
       [ -n "$f" ] || continue
       [ "$(basename -- "$f")" = "$current" ] && continue
+      key="$("${SUDO[@]}" stat -c '%d:%i' -- "$f" 2>/dev/null || true)"
+      if [ -n "$key" ]; then
+        [ -n "${seen[$key]:-}" ] && continue
+        seen[$key]="$f"
+      fi
       "${SUDO[@]}" rm -f -- "$f" 2>/dev/null || true
     done < <("${SUDO[@]}" find "$r" -maxdepth 5 -type f \( -name "${base}.efi" -o -name "${base}+*.efi" \) 2>/dev/null || true)
   done

@@ -2973,6 +2973,77 @@ SBCTL
   else
     rec fail "uki: el motor no sanea la BD de sbctl; un +3 muerto rompe el hook de pacman igual"
   fi
+
+  # f) v27.31.33: el ESP vfat no distingue mayúsculas, así que /boot/efi y
+  #    /boot/EFI son el MISMO directorio y recorrer las tres raíces devolvía el
+  #    UKI dos veces: se escribía y firmaba dos veces. 'sort -u' no lo arregla,
+  #    porque deduplica cadenas, no ficheros — la identidad real es el inodo.
+  #    Falso ESP: un directorio real y un alias con otra grafía al mismo sitio,
+  #    como hace vfat con mayúsculas. Las raíces se sustituyen por $TEST_ROOTS
+  #    (nunca definido en producción) para no depender del /boot real.
+  mkdir -p "$ROOT/esp/boot/EFI/Linux"
+  : > "$ROOT/esp/boot/EFI/Linux/arch-linux-cizen-v3.efi"
+  : > "$ROOT/esp/boot/EFI/Linux/arch-linux-cizen-v3+3.efi"   # variante vieja
+  ln -sfn EFI "$ROOT/esp/boot/efi"                          # alias en minúsculas
+  cat > "$ROOT/fakeesp.sh" <<'FAKE'
+# find() que aterriza en el ESP falso. El directorio se resuelve con realpath (como
+# haría el vfat al no distinguir mayúsculas) pero la RUTA DEVUELTA conserva la
+# grafía con la que se llegó: eso es justo lo que hace que dos rutas distintas
+# apunten al mismo fichero, que es lo que hay que deduplicar.
+find() {
+  local root="$1" real
+  case "$root" in
+    "$FAKE_ESP"/*) : ;;
+    *) command find "$@" ;;
+  esac
+  [ -d "$root" ] || return 0
+  real="$(realpath -m -- "$root")"
+  shift
+  command find "$real" "$@" | sed "s|^$real|$root|"
+}
+FAKE
+  # find_uki_targets + cleanup_uki_variants + el resolutor de nombres, con la
+  # lista de raíces sustituida por el ESP falso.
+  { sed -n '/^uki_efi_name() {/,/^}/p; /^find_uki_targets() {/,/^}/p; /^cleanup_uki_variants() {/,/^}/p' \
+      "$UKISYNC" \
+    | sed 's|^\( *\)for r in /efi /boot/efi /boot; do|\1for r in ${TEST_ROOTS}; do|'
+    cat "$ROOT/fakeesp.sh"; } > "$ROOT/tgt.sh"
+  n_t="$(FAKE_ESP="$ROOT/esp" TEST_ROOTS="$ROOT/esp/efi $ROOT/esp/boot/efi $ROOT/esp/boot" \
+    bash -c 'set -u; SUDO=(); . "$0"
+      CIZEN_UKI_NAME=arch-linux-cizen-v3.efi; CIZEN_BOOT_TRIES=0
+      find_uki_targets arch-linux-cizen-v3.efi' "$ROOT/tgt.sh" 2>/dev/null | wc -l)"
+  if [ "$n_t" = 1 ]; then
+    rec ok "uki: el UKI se localiza una sola vez aunque /boot/efi y /boot/EFI sean el mismo ESP"
+  else
+    rec fail "uki: find_uki_targets devolvió $n_t objetivos (esperado 1): duplica por grafía del ESP"
+  fi
+  # El cleanup tampoco puede intentar borrar dos veces la misma variante: rm
+  # interceptado que solo registra (así el fixture sobrevive al test).
+  : > "$ROOT/rm.log"
+  FAKE_ESP="$ROOT/esp" TEST_ROOTS="$ROOT/esp/efi $ROOT/esp/boot/efi $ROOT/esp/boot" \
+    RM_LOG="$ROOT/rm.log" bash -c 'set -u; SUDO=(); . "$0"
+      rm() { printf "%s\n" "${*: -1}" >> "$RM_LOG"; }
+      CIZEN_UKI_NAME=arch-linux-cizen-v3.efi; CIZEN_BOOT_TRIES=0
+      cleanup_uki_variants' "$ROOT/tgt.sh" 2>/dev/null
+  n_rm="$(wc -l < "$ROOT/rm.log")"
+  if [ "${n_rm:-0}" = 1 ] \
+     && grep -q 'arch-linux-cizen-v3+3.efi' "$ROOT/rm.log" \
+     && ! grep -q 'arch-linux-cizen-v3\.efi$' "$ROOT/rm.log"; then
+    rec ok "uki: cleanup_uki_variants borra la variante +N una sola vez y respeta el nombre plano"
+  else
+    rec fail "uki: cleanup_uki_variants no borró la +N exactamente una vez (log: $(tr '\n' ' ' < "$ROOT/rm.log" 2>/dev/null))"
+  fi
+  # Y el motor (ruta directa, sin cizen-uki-sync) deduplica igual.
+  if sed -n '/^find_cizen_uki_targets() {/,/^}/p' "$MOTOR" | grep -q "stat -c '%d:%i'"; then
+    rec ok "uki: el motor deduplica los objetivos por inodo (find_cizen_uki_targets)"
+  else
+    rec fail "uki: find_cizen_uki_targets no deduplica por inodo; el UKI se escribe y firma dos veces"
+  fi
+  if sed -n '/^cizen_uki_cleanup_variants() {/,/^}/p' "$MOTOR" | grep -q "stat -c '%d:%i'"; then
+    rec ok "uki: cizen_uki_cleanup_variants deduplica por inodo (no borra dos veces la misma variante)"
+  else
+    rec fail "uki: cizen_uki_cleanup_variants no deduplica por inodo"
+  fi
 else
   printf '  (sin %s: se omiten los tests del nombre de UKI)\n' "$UKISYNC"
 fi

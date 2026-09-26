@@ -136,7 +136,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.32"
+SCRIPT_VERSION="27.31.33"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -7775,7 +7775,8 @@ cizen_uki_efi_name() {
 # systemd-bless-boot y contadores pendientes de boots previos) para que tras
 # cada build solo quede la del kernel actual.
 cizen_uki_cleanup_variants() {
-    local base current r f
+    local base current r f key
+    local -A seen=()
     base="${CIZEN_UKI_NAME%.efi}"
     current="$(cizen_uki_efi_name)"
     for r in /efi /boot/efi /boot; do
@@ -7783,6 +7784,11 @@ cizen_uki_cleanup_variants() {
         while IFS= read -r f; do
             [ -n "$f" ] || continue
             [ "$(basename -- "$f")" = "$current" ] && continue
+            key="$(sudo stat -c '%d:%i' -- "$f" 2>/dev/null || true)"
+            if [ -n "$key" ]; then
+                [ -n "${seen[$key]:-}" ] && continue
+                seen[$key]="$f"
+            fi
             sudo rm -f -- "$f" 2>/dev/null || true
         done < <(sudo find "$r" -maxdepth 5 -type f \( -name "${base}.efi" -o -name "${base}+*.efi" \) 2>/dev/null || true)
     done
@@ -7844,14 +7850,28 @@ detect_cizen_esp_root() {
     return 1
 }
 
+# Objetivos = ficheros del ESP que se llaman $name, uno por cada FICHERO.
+# /efi, /boot/efi y /boot se recorren porque el ESP puede estar en cualquiera,
+# pero eso duplica: en vfat sin CaseSensitive (el caso normal) /boot/efi y
+# /boot/EFI son el MISMO directorio y 'sort -u' solo deduplica cadenas — el UKI
+# salía dos veces, se escribía dos veces y se firmaba dos veces. Se deduplica por
+# (dispositivo, inodo), la identidad real del fichero; sin stat (permiso
+# denegado en /boot sin sudo) se degrada al nombre, como antes.
 find_cizen_uki_targets() {
-    local name="$1" r f
+    local name="$1" r f key
     local -a found=()
+    local -A seen=()
 
     for r in /efi /boot/efi /boot; do
         [ -d "$r" ] || continue
         while IFS= read -r f; do
-            [ -n "$f" ] && found+=("$f")
+            [ -n "$f" ] || continue
+            key="$(sudo stat -c '%d:%i' -- "$f" 2>/dev/null || true)"
+            if [ -n "$key" ]; then
+                [ -n "${seen[$key]:-}" ] && continue
+                seen[$key]="$f"
+            fi
+            found+=("$f")
         done < <(sudo find "$r" -maxdepth 5 -type f -iname "$name" 2>/dev/null || true)
     done
 
