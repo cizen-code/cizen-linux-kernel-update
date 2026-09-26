@@ -1523,6 +1523,49 @@ if grep -q "printf 'sched=%s\\\\n' \"\$(effective_scheduler)\"" "$MOTOR"; then
 else
   rec fail "write_verify_signature no graba sched= con el scheduler efectivo"
 fi
+
+printf '%s\n' "== write_verify_signature: retired= (símbolos que el parche retira) =="
+# v27.31.22: sin retired= en la firma, el verificador post-boot no puede saber que
+# SCHED_AUTOGROUP (depends on !SCHED_ALT) es imposible con bmq/pds/lfbmq y lo
+# cuenta como incidencia de perfil en cada arranque.
+# Necesita effective_scheduler, así que va ANTES de su unset.
+_saved_vsdir="${VERIFY_STATE_DIR:-}"
+VERIFY_STATE_DIR="$ROOT/vsig"; mkdir -p "$VERIFY_STATE_DIR"
+PROFILE_FILE="$ROOT/perfil.conf"; : > "$PROFILE_FILE"
+VERSION="7.2.6"; LOCALVERSION_SUFFIX="-cizen-v3"
+BTF_REQUESTED=true; CLANG_BUILD=true; DO_SIGN_UKI=true; PKGREL=7
+BORE_ENABLED=false; PATCHES_APPLIED=(bmq)
+declare -a PATCH_RETIRED_ALL=(PSI PSI_DEFAULT_DISABLED SCHED_AUTOGROUP NUMA_BALANCING SCHED_CACHE)
+write_verify_signature
+if grep -q '^retired=PSI PSI_DEFAULT_DISABLED SCHED_AUTOGROUP NUMA_BALANCING SCHED_CACHE$' \
+     "$VERIFY_STATE_DIR/last-build"; then
+  rec ok "la firma graba retired= con los símbolos que PATCH_RETIRED_ALL retiró"
+else
+  rec fail "write_verify_signature no graba retired= (el verificador no podrá saltarlos)"
+fi
+# Sin parche de scheduler no hay retirados: la línea no debe aparecer (para que el
+# verificador deduzca por sched= en vez de fiarse de una lista vacía).
+PATCH_RETIRED_ALL=()
+write_verify_signature
+if grep -q '^retired=' "$VERIFY_STATE_DIR/last-build"; then
+  rec fail "la firma graba retired= vacío: el verificador se fiaría de una lista vacía"
+else
+  rec ok "sin símbolos retirados la firma omite retired= (el verificador deduce por sched=)"
+fi
+# La firma no puede romperse por añadir una línea: todo lo de siempre sigue ahí.
+_sig_ok=yes
+for _k in version sched btf sb pkgrel ts; do
+  grep -q "^$_k=" "$VERIFY_STATE_DIR/last-build" || { _sig_ok="le falta $_k="; }
+done
+grep -q '^sched=bmq$' "$VERIFY_STATE_DIR/last-build" || _sig_ok="sched= no es el efectivo"
+[ "$_sig_ok" = yes ] \
+  && rec ok "la firma sigue íntegra al añadir retired= (version/sched/btf/sb/pkgrel/ts)" \
+  || rec fail "la firma del verificador se rompió al añadir retired= ($_sig_ok)"
+unset _k _sig_ok
+[ -n "$_saved_vsdir" ] && VERIFY_STATE_DIR="$_saved_vsdir" || unset VERIFY_STATE_DIR
+unset _saved_vsdir
+rm -rf "$ROOT/vsig" "$ROOT/perfil.conf"
+unset -f write_verify_signature
 unset -f effective_scheduler
 
 printf '%s\n' "== unmount_tmpfs_build: éxito total desmonta siempre =="
@@ -1703,7 +1746,7 @@ for _u in "$_repo_root/systemd/user/kernel-update-verify.service" \
          "$HOME/.config/systemd/user/kernel-update-verify.service"; do
   if [ -f "$_u" ] && grep -q 'ExecStart=/usr/local/bin/kernel-update/kernel-update-verify.sh' "$_u" \
      && grep -q 'WantedBy=default.target' "$_u" && grep -q 'After=graphical-session.target' "$_u"; then
-    _unit_ok="$ _u"
+    _unit_ok=" $_u"   # con espacio delante: el mensaje quita el prefijo con ${_unit_ok# }
   fi
 done
 if [ "$_unit_ok" != "no" ]; then
@@ -1722,6 +1765,100 @@ if [ -f "$_repo_root/systemd/user/kernel-update-verify.service" ] \
   fi
 fi
 unset -f sched_symbol_for sched_label expected_sched_from_signature running_sched
+
+printf '%s\n' "== kernel-update-verify.sh: símbolos retirados por el parche =="
+# v27.31.22. El parche PRJC (pds/bmq/lfbmq) pone `depends on !SCHED_ALT` en
+# SCHED_AUTOGROUP y compañía: imposibles de habilitar, así que el motor los saca
+# de las exigencias efectivas. El verificador los contaba como incidencia de
+# perfil → "Perfil: FALLO" + notificación critical en CADA arranque.
+# El grupo anterior ya unsetó sched_label y expected_sched_from_signature, que
+# estas funciones necesitan: se extraen otra vez en un fichero aparte.
+{
+  _sx sched_label
+  _sx expected_sched_from_signature
+  _sx build_sig_field
+  _sx retired_symbols_for_sched
+  _sx load_retired_symbols
+  _sx sym_retired
+  _sx retired_reason
+} > "$ROOT/vret.sh"
+# El estado del que dependen va fuera de las funciones (en el script es global).
+declare -A RETIRED=()
+RETIRED_SCHED=""; RETIRED_SRC=""; RETIRED_LIST=""
+BUILD_SIG="$ROOT/last-build"
+# alog solo escribe en el log del verificador; aquí no existe.
+alog() { :; }
+# shellcheck disable=SC1090,SC1091
+source "$ROOT/vret.sh"
+_miss=""
+for _s in pds bmq lfbmq; do
+  retired_symbols_for_sched "$_s" | grep -qx SCHED_AUTOGROUP || _miss="$_miss $_s"
+done
+[ -z "$_miss" ] && rec ok "retired: pds/bmq/lfbmq retiran SCHED_AUTOGROUP (depends on !SCHED_ALT)" \
+  || rec fail "retired: la tabla no cubre SCHED_AUTOGROUP en:$_miss"
+# bore/muqss NO lo retiran: su patch no toca ese símbolo ni su `depends on`.
+# Confundirlos dejaría sin vigilar un perfil que sí se puede cumplir entero.
+_miss=""
+for _s in bore muqss eevdf; do
+  [ -z "$(retired_symbols_for_sched "$_s")" ] || _miss="$_miss $_s"
+done
+[ -z "$_miss" ] && rec ok "retired: bore/muqss/eevdf no retiran nada (tabla = la del motor)" \
+  || rec fail "retired: la tabla inventa retirados para:$_miss"
+# La firma manda; sin retired= se deduce del scheduler (firmas anteriores).
+_mk_sig() { printf '%s\n' "$@" > "$BUILD_SIG"; }
+_mk_sig "version=7.2.7-cizen-v3" "bore=no" "patches=bmq" "btf=yes" "sb=yes"
+load_retired_symbols
+if sym_retired SCHED_AUTOGROUP && [ "${#RETIRED[@]}" -eq 5 ] && [ -n "$RETIRED_SRC" ]; then
+  rec ok "retired: firma sin retired= + patches=bmq -> deduce los 5 retirados (firma legacy)"
+else
+  rec fail "retired: con bmq y sin retired= no se deduce la lista (${#RETIRED[@]}, origen: ${RETIRED_SRC:-ninguno})"
+fi
+sym_retired SCHED_BMQ && rec fail "retired: da por retirado un símbolo que el parche no toca" \
+  || rec ok "retired: no marca símbolos que el parche no retira (SCHED_BMQ sigue exigible)"
+# El motivo tiene que decir quién retiró el símbolo: si no, el "omitida" del
+# perfil es un misterio cada vez que aparece en el log.
+case "$(retired_reason)" in
+  *BMQ*) rec ok "retired: el motivo nombra al scheduler responsable (BMQ)" ;;
+  *)     rec fail "retired: el motivo no identifica al scheduler: $(retired_reason)" ;;
+esac
+_mk_sig "version=7.2.7-cizen-v3" "bore=no" "patches=bore" "btf=yes" "sb=yes"
+load_retired_symbols
+sym_retired SCHED_AUTOGROUP && rec fail "retired: con bore da por retirado SCHED_AUTOGROUP" \
+  || rec ok "retired: con bore no se salta nada (el perfil sí se puede cumplir entero)"
+_mk_sig "version=7.2.7-cizen-v3" "retired=SCHED_AUTOGROUP" "sched=bmq" "btf=yes" "sb=yes"
+load_retired_symbols
+if sym_retired SCHED_AUTOGROUP && ! sym_retired PSI; then
+  rec ok "retired: retired= de la firma manda sobre la tabla (lista exacta, sin inventar)"
+else
+  rec fail "retired: retired= de la firma no se respeta tal cual"
+fi
+# Sin firma no hay excusas: el verificador no debe inventar una lista.
+_mk_sig; load_retired_symbols
+sym_retired SCHED_AUTOGROUP && rec fail "retired: sin firma se salta un símbolo sin motivo" \
+  || rec ok "retired: sin firma del build no se salta nada (no se inventa)"
+# Y el salto tiene que estar en los cuatro bucles del perfil, no solo en CRITICAL:
+# el motor los saca de ENABLE/SETVAL/SETSTR también.
+_miss=""
+for _loop in OPTS_ENABLE CRITICAL_OPTS OPTS_SETVAL OPTS_SETSTR; do
+  _start="$(grep -n "for opt in .*${_loop}\[" "$VERIFY_SRC" | head -n1 | cut -d: -f1)"
+  if [ -z "$_start" ] || ! sed -n "${_start},$((_start + 14))p" "$VERIFY_SRC" | grep -q 'sym_retired'; then
+    _miss="$_miss $_loop"
+  fi
+  unset _start
+done
+[ -z "$_miss" ] && rec ok "retired: ENABLE/CRITICAL/SETVAL/SETSTR saltan los retirados" \
+  || rec fail "retired: estos bucles no saltan los retirados:$_miss"
+# Y tienen que SALTÁRSELO, no solo mencionarlo: la incidencia se cuenta en el
+# `bad+=` de cada bucle, así que el skip tiene que ser un `continue`/&&-continue.
+_pc="$(sed -n '/^profile_check() {/,/^}/p' "$VERIFY_SRC")"
+printf '%s\n' "$_pc" | grep -qE 'sym_retired .*\{ *skipped\+=|sym_retired .*continue' \
+  && rec ok "retired: el skip se aplica antes de contar la incidencia" \
+  || rec fail "retired: se detecta el símbolo retirado pero no se salta la comprobación"
+unset -f alog build_sig_field retired_symbols_for_sched load_retired_symbols \
+      sym_retired retired_reason sched_label expected_sched_from_signature
+rm -f "$ROOT/vret.sh" "$BUILD_SIG"
+unset RETIRED RETIRED_SCHED RETIRED_SRC RETIRED_LIST BUILD_SIG _pc _miss _mk_sig
+
 
 # ============================================================
 # v27.31.21: la notificación solo cuando el estado cambia

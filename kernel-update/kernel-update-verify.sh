@@ -18,6 +18,12 @@
 #                 v27.31.20: OPTS_ENABLE acepta =y y =m igual que la validación
 #                 del motor (el modo lite degrada con localmodconfig) y un
 #                 firmware presente en el árbol no cuenta como incidencia.
+#                 v27.31.22: los símbolos que el parche del scheduler RETIRA
+#                 (`depends on !SCHED_ALT`, p. ej. SCHED_AUTOGROUP con
+#                 bmq/pds/lfbmq) se saltan: el motor ya los saca de las
+#                 exigencias efectivas, así que su ausencia es correcta. Sin
+#                 esto, un build con BMQ notificaba "Perfil: FALLO" en cada
+#                 arranque por un símbolo imposible de habilitar.
 #   c) BOOT     : compara systemd-analyze (kernel/userspace/total) del boot
 #                 actual con el del boot previo registrado y avisa si el total
 #                 empeora más allá de un factor/umbral.
@@ -267,6 +273,67 @@ load_renames() {
   done < "$RENAME_MAP_FILE"
 }
 
+# ---------- 1c) SÍMBOLOS QUE EL PARCHE DEL SCHEDULER RETIRA ----------
+# El parche PRJC (pds/bmq/lfbmq) mete `depends on !SCHED_ALT` en varios símbolos
+# (SCHED_AUTOGROUP entre ellos), así que son imposibles de habilitar por diseño
+# suyo. El motor lo sabe y los saca de ENABLE/CRITICAL/SETVAL/SETSTR antes de
+# validar (build_effective_arrays + PATCH_RETIRED_ALL), de modo que el build
+# sale correcto; el perfil los puede seguir pidiendo sin problema.
+# El verificador leía el perfil en crudo y contaba su ausencia como incidencia:
+#   CRITICAL: CONFIG_SCHED_AUTOGROUP no existe en el kernel en ejecución
+# → "Perfil: FALLO" y notificación critical en cada arranque, sin que hubiera
+# nada que arreglar. Ahora se saltan, igual que los =m del modo lite: se informa,
+# no se cuenta.
+#
+# Fuente de verdad: retired= en la firma del build (v27.31.22). Para firmas
+# anteriores se deduce del scheduler efectivo con la MISMA tabla que el motor
+# (_patch_desc_scheduler_base), para no depender de un build nuevo. bore y muqss
+# no retiran ninguno: su patch no toca SCHED_AUTOGROUP ni sus `depends on`.
+declare -A RETIRED=()
+RETIRED_SCHED=""
+RETIRED_SRC=""
+RETIRED_LIST=""
+build_sig_field() { # $1 = clave -> valor de la firma del último build (o vacío)
+  [ -f "$BUILD_SIG" ] || return 0
+  sed -n "s/^$1=//p" "$BUILD_SIG" 2>/dev/null | head -n1
+}
+retired_symbols_for_sched() { # $1 = scheduler -> símbolos que ese parche retira (uno por línea)
+  case "$1" in
+    pds|bmq|lfbmq) printf '%s\n' PSI PSI_DEFAULT_DISABLED SCHED_AUTOGROUP NUMA_BALANCING SCHED_CACHE ;;
+    *)             : ;;
+  esac
+}
+load_retired_symbols() {
+  RETIRED=(); RETIRED_SCHED=""; RETIRED_SRC=""; RETIRED_LIST=""
+  local sig s
+  sig="$(build_sig_field retired)"
+  if [ -n "$sig" ]; then
+    RETIRED_SRC="firma retired="
+    for s in $sig; do RETIRED["$s"]=1; done
+  else
+    RETIRED_SCHED="$(expected_sched_from_signature "$(build_sig_field sched)" \
+      "$(build_sig_field bore)" "$(build_sig_field patches)")"
+    for s in $(retired_symbols_for_sched "$RETIRED_SCHED"); do RETIRED["$s"]=1; done
+    [ "${#RETIRED[@]}" -gt 0 ] && RETIRED_SRC="scheduler de la firma (${RETIRED_SCHED})"
+  fi
+  [ "${#RETIRED[@]}" -gt 0 ] && [ -z "$RETIRED_SCHED" ] && RETIRED_SCHED="$(build_sig_field sched)"
+  for s in "${!RETIRED[@]}"; do RETIRED_LIST="${RETIRED_LIST:+$RETIRED_LIST }$s"; done
+  # Rastro en el log: de dónde salió la lista, para que un "omitida" del perfil
+  # nunca vuelva a ser un misterio cuando se audite a mano.
+  [ -n "$RETIRED_LIST" ] && alog "verify: ${#RETIRED[@]} símbolo(s) retirados por el parche del scheduler [origen: ${RETIRED_SRC:-desconocido}]: $RETIRED_LIST"
+  return 0
+}
+sym_retired() { # $1 = símbolo -> 0 si el parche del scheduler lo retiró
+  [ -n "${RETIRED[$1]+x}" ]
+}
+retired_reason() { # texto legible del origen de la lista
+  if [ -n "${RETIRED_SCHED:-}" ]; then
+    printf 'retiradas por el parche del scheduler (%s)' "$(sched_label "$RETIRED_SCHED")"
+  else
+    printf 'retiradas por el parche del scheduler'
+  fi
+}
+
 resolve_sym() {
   local s="$1" guard=0
   while [ -n "${RENAMES[$s]:-}" ] && [ "$guard" -lt 20 ]; do
@@ -295,12 +362,17 @@ profile_check() {
   profile="$(find_profile)" || { pc_warn "Perfil cizen no encontrado; se omite la comprobación de perfil."; printf '%s\n' "0"; return 0; }
   source "$profile" || { pc_warn "No se pudo cargar el perfil $profile; se omite perfil."; printf '%s\n' "0"; return 0; }
   load_renames
+  load_retired_symbols
   local opt r st exp line
-  local -a bad=() demoted=()
+  local -a bad=() demoted=() skipped=()
 
 for opt in "${OPTS_ENABLE[@]:-}"; do
     [ -n "$opt" ] || continue
     r="$(resolve_sym "$opt")"
+    if sym_retired "$r"; then
+      skipped+=("ENABLE: CONFIG_$opt")
+      continue
+    fi
     st="$(run_state "$r")"
     case "$st" in
       y) : ;;
@@ -321,6 +393,13 @@ for opt in "${OPTS_ENABLE[@]:-}"; do
   for opt in "${CRITICAL_OPTS[@]:-}"; do
     [ -n "$opt" ] || continue
     r="$(resolve_sym "$opt")"
+    # v27.31.22: retirado por el parche del scheduler = imposible de habilitar
+    # (`depends on !SCHED_ALT`). El motor ya lo saca de las exigencias
+    # efectivas, así que el build es correcto y su ausencia aquí también.
+    if sym_retired "$r"; then
+      skipped+=("CRITICAL: CONFIG_$opt")
+      continue
+    fi
     st="$(run_state "$r")"
     case "$st" in
       y|m) : ;;
@@ -332,6 +411,7 @@ for opt in "${OPTS_ENABLE[@]:-}"; do
     for opt in "${!OPTS_SETVAL[@]}"; do
       [ -n "$opt" ] || continue
       r="$(resolve_sym "$opt")"
+      sym_retired "$r" && { skipped+=("SETVAL: CONFIG_$opt"); continue; }
       st="$(run_state "$r")"
       if [ "$st" != "missing" ] && [ "$st" != "${OPTS_SETVAL[$opt]}" ]; then
         bad+=("SETVAL: CONFIG_$opt=$st (esperado ${OPTS_SETVAL[$opt]})")
@@ -342,12 +422,18 @@ for opt in "${OPTS_ENABLE[@]:-}"; do
     for opt in "${!OPTS_SETSTR[@]}"; do
       [ -n "$opt" ] || continue
       r="$(resolve_sym "$opt")"
+      sym_retired "$r" && { skipped+=("SETSTR: CONFIG_$opt"); continue; }
       st="$(run_state "$r")"
       exp="\"${OPTS_SETSTR[$opt]}\""
       if [ "$st" != "missing" ] && [ "$st" != "$exp" ]; then
         bad+=("SETSTR: CONFIG_$opt=$st (esperado $exp)")
       fi
     done
+  fi
+
+  if [ "${#skipped[@]}" -gt 0 ]; then
+    pc_info "Perfil: ${#skipped[@]} exigencia(s) omitidas — $(retired_reason) (no es una incidencia):"
+    for line in "${skipped[@]}"; do pc_out "      $line"; done
   fi
 
   issue=0

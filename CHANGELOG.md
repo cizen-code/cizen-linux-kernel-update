@@ -1,3 +1,50 @@
+## [27.31.22] - 2026-09-25
+
+El verificador ya no confunde "imposible de habilitar" con "incumplido".
+
+Lo que pasaba: el perfil pide `SCHED_AUTOGROUP` como símbolo CRÍTICO, pero el
+parche PRJC que usan bmq/pds/lfbmq mete `depends on !SCHED_ALT` en ese Kconfig
+(igual que en PSI, PSI_DEFAULT_DISABLED, NUMA_BALANCING y SCHED_CACHE): con el
+scheduler alternativo puesto, **no hay forma de activarlo**. El motor lo sabe
+desde v27.31.6 —los saca de las exigencias efectivas antes de validar, así que el
+build sale bien y el perfil puede pedirlos sin problema—, pero el verificador
+post-boot leía el perfil en crudo y contaba su ausencia como incidencia:
+
+```
+⚠ El kernel en ejecución NO cumple el perfil (1):
+    CRITICAL: CONFIG_SCHED_AUTOGROUP no existe en el kernel en ejecución
+```
+
+O sea: `Perfil: FALLO` y notificación `critical` en cada arranque por un símbolo
+que nadie puede arreglar, y que tampoco era un problema: el kernel arrancado
+cumplía todo lo exigible. En este host era la única incidencia que quedaba, la
+que vestía de alarma el aviso de "kernel verificado".
+
+- **La firma del build graba `retired=`**: los símbolos que `PATCH_RETIRED_ALL`
+  retiró, que es la lista real que el motor aplicó (no una suposición del
+  verificador). Se omite la línea cuando no hay ninguno, para no fijar una lista
+  vacía que taparía la deducción por `sched=`.
+- **El verificador los salta** en los cuatro bucles del perfil (ENABLE, CRITICAL,
+  SETVAL y SETSTR), los informa como `• perfil: N exigencia(s) omitidas —
+  retiradas por el parche del scheduler (BMQ)` y **no cuenta incidencia**: mismo
+  criterio que los `=m` del modo lite y que el firmware presente en el árbol.
+- **Firmas anteriores (sin `retired=`)**: se deducen del scheduler efectivo con la
+  misma tabla que el motor, así que el arreglo surte efecto sin esperar a un
+  build nuevo. bore y muqss no retiran nada —su patch no toca esos símbolos— y esa
+  tabla está fijada por tests para que no se invente una lista más ancha de la
+  cuenta.
+- **Rastro en el log**: `verify.log` anota cuántos símbolos se saltan y de dónde
+  salió la lista, para que un "omitida" no sea un misterio al auditar a mano.
+- El resumen y la notificación pasan a `Perfil: OK` / **0 incidencias**, con
+  severidad `normal` en vez de alarma.
+
+Tests: 13 nuevos (selftest **222 → 235, 0 fail**): `retired=` se graba con lo que
+retiró `PATCH_RETIRED_ALL` y no se graba si no hay nada (y la firma sigue
+íntegra); la tabla cubre pds/bmq/lfbmq y **no** inventa retirados para
+bore/muqss/eevdf; la firma manda sobre la tabla, sin firma no se salta nada, y
+sin `retired=` la lista se deduce; el motivo identifica al scheduler; y los
+cuatro bucles del perfil saltan los retirados **antes** de contar la incidencia.
+
 ## [27.31.21] - 2026-09-25
 
 La notificación del verificador solo sale cuando el estado **cambia**.

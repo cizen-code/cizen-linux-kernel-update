@@ -134,7 +134,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.21"
+SCRIPT_VERSION="27.31.22"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -7155,6 +7155,17 @@ write_verify_signature() {
     # ofrece (bore/pds/bmq/lfbmq/muqss, o eevdf si no hay ninguno). Con
     # "inherit" queda el que acabó aplicándose, que es lo comprobable.
     printf 'sched=%s\n' "$(effective_scheduler)"
+    # v27.31.22: símbolos que el scheduler aplicado RETIRA del kernel (dependen
+    # de !SCHED_ALT, así que son imposibles de habilitar por diseño del parche).
+    # build_effective_arrays ya los saca de ENABLE/CRITICAL/SETVAL/SETSTR para
+    # que la validación no los haga FATAL; aquí se firman para que el verificador
+    # post-boot sepa que su ausencia en el kernel arrancado es correcta y no la
+    # cuente como incidencia. Sin esto, un build con bmq/pds/lfbmq que tenga
+    # SCHED_AUTOGROUP en CRITICAL_OPTS notificaba "Perfil: FALLO" en cada
+    # arranque, y se queda así para siempre.
+    if [ "${#PATCH_RETIRED_ALL[@]}" -gt 0 ]; then
+      printf 'retired=%s\n' "${PATCH_RETIRED_ALL[*]}"
+    fi
     if [ "${#PATCHES_APPLIED[@]}" -gt 0 ]; then
       # bore permanece aparte por compatibilidad; el resto de parches van en patches=.
       printf 'patches=%s\n' "${PATCHES_APPLIED[*]}"
