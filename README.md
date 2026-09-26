@@ -55,6 +55,45 @@ con otras herramientas):
 > (list/info/flip/backup/remove de kernels instalados), `kernel-update-rollback.sh`
 > y `cizen-uki-sync` (sincronización y firma del UKI para systemd-boot + sbctl).
 
+#### El rollback reinstala el paquete anterior (v27.31.24)
+
+Un rollback que solo extrae ficheros no es un rollback: pacman sigue diciendo
+que el kernel instalado es el nuevo, y la siguiente actualización ya no sabe
+cuál era el anterior. Con `CleanMethod=KeepCurrent` (el de este host) pacman
+borra de su caché el paquete anterior al instalar el siguiente, y el paquete
+que genera la build vive en un tmpfs que se desmonta al terminar: antes de
+v27.31.24 el kernel anterior **no quedaba en ninguna parte** del sistema.
+
+Ahora el motor copia a `$ROLLBACK_DIR` el **paquete que acaba de instalar** (y
+solo ese: "actual + previo"), junto a un manifiesto `rollback.info` con
+pkgbase, pkgver, release y scheduler:
+
+```sh
+sudo /usr/local/bin/kernel-update/kernel-update-rollback.sh --list   # qué kernel anterior hay, con su scheduler
+sudo /usr/local/bin/kernel-update/kernel-update-rollback.sh          # lo reinstala (pacman -U) y regenera el UKI
+```
+
+```sh
+Kernel anterior disponible para rollback:
+  paquete  linux-cizen-v3-7.2.7_cizen_v3-2  (scheduler: bmq)  release 7.2.7-cizen-v3
+  fichero  /var/lib/kernel-update/rollback/linux-cizen-v3-7.2.7_cizen_v3-2-x86_64.pkg.tar.zst (113M)
+```
+
+Dos detalles que parecen detalles y no lo son:
+
+- **El scheduler importa.** bore y bmq se llaman igual (`7.2.7-cizen-v3`, solo
+  cambia el pkgrel), así que el rollback no se elige por la release sino por el
+  manifiesto, y `--list` enseña a cuál vuelve. Antes, un archive de la misma
+  release pero de otro pkgrel se daba por bueno sin comprobarlo.
+- **Tras reinstalar hay que regenerar el UKI**, porque el del ESP sigue
+  apuntando al kernel que se acaba de sustituir: sin eso, reiniciar vuelve al
+  kernel nuevo. El archive de ficheros se conserva como plan B (por si falló
+  la copia del paquete) y avisa de que deja la base de datos de pacman
+  desincronizada.
+
+Con `CIZEN_ROLLBACK_PKG=0` se desactiva la preservación del paquete y se
+vuelve al comportamiento anterior (solo archive de ficheros).
+
 > `podar-modulos.sh` debe instalarse ejecutable junto al resto de la suite
 > (se copia igual que `kernel-update.sh`); si falta o no es ejecutable, el
 > build continúa sin poda (aviso claro, nunca falla). Si el árbol aún no

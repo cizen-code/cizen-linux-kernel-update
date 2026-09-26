@@ -134,7 +134,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.23"
+SCRIPT_VERSION="27.31.24"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -286,6 +286,16 @@ CIZEN_KERNEL_TRACK="${CIZEN_KERNEL_TRACK:-stable}"
 
 # Rollback dual-kernel: directorio (root) donde se archiva el kernel previo al instalar.
 ROLLBACK_DIR="${CIZEN_ROLLBACK_DIR:-/var/lib/kernel-update/rollback}"
+# Además del archive de ficheros, se preserva el PAQUETE del kernel instalado
+# (rollback.info + un .pkg.tar.zst). Es lo que permite volver atrás con pacman -U
+# en vez de dejar la base de datos mintiendo sobre qué kernel hay instalado.
+ROLLBACK_PKG_ENABLED="${CIZEN_ROLLBACK_PKG:-1}"
+ROLLBACK_MANIFEST="$ROLLBACK_DIR/rollback.info"
+ROLLBACK_PKG_FILE=""
+# Los helpers de la suite viven en /usr/local/bin/kernel-update/ y NO están en el
+# PATH (por diseño: no se mezclan con otras herramientas). Los mensajes que
+# invocan krollback llevan la ruta entera, o el usuario no puede copiarlos.
+KROLLBACK_SCRIPT="${CIZEN_KROLLBACK_SCRIPT:-/usr/local/bin/kernel-update/kernel-update-rollback.sh}"
 # Snapshot btrfs readonly de la raíz antes de instalar: 1=auto (si / es btrfs), 0=off.
 CIZEN_SNAPSHOT="${CIZEN_SNAPSHOT:-1}"
 SNAPSHOT_SUBVOL=".snapshots"
@@ -6985,14 +6995,144 @@ prune_stale_packages() {
 # antiguos se podan para mantener "actual + previo".
 SNAPSHOT_DESC=""
 
+# --- manifiesto del rollback ---------------------------------------------
+# Un archive de rollback sin saber QUÉ kernel contiene no sirve: bore y bmq
+# comparten release (`7.2.7-cizen-v3`), así que la release no identifica al
+# build. El manifiesto ata cada artefacto a su pkgbase+pkgver+scheduler.
+installed_pkgver() {
+  pacman -Q "$CIZEN_PKGBASE" 2>/dev/null | awk '{print $2}' | head -n1
+}
+
+rollback_manifest_field() {
+  local key="$1" line
+  [ -f "$ROLLBACK_MANIFEST" ] || return 0
+  while IFS= read -r line; do
+    case "$line" in
+      "$key="*) printf '%s\n' "${line#*=}"; return 0 ;;
+    esac
+  done < <(sudo cat -- "$ROLLBACK_MANIFEST" 2>/dev/null || cat -- "$ROLLBACK_MANIFEST" 2>/dev/null)
+  return 0
+}
+
+rollback_manifest_set() {
+  local key="$1" value="$2" tmp line
+  [ -n "$value" ] || return 0
+  sudo mkdir -p -- "$ROLLBACK_DIR" 2>/dev/null || return 0
+  tmp="$ROLLBACK_DIR/.rollback.info.$$.tmp"
+  {
+    if [ -f "$ROLLBACK_MANIFEST" ]; then
+      sudo cat -- "$ROLLBACK_MANIFEST" 2>/dev/null |
+        while IFS= read -r line; do
+          case "$line" in
+            "$key="*) printf '%s=%s\n' "$key" "$value" ;;
+            *) printf '%s\n' "$line" ;;
+          esac
+        done
+    fi
+    # Si la clave no estaba (o no había manifiesto), se añade al final.
+    if ! { [ -f "$ROLLBACK_MANIFEST" ] &&
+        sudo cat -- "$ROLLBACK_MANIFEST" 2>/dev/null | grep -q "^${key}="; }; then
+      printf '%s=%s\n' "$key" "$value"
+    fi
+  } | sudo tee "$tmp" >/dev/null 2>&1 || { sudo rm -f -- "$tmp" 2>/dev/null; return 1; }
+  sudo mv -f -- "$tmp" "$ROLLBACK_MANIFEST" 2>/dev/null || {
+    sudo rm -f -- "$tmp" 2>/dev/null; return 1; }
+  return 0
+}
+
+# ¿El archive de esta release es realmente el del kernel INSTALADO ahora?
+# Sin esta comprobación, un archive de la misma release pero de otro pkgrel (otro
+# scheduler) se daba por bueno: era un "rollback" a un kernel que ya no era el
+# anterior, y se descubría al usarlo.
+rollback_manifest_matches() {
+  local rel="$1" recorded installed
+  recorded="$(rollback_manifest_field pkgver)"
+  [ -n "$recorded" ] || return 1     # manifiesto legado o ausente: se rehace
+  installed="$(installed_pkgver)"
+  [ -n "$installed" ] || return 1
+  [ "$recorded" = "$installed" ]
+}
+
+# --- paquete de rollback: el que se puede REINSTALAR -----------------------
+# Un archive de ficheros no es un rollback de verdad: pacman sigue diciendo que
+# está instalado el kernel nuevo, y la próxima actualización vuelve a perder el
+# anterior. Con `CleanMethod=KeepCurrent`, además, pacman borra de su caché el
+# paquete anterior al instalar el nuevo, así que el .pkg.tar.zst solo existe
+# mientras dura la build (y la build vive en un tmpfs que se desmonta al
+# terminar). Por eso el motor guarda SU PROPIA copia del paquete que acaba de
+# instalar: es el único "anterior" que queda en el host.
+preserve_rollback_package() {
+  local pkgver tmp name size keep item
+  [ "$ROLLBACK_PKG_ENABLED" = "1" ] || { info "Preservación del paquete de rollback desactivada (CIZEN_ROLLBACK_PKG=0)."; return 0; }
+  [ -n "$PKG" ] && [ -s "$PKG" ] || { warn "No hay paquete que preservar para rollback ($PKG)."; return 0; }
+  [ -d "$ROLLBACK_DIR" ] || sudo mkdir -p -- "$ROLLBACK_DIR" 2>/dev/null || {
+    warn "No se pudo crear $ROLLBACK_DIR; el paquete NO queda preservado para rollback."; return 0; }
+
+  name="$(basename -- "$PKG")"
+  pkgver="$PKG_VERSION"
+  [ -n "$pkgver" ] || pkgver="$(installed_pkgver)"
+  [ -n "$pkgver" ] || { warn "No se pudo leer la versión del paquete; no se preserva para rollback."; return 0; }
+
+  # Se copia a un temporal en el MISMO directorio y se renombra: si se interrumpe
+  # a mitad, no queda un .pkg.tar.zst truncado que pacman instalaría unhappy.
+  tmp="$ROLLBACK_DIR/.pkg-$$.tmp"
+  sudo rm -f -- "$tmp" 2>/dev/null
+  if ! sudo cp -f -- "$PKG" "$tmp" 2>/dev/null; then
+    sudo rm -f -- "$tmp" 2>/dev/null
+    warn "No se pudo copiar el paquete a $ROLLBACK_DIR; el kernel anterior NO quedará disponible para rollback."
+    return 0
+  fi
+  sudo mv -f -- "$tmp" "$ROLLBACK_DIR/$name" 2>/dev/null || {
+    sudo rm -f -- "$tmp" 2>/dev/null
+    warn "No se pudo dejar el paquete preservado en $ROLLBACK_DIR/$name."; return 0; }
+
+  rollback_manifest_set pkgbase "$CIZEN_PKGBASE"
+  rollback_manifest_set pkgver "$pkgver"
+  rollback_manifest_set release "${VERSION}${LOCALVERSION_SUFFIX}"
+  rollback_manifest_set sched "$(effective_scheduler)"
+  rollback_manifest_set pkgfile "$name"
+  rollback_manifest_set ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # El archive (si lo hay) describes OTRO momento del mismo kernel en marcha; se
+  # desvincula para que el manifiesto no lo presente como parte de este paquete.
+  [ -f "$ROLLBACK_DIR/${VERSION}${LOCALVERSION_SUFFIX}.tar.xz" ] ||
+    rollback_manifest_set archive ""
+
+  # Solo se conserva el ÚLTIMO paquete: "actual + previo". Los anteriores se van
+  # (cada uno son ~100 MB y volver a ellos casi nunca es lo que se quiere). La
+  # firma .sig se va con su paquete: una firma sin paquete no sirve para nada y
+  # ocupa lo mismo.
+  shopt -s nullglob
+  for item in "$ROLLBACK_DIR"/*.pkg.tar.zst "$ROLLBACK_DIR"/*.pkg.tar.zst.sig; do
+    keep="$(basename -- "$item")"
+    case "$keep" in
+      "$name"|"$name.sig") continue ;;
+    esac
+    log "Pruning paquete de rollback antiguo: $keep"
+    sudo rm -f -- "$item" 2>/dev/null || true
+  done
+  shopt -u nullglob
+
+  size="$(sudo du -h -- "$ROLLBACK_DIR/$name" 2>/dev/null | cut -f1)"
+  ROLLBACK_PKG_FILE="$ROLLBACK_DIR/$name"
+  ok "Paquete de rollback preservado: $name${size:+ ($size)}, $CIZEN_PKGBASE-$pkgver [$(effective_scheduler)]"
+  info "Si este kernel no arranca, se reinstala el anterior con:"
+  info "  sudo $KROLLBACK_SCRIPT --list   # ver cuál es"
+  info "  sudo $KROLLBACK_SCRIPT          # reinstalarlo y regenerar el UKI"
+  return 0
+}
 prepare_rollback_archive() {
   local rel modules vmlinuz tmp
   rel="$(uname -r 2>/dev/null || true)"
   [ -n "$rel" ] || { warn "No se puede leer uname -r; no se guarda archive de rollback."; return 0; }
-  # Nunca volver a archivar la versión que acabamos de dejar de arrancar si ya
-  # existe un archive de la misma release: no vale la pena overwrite. Aún así se
-  # poda por si quedaran archives antiguos de sesiones previas.
-  [ -f "$ROLLBACK_DIR/$rel.tar.xz" ] && { info "Rollback ya existe para $rel; se conserva."; prune_rollback_archives; return 0; }
+  # El archive se nombra por release, pero el release NO identifica al build:
+  # bore y bmq comparten `7.2.7-cizen-v3` (solo cambia el pkgrel), así que un
+  # archive de la misma release puede ser de OTRO scheduler. Se conserva solo si
+  # el manifiesto dice que es el mismo paquete; si no, se rehace.
+  if [ -f "$ROLLBACK_DIR/$rel.tar.xz" ] && rollback_manifest_matches "$rel"; then
+    info "Rollback ya existe para $rel ($(rollback_manifest_field pkgver)); se conserva."
+    prune_rollback_archives
+    return 0
+  fi
 
   modules="/usr/lib/modules/$rel"
   vmlinuz="/boot/vmlinuz-linux-cizen-v3"
@@ -7022,6 +7162,11 @@ prepare_rollback_archive() {
       }
       printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | sudo tee "$ROLLBACK_DIR/$rel.timestamp" >/dev/null 2>&1 || true
       VERIFY_ROLLBACK_FILE="$ROLLBACK_DIR/$rel.tar.xz"
+      # El manifiesto ata el archive al paquete del que salió. Sin esto no se
+      # puede distinguir "el kernel anterior" de "otro build de la misma
+      # release" (bore vs bmq), que es justo lo que un rollback necesita saber.
+      rollback_manifest_set archive "$rel.tar.xz"
+      rollback_manifest_set archive_rel "$rel"
       ok "Rollback preparado: $ROLLBACK_DIR/$rel.tar.xz (kernel en ejecución $rel)"
     else
       sudo rm -f -- "$tmp" 2>/dev/null
@@ -9312,6 +9457,11 @@ case "$CIZEN_PKG_BACKEND" in
     recover_pacman_lock
     install_kernel_package || fatal "No se pudo instalar $PKG_NAME-$PKG_VERSION con pacman."
     ok "Paquete instalado: $PKG_NAME-$PKG_VERSION"
+    # El paquete vive en el tmpfs de la build y pacman borra el anterior de su
+    # caché (CleanMethod=KeepCurrent): si no se copia aquí, el kernel anterior
+    # desaparece del host y no hay rollback posible. Se hace justo tras instalar,
+    # que es el último momento en que el fichero existe.
+    preserve_rollback_package
     ;;
   deb)
     if command -v dpkg >/dev/null 2>&1; then
@@ -9501,11 +9651,15 @@ IMPORTANTE:
 
    sudo reboot
 
- Verificador: $VERIFY_STATE_MSG
- Si está activo, tras el reboot comprueba que el kernel cumple el perfil
- (incluido el scheduler que kronizó este build), el tiempo de arranque y
- busca regresiones en el journal.
- El kernel previo quedó archivado para rollback: krollback --list
+  Verificador: $VERIFY_STATE_MSG
+  Si está activo, tras el reboot comprueba que el kernel cumple el perfil
+  (incluido el scheduler que kronizó este build), el tiempo de arranque y
+  busca regresiones en el journal.
+  Rollback: el paquete de este kernel queda preservado en $ROLLBACK_DIR
+  (${ROLLBACK_PKG_FILE:-sin paquete: solo el archive de ficheros}).
+  Si el kernel nuevo no arranca, se reinstala el anterior con su scheduler:
+    sudo $KROLLBACK_SCRIPT --list   # ver cuál es
+    sudo $KROLLBACK_SCRIPT          # reinstalarlo y regenerar el UKI
 ===============================================================
 SUMMARY
 

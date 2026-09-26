@@ -1,3 +1,51 @@
+## [27.31.24] - 2026-09-25
+
+El rollback deja de ser un extracting de ficheros y pasa a reinstalar el paquete.
+
+Lo que pasaba: `krollback` extraía un `.tar.xz` con módulos + vmlinuz + UKI y
+decía, muy honestamente, "esto NO es un downgrade de paquete". El resultado era
+que **el kernel anterior no quedaba en ninguna parte del host**:
+
+- El paquete que genera la build vive en el tmpfs de compilación, que se
+  desmonta al terminar ("no se mantiene una segunda copia persistente").
+- El paquete anterior **tampoco está en la caché de pacman**: con
+  `CleanMethod=KeepCurrent` —el de `/etc/pacman.conf` en este host— la
+  transacción que instala el nuevo borra el viejo de la caché.
+- `/usr/lib/modules` solo conserva el release instalado: bore y bmq comparten
+  `7.2.7-cizen-v3`, así que al cambiar de scheduler el anterior desaparece.
+
+O sea que la redundancia era de mentira: el "kernel previo" archivado era una
+foto de un kernel de tres builds antes, y deshacer un cambio de scheduler
+implicaba recompilar.
+
+- **El motor preserva el PAQUETE que acaba de instalar**: lo copia a
+  `$ROLLBACK_DIR` en el momento de instalarlo (el último en que el fichero
+  existe) y se queda solo con ese —"actual + previo", cada uno ~100 MB.
+- **`rollback.info`**: manifiesto con `pkgbase`, `pkgver`, `release`, `sched`,
+  `pkgfile` y fecha. El rollback se elige por paquete, no por release, porque
+  bore y bmq tienen la MISMA release y solo difieren en el pkgrel.
+- **`krollback` reinstala**: `pacman -U` del paquete preservado (módulos,
+  vmlinuz y hooks) y después `cizen-uki-sync`, porque el UKI del ESP sigue
+  apuntando al kernel recién sustituido y sin regenerarlo el reboot vuelve al
+  kernel nuevo. La base de datos de pacman deja de mentir sobre qué hay
+  instalado.
+- **`krollback --list`** enseña el kernel anterior con su scheduler, su release
+  y si el paquete está presente de verdad.
+- **El archive de ficheros no se toca**: pasa a ser plan B para cuando falló la
+  copia del paquete, y avisa de que deja pacman desincronizado.
+- **Un archive de la misma release pero de otro pkgrel ya no se da por bueno.**
+  Antes `prepare_rollback_archive` veía el fichero, veía que la release
+  coincidía y lo conservaba —pudiendo ser el kernel de otro scheduler. Ahora se
+  comprueba contra el manifiesto, y sin manifiesto se rehace.
+- La copia va a temporal y se renombra: un `.pkg.tar.zst` truncado por una
+  interrupción no llega a existe para que pacman lo instale a medias.
+- `CIZEN_ROLLBACK_PKG=0` desactiva la preservación y vuelve al plan B.
+
+Lo que esto **no** arregla: el paquete de bore (pkgrel-2) que había en este host
+ya no existe en ninguna parte, así que volver a él sigue necesitando un build
+`--sched bore`. A partir de ahora, ese build sí deja el paquete de BMQ
+disponible para volver atrás.
+
 ## [27.31.23] - 2026-09-25
 
 Un banco para comparar schedulers, porque el tiempo de arranque no sirve.

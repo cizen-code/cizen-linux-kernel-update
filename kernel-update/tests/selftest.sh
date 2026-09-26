@@ -140,6 +140,12 @@ extract() { # $1 = nombre de función (hasta el `}` inicial en columna 0)
   extract unmount_tmpfs_build
   extract effective_scheduler
   extract write_verify_signature
+  # v27.31.24: rollback por paquete (no solo por ficheros)
+  extract installed_pkgver
+  extract rollback_manifest_field
+  extract rollback_manifest_set
+  extract rollback_manifest_matches
+  extract preserve_rollback_package
 } > "$ROOT/fns.sh"
 
 if [ ! -s "$ROOT/fns.sh" ]; then
@@ -2073,6 +2079,175 @@ if bash -c 'printf "%s\n" "Direct firmware load for i915/kbl_dmc_ver1_04.bin fai
   rec ok "extracción del nombre de firmware: admite rutas con subdirectorios"
 else
   rec fail "la extracción del nombre de firmware rompe con rutas tipo i915/..."
+fi
+
+# --- rollback por PAQUETE, no solo por ficheros (v27.31.24) ---
+# El fallo que motivó esto: el archive de rollback guarda ficheros y krollback los
+# extraía, así que pacman seguía diciendo que estaba instalado el kernel NUEVO.
+# Con CleanMethod=KeepCurrent, además, pacman borra de su caché el paquete
+# anterior al instalar el siguiente, y la build vive en un tmpfs que se desmonta
+# al terminar: el kernel anterior no quedaba en ninguna parte del host.
+printf '%s\n' "== rollback: manifiesto y paquete preservado =="
+
+RB="$ROOT/rollback"
+rm -rf "$RB"; mkdir -p "$RB"
+ROLLBACK_DIR="$RB"
+ROLLBACK_MANIFEST="$RB/rollback.info"
+ROLLBACK_PKG_FILE=""
+ROLLBACK_PKG_ENABLED=1
+KROLLBACK_SCRIPT="/usr/local/bin/kernel-update/kernel-update-rollback.sh"
+CIZEN_PKGBASE="linux-cizen-v3"
+VERSION="7.2.7"
+LOCALVERSION_SUFFIX="-cizen-v3"
+PATCHES_APPLIED=(bmq)
+# sudo como stub: los tests no son root y no deben serlo. Todo lo que pide
+# privilegio (cp/tee/mv/cat/du/test) va contra un directorio del usuario.
+sudo() { [ "$1" = sudo ] && shift; "$@"; }
+# effective_scheduler se unset más arriba de la suite (tras su propio test), y
+# preserve_rollback_package lo usa para firmar el paquete: se reextrae.
+eval "$(extract effective_scheduler)"
+PACMAN_Q_VERSION=""
+pacman() { case "$1" in -Q) printf '%s %s\n' "$CIZEN_PKGBASE" "$PACMAN_Q_VERSION" ;; *) return 1 ;; esac; }
+
+# El manifiesto es un mapa clave=valor: se escribe una clave, se relee, y una
+# clave que no existe no inventa nada (si "devolviera" algo, krollback podría
+# reinstalar un paquete con nombre vacío).
+rollback_manifest_set pkgbase "linux-cizen-v3"
+rollback_manifest_set pkgver "7.2.7_cizen_v3-2"
+rollback_manifest_set sched "bmq"
+[ "$(rollback_manifest_field pkgver)" = "7.2.7_cizen_v3-2" ] \
+  && rec ok "rollback: el manifiesto guarda y relee el pkgver" \
+  || rec fail "rollback: el manifiesto no relee pkgver ('$(rollback_manifest_field pkgver)')"
+[ -z "$(rollback_manifest_field noexiste)" ] \
+  && rec ok "rollback: una clave ausente devuelve vacío (no inventa un paquete)" \
+  || rec fail "rollback: clave inexistente devolvió algo"
+rollback_manifest_set pkgver "7.2.7_cizen_v3-3"
+[ "$(rollback_manifest_field pkgver)" = "7.2.7_cizen_v3-3" ] \
+  && rec ok "rollback: reescribir una clave no duplica entradas" \
+  || rec fail "rollback: la clave se quedó con el valor viejo"
+[ "$(grep -c '^pkgver=' "$ROLLBACK_MANIFEST")" = "1" ] \
+  && rec ok "rollback: el manifiesto no acumula líneas repetidas" \
+  || rec fail "rollback: el manifiesto duplicó la clave pkgver"
+[ "$(rollback_manifest_field sched)" = "bmq" ] \
+  && rec ok "rollback: el manifiesto guarda el scheduler del paquete anterior" \
+  || rec fail "rollback: el scheduler no quedó en el manifiesto"
+
+# La comprobación que faltaba y hacía peligroso el "rollback": un archive de la
+# MISMA release pero de otro pkgrel (bore vs bmq comparten 7.2.7-cizen-v3) no
+# puede darse por bueno. Solo vale si el pkgver del manifiesto es el instalado.
+rollback_manifest_set pkgver "7.2.7_cizen_v3-2"
+PACMAN_Q_VERSION="7.2.7_cizen_v3-2"
+rollback_manifest_matches "7.2.7-cizen-v3" \
+  && rec ok "rollback: el archive de la release vale si es el paquete instalado" \
+  || rec fail "rollback: se rechazó un archive que sí correspondía"
+rollback_manifest_set pkgver "7.2.7_cizen_v3-2"
+PACMAN_Q_VERSION="7.2.7_cizen_v3-3"
+if rollback_manifest_matches "7.2.7-cizen-v3"; then
+  rec fail "rollback: un archive de la MISMA release pero de otro pkgrel se dio por bueno"
+else
+  rec ok "rollback: un archive de la misma release y OTRO pkgrel se rechaza (bore vs bmq)"
+fi
+rm -f "$ROLLBACK_MANIFEST"
+if rollback_manifest_matches "7.2.7-cizen-v3"; then
+  rec fail "rollback: sin manifiesto dio por bueno un archive desconocido"
+else
+  rec ok "rollback: sin manifiesto el archive se rehace en vez de confiar a ciegas"
+fi
+
+# preserve_rollback_package: copia el paquete tmpfs al directorio de rollback y
+# deja constancia de a qué kernel y scheduler corresponde.
+PACMAN_Q_VERSION="7.2.7_cizen_v3-2"
+mkdir -p "$SRC"
+printf 'paquete falso\n' > "$SRC/linux-cizen-v3-7.2.7_cizen_v3-2-x86_64.pkg.tar.zst"
+PKG="$SRC/linux-cizen-v3-7.2.7_cizen_v3-2-x86_64.pkg.tar.zst"
+PKG_VERSION="7.2.7_cizen_v3-2"
+preserve_rollback_package
+if [ -s "$ROLLBACK_DIR/linux-cizen-v3-7.2.7_cizen_v3-2-x86_64.pkg.tar.zst" ]; then
+  rec ok "rollback: el paquete instalado queda copiado al directorio de rollback"
+else
+  rec fail "rollback: el paquete no se copió (quedaría el kernel anterior en el tmpfs)"
+fi
+[ "$(rollback_manifest_field pkgfile)" = "linux-cizen-v3-7.2.7_cizen_v3-2-x86_64.pkg.tar.zst" ] \
+  && rec ok "rollback: el manifiesto apunta al paquete copiado" \
+  || rec fail "rollback: pkgfile incorrecto ('$(rollback_manifest_field pkgfile)')"
+[ "$(rollback_manifest_field sched)" = "bmq" ] \
+  && rec ok "rollback: el paquete preservado firma su scheduler (bmq)" \
+  || rec fail "rollback: el scheduler del paquete preservado no es el efectivo"
+
+# Solo "actual + previo": un paquete más viejo se va (son ~100 MB cada uno).
+printf 'viejo\n' > "$ROLLBACK_DIR/linux-cizen-v3-7.2.7_cizen_v3-1-x86_64.pkg.tar.zst"
+printf 'firma vieja\n' > "$ROLLBACK_DIR/linux-cizen-v3-7.2.7_cizen_v3-1-x86_64.pkg.tar.zst.sig"
+printf 'firma del actual\n' > "$ROLLBACK_DIR/linux-cizen-v3-7.2.7_cizen_v3-2-x86_64.pkg.tar.zst.sig"
+preserve_rollback_package
+[ -f "$ROLLBACK_DIR/linux-cizen-v3-7.2.7_cizen_v3-1-x86_64.pkg.tar.zst" ] \
+  && rec fail "rollback: se acumuló un paquete más viejo que el actual" \
+  || rec ok "rollback: se poda el paquete de un build anterior (solo actual + previo)"
+[ -f "$ROLLBACK_DIR/linux-cizen-v3-7.2.7_cizen_v3-1-x86_64.pkg.tar.zst.sig" ] \
+  && rec fail "rollback: la firma .sig del paquete viejo se quedó huérfana" \
+  || rec ok "rollback: la firma suelta del paquete viejo se poda con él"
+[ -f "$ROLLBACK_DIR/linux-cizen-v3-7.2.7_cizen_v3-2-x86_64.pkg.tar.zst.sig" ] \
+  && rec ok "rollback: la firma del paquete vigente se conserva con él" \
+  || rec fail "rollback: se podó la firma del paquete que se acaba de preservar"
+
+# Sin paquete que copiar no se rompe nada, pero se dice (fallo blando: que el
+# paquete no quede en ningún sitio es justo lo que hace inútil el rollback).
+PKG=""
+ROLLBACK_PKG_ENABLED=1
+warn() { printf 'WARN: %s\n' "$*" >> "$ROOT/warn.log"; }
+preserve_rollback_package
+grep -q "No hay paquete que preservar" "$ROOT/warn.log" 2>/dev/null \
+  && rec ok "rollback: sin paquete que preservar avisa en vez de fingir que está todo bien" \
+  || rec fail "rollback: la falta de paquete pasa silenciosa"
+ROLLBACK_PKG_ENABLED=0
+rm -f "$ROOT/warn.log"
+preserve_rollback_package
+[ -s "$ROOT/warn.log" ] \
+  && rec fail "rollback: CIZEN_ROLLBACK_PKG=0 no desactiva la preservación" \
+  || rec ok "rollback: CIZEN_ROLLBACK_PKG=0 desactiva la preservación del paquete"
+rm -rf "$RB"; rm -f "$SRC"/*.pkg.tar.zst
+
+# krollback reinstala con pacman -U y regenera la UKI: si se queda en extraer
+# ficheros, la base de datos sigue mintiendo sobre qué kernel está instalado.
+KROLLBACK="$(dirname "$MOTOR")/kernel-update-rollback.sh"
+if [ -r "$KROLLBACK" ]; then
+  bash -n "$KROLLBACK" 2>/dev/null \
+    && rec ok "krollback: bash -n limpio" \
+    || rec fail "krollback: no pasa bash -n"
+  if grep -q 'pacman -U "\$pkgpath"' "$KROLLBACK"; then
+    rec ok "krollback: el plan A reinstala el paquete con pacman -U"
+  else
+    rec fail "krollback: no reinstala el paquete (sigue siendo solo extraer ficheros)"
+  fi
+  # Sin regenerar la UKI, reiniciar volvería a arrancar el kernel que se acaba
+  # de sustituir: el UKI del ESP apunta al kernel nuevo.
+  if grep -q 'cizen-uki-sync' "$KROLLBACK"; then
+    rec ok "krollback: regenera el UKI tras reinstalar (si no, se reinicia al kernel nuevo)"
+  else
+    rec fail "krollback: no regenera el UKI; el reboot volvería al kernel que se sustituyó"
+  fi
+  # El scheduler del paquete anterior se nombra explícitamente: bore y bmq se
+  # llaman igual, y el usuario tiene que ver a cuál vuelve.
+  if grep -q 'scheduler: %s' "$KROLLBACK" && grep -q 'sched' "$KROLLBACK"; then
+    rec ok "krollback: --list enseña el scheduler del kernel anterior"
+  else
+    rec fail "krollback: no enseña qué scheduler tiene el kernel anterior"
+  fi
+  # El plan B (ficheros) tiene que existir pero decir lo que cuesta: deja la base
+  # de datos de pacman mintiendo.
+  if grep -q 'NO es un downgrade de paquete' "$KROLLBACK"; then
+    rec ok "krollback: el plan B advierte de que deja pacman desincronizado"
+  else
+    rec fail "krollback: el plan B no advierte de la desincronización de pacman"
+  fi
+  CIZEN_ROLLBACK_DIR="$ROOT/empty-rollback" bash "$KROLLBACK" --list >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    rec ok "krollback: --list avisa (no revienta) si no hay nada que restaurar"
+  else
+    rec fail "krollback: --list con el directorio vacío devolvió rc=0"
+  fi
+else
+  printf '  (sin %s: se omiten los tests de krollback)\n' "$KROLLBACK"
 fi
 
 # --- resumen ---
