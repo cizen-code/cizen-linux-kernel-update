@@ -68,8 +68,20 @@ Ahora el motor copia a `$ROLLBACK_DIR` el **paquete que acaba de instalar** (y
 solo ese: "actual + previo"), junto a un manifiesto `rollback.info` con
 pkgbase, pkgver, release y scheduler:
 
-En el menú interactivo es la **opción 9** (`cizen-menu`), que además muestra en
-la propia etiqueta a qué se vuelve:
+Todas las opciones que compilan (3, 4, 5, 7, 8, 14, 15, 16) preguntan el
+compilador antes de arrancar:
+
+```
+  CC (Enter usa el default):
+    auto  elige según el sistema (clang si LTO/toolchain LLVM viable; si no gcc) (default)
+    gcc   compilador GCC
+    clang Clang/LLVM (necesario para el LTO)
+    otro  teclea TU compilador (p. ej. gcc-14, clang-17 o una ruta). Se exigirá como dependencia si falta.
+  CC [Enter=auto]:
+```
+
+En el menú interactivo, el rollback es la **opción 9** (`cizen-menu`), que además
+muestra en la propia etiqueta a qué se vuelve:
 
 ```
     9)  rollback      volver al kernel anterior · linux-cizen-v3-7.2.7_cizen_v3-2 (bmq)

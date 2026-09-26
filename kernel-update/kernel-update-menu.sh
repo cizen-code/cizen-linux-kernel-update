@@ -199,6 +199,44 @@ opt() { # $1=número $2=nombre $3=descripción
   printf '%b%5s%b)  %-13s %s\n' "$C" "$1" "$N" "$2" "$3"
 }
 
+# ── Elección de compilador (compartida por TODAS las opciones de build) ──
+# v27.31.24: preguntar el compilador solo en la opción 14 (variant) dejaba al
+# resto de builds —que son las que se usan a diario— atadas al default, sin
+# forma de forzar gcc o clang cuando toca (p. ej. un fallo de LTO con clang, o
+# al revés, comparar compiladores). Ahora toda opción que compila pregunta.
+#
+# El submenú va a stderr y la elección a stdout para poder capturarla con $( ):
+# la pregunta tiene que verse en la terminal mientras se lee, no desaparecer
+# dentro del subshell. El prompt de `read -p` también va a stderr, por eso las
+# dos piezas se ven y solo se captura lo tecleado.
+ask_cc() {
+  local cc prompt
+  printf '\n  %bCC%b (Enter usa el default):\n' "$W" "$N" >&2
+  printf '    %bauto%b  elige según el sistema (clang si LTO/toolchain LLVM viable; si no gcc) (default)\n' "$W" "$N" >&2
+  printf '    %bgcc%b   compilador GCC\n' "$W" "$N" >&2
+  printf '    %bclang%b Clang/LLVM (necesario para el LTO)\n' "$W" "$N" >&2
+  printf '    %botro%b  teclea TU compilador (p. ej. gcc-14, clang-17 o una ruta). Se exigirá como dependencia si falta.\n' "$W" "$N" >&2
+  # El prompt se compone aparte: en `read -p PROMPT NOMBRE...` lo que va
+  # detrás es el nombre de la variable, no argumentos del %b, y con
+  # `read -p "...%b..." "$W" "$N" cc` bash acaba haciendo read sobre "".
+  prompt="$(printf '  %bCC%b [Enter=%bauto%b]: ' "$W" "$N" "$Y" "$N")"
+  read -r -p "$prompt" cc
+  printf '%s' "$cc"
+}
+
+# Lanza un build preguntando antes el compilador.
+#   $1 = prioridad (baja|alta)   $2.. = argumentos del motor
+# El default del motor ya es "auto", así que Enter (vacío) no añade nada; lo que
+# se teclee se pasa tal cual, y el motor resuelve auto/gcc/clang/gcc-14/... .
+build_and_exec() {
+  local prio="$1"; shift
+  local cc
+  cc="$(ask_cc)"
+  [ "$prio" = "alta" ] && export CIZEN_BUILD_PRIORITY=normal
+  # shellcheck disable=SC2086
+  exec "$SCRIPT" "$@" ${cc:+--cc "$cc"}
+}
+
 echo "  ${W}Validación${N}"
 opt 1 "check"       "validar config · baja"
 opt 2 "checkfast"   "validar config · alta"
@@ -234,12 +272,12 @@ while true; do
   case "$choice" in
     1) exec "$SCRIPT" --absorb-rebels --check ;;
     2) CIZEN_BUILD_PRIORITY=normal exec "$SCRIPT" --absorb-rebels --check ;;
-    3) exec "$SCRIPT" --absorb-rebels ;;
-    4) CIZEN_BUILD_PRIORITY=normal exec "$SCRIPT" --absorb-rebels ;;
-    5) exec "$SCRIPT" --force ;;
+    3) build_and_exec baja --absorb-rebels ;;
+    4) build_and_exec alta --absorb-rebels ;;
+    5) build_and_exec baja --force ;;
     6) exec "$SCRIPT" --check-update ;;
-    7) exec "$SCRIPT" --absorb-rebels --patch bore ;;
-    8) CIZEN_BUILD_PRIORITY=normal exec "$SCRIPT" --absorb-rebels --patch bore ;;
+    7) build_and_exec baja --absorb-rebels --patch bore ;;
+    8) build_and_exec alta --absorb-rebels --patch bore ;;
     9) if [ -x "$ROLLBACK_SCRIPT" ]; then
          exec "$ROLLBACK_SCRIPT"
        else
@@ -270,13 +308,7 @@ while true; do
        printf '    %bmuqss%b   MuQSS · tercero\n' "$W" "$N"
        printf '  %bScheduler%b [Enter=%blinherit%b]: ' "$W" "$N" "$Y" "$N"
        read -r sched
-       printf '\n  %bCC%b (Enter usa el default):\n' "$W" "$N"
-       printf '    %bauto%b  elige según el sistema (clang si LTO/toolchain LLVM viable; si no gcc) (default)\n' "$W" "$N"
-       printf '    %bgcc%b   compilador GCC\n' "$W" "$N"
-       printf '    %bclang%b Clang/LLVM (necesario para el LTO)\n' "$W" "$N"
-       printf '    %botro%b  teclea TU compilador (p. ej. gcc-14, clang-17 o una ruta). Se exigirá como dependencia si falta.\n' "$W" "$N"
-       printf '  %bCC%b [Enter=%blauto%b]: ' "$W" "$N" "$Y" "$N"
-       read -r cc
+       cc="$(ask_cc)"
        # v27.31.16: si el scheduler elegido solo existe en el fork y la versión
        # no está publicada allí, se ofrece la última del fork de esa línea en
        # lugar de dejar que el build aborte. Sin TTY (o sin fallback) se sigue
@@ -304,8 +336,8 @@ while true; do
        [ -n "$cc" ] && args="$args --cc $cc"
        # shellcheck disable=SC2086
        exec "$SCRIPT" $args ;;
-    15) exec "$SCRIPT" --absorb-rebels --ntsync ;;
-    16) exec "$SCRIPT" --absorb-rebels --cachy ;;
+    15) build_and_exec baja --absorb-rebels --ntsync ;;
+    16) build_and_exec baja --absorb-rebels --cachy ;;
     17) exec /usr/local/bin/kernel-update/kernel-update-manager.sh ;;
     0) echo "  Saliendo."; exit 0 ;;
     *) printf '  %bOpción no válida: %s%b\n' "$R" "$choice" "$N" ;;

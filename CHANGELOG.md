@@ -1,3 +1,35 @@
+## [27.31.25] - 2026-09-25
+
+El compilador se elige al vuelo en cualquier build, no solo en `variant`.
+
+Preguntar el CC solo en la 14 dejaba a las opciones que se usan a diario —`build`,
+`buildfast`, `force`, `buildbore`, `buildborefast`, `ntsync`, `cachy`— atadas al
+default del motor, sin forma de forzar `gcc` o `clang` justo cuando hace falta
+(un LTO de clang que falla, o comparar compilers de verdad). Ahora al elegir
+cualquiera de ellas (3, 4, 5, 7, 8, 14, 15, 16) aparece:
+
+```
+  CC (Enter usa el default):
+    auto  elige según el sistema (clang si LTO/toolchain LLVM viable; si no gcc) (default)
+    gcc   compilador GCC
+    clang Clang/LLVM (necesario para el LTO)
+    otro  teclea TU compilador (p. ej. gcc-14, clang-17 o una ruta). Se exigirá como dependencia si falta.
+  CC [Enter=auto]:
+```
+
+- Enter no añade argumento: el default del motor ya es `auto`. Lo tecleado se
+  pasa tal cual como `--cc`, así que también vale `gcc-14`, `clang-17` o una ruta.
+- `ask_cc()` es una función compartida por todas las opciones, incluida la 14: la
+  14 arrastraba su propia copia del submenú y ya se habían desincronizado (su
+  prompt decía `lauto` en vez de `auto`, con un `l` de más).
+- El submenú va a **stderr** y lo tecleado sale por stdout, para poder capturarlo
+  con `$( )` sin que la pregunta desaparezca dentro del subshell.
+- La prioridad `baja`/`alta` de cada opción se aplica en el mismo sitio, sin
+  depender de un `VAR=x exec` (que solo exporta por su cuenta en algunos casos).
+- 6 tests nuevos: las 7 opciones de build pasan por `build_and_exec`, la 14
+  reutiliza `ask_cc`, `--cc` llega tal cual al motor, Enter no añade nada, la
+  prioridad `alta` se propaga, y el submenú se ve. Suite: 273 ok, 0 fail.
+
 ## [27.31.24] - 2026-09-25
 
 El rollback deja de ser un extracting de ficheros y pasa a reinstalar el paquete,

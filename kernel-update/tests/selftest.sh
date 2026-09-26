@@ -1310,6 +1310,70 @@ cachyos-7.2.80-1" fork_tagrel 7.2.8)" ]; then
   else
     rec fail "menú rollback: exec sin comprobar el script (error ilegible si falta)"
   fi
+
+  # ── Compilador: toda opción que compila tiene que preguntar cuál ──
+  # Preguntarlo solo en la opción 14 dejaba a las de uso diario atadas al
+  # default del motor, sin forma de forzar gcc o clang cuando hace falta.
+  # Cada build tiene que pasar por build_and_exec; si alguien añade una opción
+  # nueva compilando con exec a pelo, este test lo canta.
+  faltan=""
+  for n in 3 4 5 7 8 15 16; do
+    grep -qE "^ +$n\) build_and_exec " "$MENU" || faltan="$faltan $n"
+  done
+  if [ -z "$faltan" ]; then
+    rec ok "menú: las 7 opciones de build (3,4,5,7,8,15,16) pasan por build_and_exec (preguntan CC)"
+  else
+    rec fail "menú: opciones de build sin pregunta de CC:$faltan"
+  fi
+  # La 14 reutiliza el submenú en vez de tener su propia copia: las dos copias ya
+  # se habían desincronizado una vez (su prompt decía «lauto» y no «auto»).
+  if [ "$(grep -c 'CC%b (Enter usa el default)' "$MENU")" = 1 ] && grep -q 'cc="$(ask_cc)"' "$MENU"; then
+    rec ok "menú: la opción 14 reutiliza ask_cc en vez de duplicar el submenú"
+  else
+    rec fail "menú: submenú de CC duplicado (o la opción 14 sin ask_cc); volverían a divergir"
+  fi
+
+  # ask_cc escribe el submenú en stderr y lo tecleado en stdout: así la pregunta
+  # se ve en la terminal y aun así se puede capturar con $( ). build_and_exec
+  # solo añade --cc si se tecleó algo, porque el default del motor ya es auto.
+  sed -n '/^ask_cc() {/,/^}/p; /^build_and_exec() {/,/^}/p' "$MENU" > "$ROOT/ccfn.sh"
+  cat > "$ROOT/fake-engine.sh" <<'FAKE'
+#!/bin/bash
+printf 'ARGS:'; printf ' <%s>' "$@"; printf ' PRIO=%s\n' "${CIZEN_BUILD_PRIORITY:-unset}"
+FAKE
+  chmod +x "$ROOT/fake-engine.sh"
+  cat > "$ROOT/cc-run.sh" <<RUNNER
+W=''; G=''; Y=''; N=''
+# shellcheck disable=SC1090
+source "$ROOT/ccfn.sh"
+SCRIPT="$ROOT/fake-engine.sh"
+build_and_exec "\$@"
+RUNNER
+  out_clang="$(printf 'clang\n' | bash "$ROOT/cc-run.sh" baja --absorb-rebels 2>/dev/null)"
+  out_empty="$(printf '\n' | bash "$ROOT/cc-run.sh" baja --absorb-rebels 2>/dev/null)"
+  out_alta="$(printf 'gcc-14\n' | bash "$ROOT/cc-run.sh" alta --absorb-rebels 2>/dev/null)"
+  if [ "$out_clang" = "ARGS: <--absorb-rebels> <--cc> <clang> PRIO=unset" ]; then
+    rec ok "menú: elegir clang en el submenú llega al motor como --cc clang"
+  else
+    rec fail "menú: --cc mal pasado al motor ('$out_clang')"
+  fi
+  if [ "$out_empty" = "ARGS: <--absorb-rebels> PRIO=unset" ]; then
+    rec ok "menú: Enter en el submenú no añade --cc (el default del motor ya es auto)"
+  else
+    rec fail "menú: Enter añadió un argumento de más ('$out_empty')"
+  fi
+  if [ "$out_alta" = "ARGS: <--absorb-rebels> <--cc> <gcc-14> PRIO=normal" ]; then
+    rec ok "menú: un compilador tecleado a mano (gcc-14) y la prioridad «alta» llegan ambos al motor"
+  else
+    rec fail "menú: CC tecleado o prioridad mal pasados ('$out_alta')"
+  fi
+  # Si el submenú fuera a stdout desaparecería dentro del $(), es decir el
+  # usuario no vería la pregunta. Por eso va a stderr.
+  if printf 'gcc\n' | bash "$ROOT/cc-run.sh" baja 2>&1 >/dev/null | grep -q 'CC (Enter usa el default)'; then
+    rec ok "menú: el submenú de CC se ve en la terminal (va a stderr, no se pierde en el $)"
+  else
+    rec fail "menú: el submenú de CC no se ve (si fuera a stdout se perdería en el \$)"
+  fi
   # Sin red el menú no debe avisar ni bloquear (fail-open), y la pregunta de la
   # versión alternativa solo se hace en terminal.
   if grep -q '\[ -n "\$tags" \] || return 1' "$MENU" \
