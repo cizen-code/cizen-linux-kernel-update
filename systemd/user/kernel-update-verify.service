@@ -1,0 +1,13 @@
+[Unit]
+Description=Verificar el kernel Cizen arrancado (perfil, scheduler, boot, journal)
+Documentation=file:///usr/local/bin/kernel-update/kernel-update-verify.sh
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/kernel-update/kernel-update-verify.sh
+# El escaneo de firmware de todos los módulos cargados es la parte lenta.
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

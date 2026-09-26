@@ -134,7 +134,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.18"
+SCRIPT_VERSION="27.31.21"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -181,6 +181,9 @@ TMPFS_CREATED_BY_SCRIPT=false
 # no tiene motivo de existir y se desmonta. CIZEN_KEEP_TMPFS=1 conserva el
 # comportamiento anterior (reutilización del árbol entre ejecuciones).
 CIZEN_KEEP_TMPFS="${CIZEN_KEEP_TMPFS:-0}"
+# v27.31.19: resultado del desmontaje de fin de build para el informe final.
+TMPFS_UMOUNT_STATUS=""
+TMPFS_UMOUNT_NOTE=""
 # Desmontaje inteligente (v27.31.17). El directorio del árbol solo lleva la
 # versión (linux-X.Y.Z), de modo que un vanilla conservado y un build del fork
 # pueden acabar en el mismo camino y "reutilizarse" sin que se note (los
@@ -1781,6 +1784,15 @@ get_avail_mb() {
   echo $(( ${kb:-0} / 1024 ))
 }
 
+# Memoria disponible del SISTEMA (no del tmpfs): es la magnitud que se recupera
+# al desmontar el árbol de compilación, así que es la que se mide para poder
+# decir cuántos GB volvieron a la RAM.
+get_mem_available_mb() {
+  local kb
+  kb="$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo 2>/dev/null)"
+  echo $(( ${kb:-0} / 1024 ))
+}
+
 prepare_dirs() {
   mkdir -p "$KERNEL_BUILD_ROOT" "$TMPFS_ROOT" "$(dirname "$LOCK_FILE")"
 }
@@ -1804,14 +1816,25 @@ tmpfs_is_mounted() {
   [ "$(findmnt -n -M "$TMPFS_ROOT" -o FSTYPE 2>/dev/null | head -n1 || true)" = "tmpfs" ]
 }
 
-# Desmonta el tmpfs de compilación, incluidos los montajes APILADOS que
-# hubiera (un solo umount no basta y dejaría la RAM retenida, que es justo lo
-# que este flujo viene a devolver). Si algo lo usa, no se fuerza con -l.
+# Desmonta el tmpfs de compilación, incluidos los montajes APILADOS que hubiera
+# (un solo umount no basta y dejaría la RAM retenida, que es justo lo que este
+# flujo viene a devolver). Si algo lo usa, no se fuerza con -l: se informa.
+#   0 = desmontado   1 = sigue montado (EBUSY, credenciales, lo que sea)
+# Hasta v27.31.18 el stderr de umount se descartaba, así que un EBUSY (proceso
+# del pipeline que aún sujetaba el árbol) era invisible: el build terminaba
+# "bien" con 7 GB de tmpfs ocupado. Ahora el error se conserva y se reporta.
+TMPFS_UMOUNT_ERR=""
 tmpfs_umount_all() {
   local n=0 max=4
+  TMPFS_UMOUNT_ERR=""
   while [ "$n" -lt "$max" ]; do
     findmnt -n -M "$TMPFS_ROOT" -o TARGET 2>/dev/null | grep -q . || return 0
-    sudo umount "$TMPFS_ROOT" 2>/dev/null || return 1
+    # OJO: sin sonda previa tipo `sudo -n true`. Con un allowlist de sudoers
+    # por comando (como este host) la sonda se deniega aunque el umount sí esté
+    # permitido, y se abortaba el desmontaje sin intentarlo nunca.
+    if ! TMPFS_UMOUNT_ERR="$(sudo -n umount "$TMPFS_ROOT" 2>&1)"; then
+      return 1
+    fi
     n=$((n + 1))
   done
   if findmnt -n -M "$TMPFS_ROOT" -o TARGET 2>/dev/null | grep -q .; then
@@ -1913,24 +1936,64 @@ prepare_tmpfs_build() {
 
 unmount_tmpfs_build() {
   [ "$TMPFS_MOUNTED" = true ] || return 0
+  # Estado para el informe final: unmounted | failed | kept | not-mounted.
+  TMPFS_UMOUNT_STATUS="not-mounted"
+  TMPFS_UMOUNT_NOTE=""
 
-  # Tras un flujo completo exitoso el tmpfs ya no hace falta: se desmonta.
-  # CIZEN_KEEP_TMPFS=1 lo conserva (reutilización del árbol, diagnóstico).
+  # Tras un flujo completo exitoso el tmpfs ya no hace falta: se desmonta SIEMPRE
+  # (v27.31.19: requisito explícito — el éxito total implica devolver la RAM, y
+  # no un optional que se puede perder). CIZEN_KEEP_TMPFS=1 es el único opt-out
+  # y se dice en el informe final para que quede constancia.
   # Los flujos parciales (p. ej. solo check) nunca desmontan, para que un
   # kcheck prepare el entorno y el kbuild siguiente lo reutilice.
   if [ "$FULL_PIPELINE_OK" = true ] && [ "$CIZEN_KEEP_TMPFS" != "1" ]; then
     if tmpfs_is_mounted; then
+      local used_mb=0 before_mb after_mb attempt
+      before_mb="$(get_mem_available_mb)"
       log "Desmontando tmpfs de compilación (flujo completo exitoso): $TMPFS_ROOT"
       if sudo -v >/dev/null 2>&1 || true; then :; fi
-      if tmpfs_umount_all; then
-        ok "tmpfs desmontado: $TMPFS_ROOT"
-        TMPFS_MOUNTED=false
-        TMPFS_CREATED_BY_SCRIPT=false
-        return 0
+      # Dos intentos: lo que suele sujetar el montaje es un subproceso del
+      # propio pipeline que está terminando, y a los pocos segundos ya no está.
+      for attempt in 1 2; do
+        if tmpfs_umount_all; then
+          after_mb="$(get_mem_available_mb)"
+          used_mb=$(( after_mb - before_mb ))
+          [ "$used_mb" -lt 0 ] && used_mb=0
+          TMPFS_UMOUNT_STATUS="unmounted"
+          TMPFS_UMOUNT_NOTE="$used_mb"
+          if [ "$used_mb" -ge 1024 ]; then
+            ok "tmpfs desmontado: $TMPFS_ROOT (~$(( used_mb / 1024 )) GB devueltos a la RAM)"
+          else
+            ok "tmpfs desmontado: $TMPFS_ROOT (~${used_mb} MB devueltos a la RAM)"
+          fi
+          TMPFS_MOUNTED=false
+          TMPFS_CREATED_BY_SCRIPT=false
+          return 0
+        fi
+        [ "$attempt" = "1" ] && sleep 2
+      done
+      TMPFS_UMOUNT_STATUS="failed"
+      TMPFS_UMOUNT_NOTE="sigue montado tras 2 intentos"
+      warn "No se pudo desmontar $TMPFS_ROOT; queda conservado y la RAM sigue ocupada."
+      if printf '%s' "$TMPFS_UMOUNT_ERR" | grep -qi 'password is required\|a terminal\|not in the sudoers'; then
+        warn "  Causa: sin credenciales sudo utilizables. Ejecuta 'sudo -v' en una terminal y repite el build."
       else
-        warn "No se pudo desmontar $TMPFS_ROOT (¿proceso usándolo?); queda conservado. Para desmontarlo: sudo umount $TMPFS_ROOT"
+        warn "  Causa: $TMPFS_UMOUNT_ERR"
+        if command -v fuser >/dev/null 2>&1; then
+          local holders
+          holders="$(fuser -m "$TMPFS_ROOT" 2>/dev/null | tr -s ' ' | cut -c1-200)"
+          [ -n "$holders" ] && warn "  Procesos dentro del tmpfs:${holders}"
+        fi
       fi
+      warn "  Para liberarla a mano: sudo umount $TMPFS_ROOT"
+      warn "  Para dejarla siempre montada entre builds: CIZEN_KEEP_TMPFS=1"
+    else
+      TMPFS_UMOUNT_STATUS="not-mounted"
     fi
+  elif [ "$FULL_PIPELINE_OK" = true ] && [ "$CIZEN_KEEP_TMPFS" = "1" ]; then
+    TMPFS_UMOUNT_STATUS="kept"
+    TMPFS_UMOUNT_NOTE="CIZEN_KEEP_TMPFS=1"
+    info "CIZEN_KEEP_TMPFS=1: el tmpfs se conserva montado a propósito ($TMPFS_ROOT)."
   fi
 
   # Por defecto el tmpfs dedicado se conserva montado deliberadamente entre
@@ -2159,14 +2222,14 @@ cleanup_success() {
 
   rm -f "$BUILD_MARKER" 2>/dev/null || true
 
-  # El árbol de la versión más nueva se conserva en el tmpfs para reutilizarlo
-  # en la próxima ejecución. No se elimina al terminar correctamente.
-  if [ -d "$SRC" ]; then
+  # Tras un flujo COMPLETO y exitoso el tmpfs (y con él el árbol) se desmonta:
+  # el requisito es devolver la RAM, no conservar 7 GB por si acaso. Solo los
+  # flujos parciales (p. ej. un check que prepara el entorno) lo dejan montado
+  # para que el build siguiente lo reutilice; y CIZEN_KEEP_TMPFS=1 lo mantiene
+  # a propósito, en cuyo caso el árbol sí se conserva para reutilizarlo.
+  if [ -d "$SRC" ] && [ "$CIZEN_KEEP_TMPFS" = "1" ]; then
     log "Fuentes conservadas para reutilización: $SRC"
   fi
-
-  # El tmpfs y el árbol de fuentes se mantienen montados/conservados siempre
-  # para reutilizar la build en la próxima ejecución.
   unmount_tmpfs_build
 }
 
@@ -2223,6 +2286,16 @@ cleanup_tmpfs_on_exit() {
   fi
   if [ -n "${SRC:-}" ] && [ -f "$SRC/scripts/package/PKGBUILD.cizen-orig" ]; then
     mv -f -- "$SRC/scripts/package/PKGBUILD.cizen-orig" "$SRC/scripts/package/PKGBUILD" 2>/dev/null || true
+  fi
+
+  # v27.31.19: red de seguridad del desmontaje. Si la ejecución terminó con
+  # ÉXITO TOTAL por una vía que no pasó por cleanup_success, el tmpfs se
+  # desmonta igualmente aquí: el requisito es que el éxito devuelva la RAM.
+  # cleanup_success (ruta normal) ya lo hizo y marcó CLEANUP_DONE.
+  if [ "$rc" -eq 0 ] && [ "$FULL_PIPELINE_OK" = true ] && [ "$CLEANUP_DONE" != true ]; then
+    CLEANUP_DONE=true
+    cd "$HOME" 2>/dev/null || cd / 2>/dev/null || true
+    unmount_tmpfs_build
   fi
 
   # Las rutas normales llaman cleanup_success explícitamente.
@@ -7045,6 +7118,30 @@ create_btrfs_snapshot() {
 # El servicio kernel-update-verify.sh lee este fichero tras el reboot para
 # comprobar que el kernel que arrancó cumple lo que este build prometió
 # (incluido el scheduler BORE).
+# Scheduler efectivo de este build (v27.31.19). Es lo que se graba en la firma
+# para que el verificador post-boot pueda compararlo con los símbolos del kernel
+# arrancado. No devuelve "inherit": se deduce de lo que realmente se aplicó, que
+# es lo comprobable. bore tiene prioridad porque es el símbolo que el fork
+# activa por defecto; un kernel con SCHED_BORE=y y SCHED_BMQ=y se reporta bore,
+# igual que hace running_sched() en kernel-update-verify.sh.
+effective_scheduler() {
+  local p
+  if [ "$BORE_ENABLED" = true ]; then
+    printf 'bore\n'
+    return 0
+  fi
+  for p in "${PATCHES_APPLIED[@]:-}"; do
+    case "$p" in
+      bore)  printf 'bore\n';  return 0 ;;
+      pds)   printf 'pds\n';   return 0 ;;
+      bmq)   printf 'bmq\n';   return 0 ;;
+      lfbmq) printf 'lfbmq\n'; return 0 ;;
+      muqss) printf 'muqss\n'; return 0 ;;
+    esac
+  done
+  printf 'eevdf\n'
+}
+
 write_verify_signature() {
   local profile_hash="" rel
   mkdir -p -- "$VERIFY_STATE_DIR" 2>/dev/null || true
@@ -7053,6 +7150,11 @@ write_verify_signature() {
   {
     printf 'version=%s\n' "$rel"
     printf 'bore=%s\n' "$([ "$BORE_ENABLED" = true ] && echo yes || echo no)"
+    # v27.31.19: scheduler EFECTIVO (no el pedido): el verificador post-boot lo
+    # compara con los símbolos del kernel arrancado para todos los que el motor
+    # ofrece (bore/pds/bmq/lfbmq/muqss, o eevdf si no hay ninguno). Con
+    # "inherit" queda el que acabó aplicándose, que es lo comprobable.
+    printf 'sched=%s\n' "$(effective_scheduler)"
     if [ "${#PATCHES_APPLIED[@]}" -gt 0 ]; then
       # bore permanece aparte por compatibilidad; el resto de parches van en patches=.
       printf 'patches=%s\n' "${PATCHES_APPLIED[*]}"
@@ -9312,6 +9414,42 @@ fi
 sudo_keepalive_stop
 cleanup_success
 
+# v27.31.19: el informe dice la verdad sobre el verificador y sobre el tmpfs.
+VERIFY_SCRIPT_PATH="/usr/local/bin/kernel-update/kernel-update-verify.sh"
+VERIFY_UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+verify_service_state() {
+  if [ ! -f "$VERIFY_SCRIPT_PATH" ]; then
+    printf 'no instalado (%s no existe)\n' "$VERIFY_SCRIPT_PATH"
+  elif [ ! -f "$VERIFY_UNIT_DIR/kernel-update-verify.service" ]; then
+    printf 'script instalado, unidad ausente en %s\n' "$VERIFY_UNIT_DIR"
+  elif systemctl --user is-enabled kernel-update-verify.service >/dev/null 2>&1; then
+    printf 'activo (se ejecutará tras el próximo arranque)\n'
+  else
+    printf 'instalado pero NO habilitado: systemctl --user enable kernel-update-verify.service\n'
+  fi
+}
+
+VERIFY_STATE_MSG="$(verify_service_state)"
+
+case "$TMPFS_UMOUNT_STATUS" in
+  unmounted)
+    if [ "${TMPFS_UMOUNT_NOTE:-0}" -ge 1024 ]; then
+      TMPFS_LINE="desmontado tras el éxito (~$(( ${TMPFS_UMOUNT_NOTE:-0} / 1024 )) GB devueltos a la RAM)"
+    else
+      TMPFS_LINE="desmontado tras el éxito (~${TMPFS_UMOUNT_NOTE:-0} MB devueltos a la RAM)"
+    fi
+    ;;
+  failed)
+    TMPFS_LINE="NO desmontado: $TMPFS_UMOUNT_NOTE — sudo umount $TMPFS_ROOT"
+    ;;
+  kept)
+    TMPFS_LINE="montado a propósito ($TMPFS_UMOUNT_NOTE); se conserva el árbol para reutilizarlo"
+    ;;
+  not-mounted|*)
+    TMPFS_LINE="sin montaje pendiente"
+    ;;
+esac
+
 cat <<SUMMARY
 
 ===============================================================
@@ -9330,7 +9468,7 @@ Build prio  : $BUILD_PRIORITY_LABEL (CIZEN_BUILD_PRIORITY=normal para máxima ve
   Paquete     : ${PKG:+$(basename "$PKG")}${PKG:---sin paquete (modules_install)}
   Mod-firma   : $([ "$CIZEN_MODULE_SIGN" = "yes" ] && echo 'sí (MOK persistente)' || echo 'no')
  Config base : $FINAL_CONFIG
- Build tmpfs : $TMPFS_ROOT (size=$TMPFS_SIZE)
+ Build tmpfs : $TMPFS_ROOT (size=$TMPFS_SIZE) → $TMPFS_LINE
  Podar       : $([ "${CIZEN_PRUNE_MODULES:-$PRUNE_MODULES}" = "1" ] && echo 'sí (solo módulos de este hardware)' || echo 'no')
  Lite        : sí (único modo: solo se compilan los módulos en uso; localmodconfig)
  Firma UKI   : $([ "$DO_SIGN_UKI" = true ] && printf '%s' 'sí (sbctl)' || printf '%s' 'no')${SIGN_UKI_REASON:+ — $SIGN_UKI_REASON}
@@ -9347,13 +9485,15 @@ ${VERIFY_ROLLBACK_FILE:+ Rollback  : $VERIFY_ROLLBACK_FILE}
 
 IMPORTANTE:
  El kernel nuevo queda instalado y el UKI ha sido sincronizado.
- Para arrancarlo:
+ tmpfs de compilación: $TMPFS_LINE
+ Para arrancarlo (no se reinicia solo):
 
    sudo reboot
 
- Después del reboot, kernel-update-verify.service comprueba que el kernel
- cumple el perfil (y BORE si se pidió), el tiempo de arranque y busca
- regresiones en el journal.
+ Verificador: $VERIFY_STATE_MSG
+ Si está activo, tras el reboot comprueba que el kernel cumple el perfil
+ (incluido el scheduler que kronizó este build), el tiempo de arranque y
+ busca regresiones en el journal.
  El kernel previo quedó archivado para rollback: krollback --list
 ===============================================================
 SUMMARY

@@ -136,6 +136,10 @@ extract() { # $1 = nombre de función (hasta el `}` inicial en columna 0)
   extract source_tree_reusable
   extract write_tree_meta
   extract reconcile_tmpfs_trees
+  extract get_mem_available_mb
+  extract unmount_tmpfs_build
+  extract effective_scheduler
+  extract write_verify_signature
 } > "$ROOT/fns.sh"
 
 if [ ! -s "$ROOT/fns.sh" ]; then
@@ -1362,7 +1366,7 @@ SRC="$TMPFS_ROOT/linux-7.2.7"
 _mktree 7.2.8 vanilla >/dev/null
 TREE_FORCE_NOTE="lo fuerza el parche/scheduler 'bmq' (solo existe en el fork CachyOS/linux)"
 reconcile_tmpfs_trees
-if [ ! -d "$TMPFS_ROOT/linux-7.2.8" ] && grep -q '^umount ' "$ROOT/umount.log" \
+if [ ! -d "$TMPFS_ROOT/linux-7.2.8" ] && grep -qE '^(-n )?umount ' "$ROOT/umount.log" \
    && [ "$TMPFS_MOUNTED" = false ] && [ ! -f "$MOUNTED_FLAG" ]; then
   rec ok "árbol vanilla incompatible: descartado y tmpfs desmontado (RAM devuelta)"
 else
@@ -1424,7 +1428,7 @@ source_tree_reusable || rec fail "el árbol completo dejó de ser reutilizable"
   || rec fail "un árbol a medio extraer se reutilizaría"
 : > "$ROOT/umount.log"
 reconcile_tmpfs_trees
-if [ ! -d "$TMPFS_ROOT/linux-7.2.7" ] && grep -q '^umount ' "$ROOT/umount.log" \
+if [ ! -d "$TMPFS_ROOT/linux-7.2.7" ] && grep -qE '^(-n )?umount ' "$ROOT/umount.log" \
    && [ ! -e "$TMPFS_ROOT/.cizen-extracting-7.2.7" ]; then
   rec ok "el árbol a medias se descarta, se desmonta el tmpfs y vanish su testigo"
 else
@@ -1458,8 +1462,13 @@ fi
 : > "$MOUNTED_FLAG"; TMPFS_MOUNTED=true
 echo 3 > "$STACKED_FLAG"
 : > "$ROOT/umount.log"
-if tmpfs_umount_all && [ ! -f "$MOUNTED_FLAG" ] && [ "$(grep -c '^umount ' "$ROOT/umount.log")" -eq 3 ]; then
-  rec ok "tmpfs_umount_all: desmonta también los apilados (3 umount, tmpfs limpio)"
+# v27.31.19: el umount es `sudo -n` (no interactivo: nunca puede quedarse
+# esperando una contraseña a mitad del build) y su stderr se conserva en
+# TMPFS_UMOUNT_ERR en vez de descartarse, que es lo que escondía el EBUSY.
+if tmpfs_umount_all && [ ! -f "$MOUNTED_FLAG" ] \
+   && [ "$(grep -cE '^(-n )?umount ' "$ROOT/umount.log")" -eq 3 ] \
+   && ! grep -qE '^umount ' "$ROOT/umount.log"; then
+  rec ok "tmpfs_umount_all: desmonta también los apilados (3 umount, tmpfs limpio) y con sudo -n"
 else
   rec fail "tmpfs_umount_all: log=$(tr '\n' ' ' < "$ROOT/umount.log" 2>/dev/null) stacked=$(cat "$STACKED_FLAG" 2>/dev/null || echo 0) montado=$([ -f "$MOUNTED_FLAG" ] && echo sí || echo no)"
 fi
@@ -1480,6 +1489,414 @@ else
 fi
 unset -f findmnt sudo
 
+# ============================================================
+# v27.31.19: scheduler efectivo, firma sched=, desmontaje post-éxito
+# ============================================================
+printf '%s\n' "== effective_scheduler (scheduler efectivo que se graba) =="
+for _sch in bore pds bmq lfbmq muqss; do
+  BORE_ENABLED=false
+  declare -a PATCHES_APPLIED=("$_sch")
+  if [ "$(effective_scheduler)" = "$_sch" ]; then
+    rec ok "effective_scheduler: $_sch (pedido explícito) -> $_sch"
+  else
+    rec fail "effective_scheduler: $_sch dio $(effective_scheduler)"
+  fi
+done
+BORE_ENABLED=true; declare -a PATCHES_APPLIED=()
+[ "$(effective_scheduler)" = "bore" ] && rec ok "effective_scheduler: BORE_ENABLED sin parches -> bore" || rec fail "effective_scheduler: BORE_ENABLED dio $(effective_scheduler)"
+BORE_ENABLED=false; declare -a PATCHES_APPLIED=("ntsync" "bore")
+[ "$(effective_scheduler)" = "bore" ] && rec ok "effective_scheduler: bore dentro de PATCHES_APPLIED -> bore" || rec fail "effective_scheduler: parche bore dentro de la lista dio $(effective_scheduler)"
+BORE_ENABLED=false; declare -a PATCHES_APPLIED=()
+[ "$(effective_scheduler)" = "eevdf" ] && rec ok "effective_scheduler: sin nada aplicado -> eevdf (mainline)" || rec fail "effective_scheduler: vacío dio $(effective_scheduler)"
+BORE_ENABLED=false; declare -a PATCHES_APPLIED=("ntsync")
+[ "$(effective_scheduler)" = "eevdf" ] && rec ok "effective_scheduler: solo ntsync sigue siendo eevdf" || rec fail "effective_scheduler: solo ntsync dio $(effective_scheduler)"
+# El nombre de la opción pedida no debe filtrarse: "inherit" se resuelve.
+BORE_ENABLED=false; declare -a PATCHES_APPLIED=("bmq")
+if effective_scheduler | grep -qx inherit; then
+  rec fail "effective_scheduler: devolvió 'inherit' (no es comprobable)"
+else
+  rec ok "effective_scheduler: nunca devuelve 'inherit' (se graba el efectivo)"
+fi
+# La firma tiene que llevar sched= para que el verificador post-boot lo compare.
+if grep -q "printf 'sched=%s\\\\n' \"\$(effective_scheduler)\"" "$MOTOR"; then
+  rec ok "la firma del verificador graba sched= con el scheduler efectivo"
+else
+  rec fail "write_verify_signature no graba sched= con el scheduler efectivo"
+fi
+unset -f effective_scheduler
+
+printf '%s\n' "== unmount_tmpfs_build: éxito total desmonta siempre =="
+# El selftest corre con `set -u`: se inicializan para que la ejecución en rojo
+# contra un motor anterior (sin estos flags) falle por los tests, no por abortar.
+TMPFS_UMOUNT_STATUS=""; TMPFS_UMOUNT_NOTE=""; TMPFS_UMOUNT_ERR=""
+# Stubs de findmnt/sudo idénticos a los del grupo de reconciliación.
+# El stub imprime tmpfs solo si se pide TARGET; para FSTYPE imprime tmpfs cuando
+# el flag de "montado" existe, que es lo que consulta tmpfs_is_mounted (FSTYPE).
+findmnt() { # shellcheck disable=SC2317
+  if [ -f "$MOUNTED_FLAG" ]; then
+    case " $* " in
+      *" FSTYPE "*) printf 'tmpfs\n' ;;
+      *)           printf '%s\n' "$TMPFS_ROOT" ;;
+    esac
+  fi
+  return 0
+}
+sudo() { # shellcheck disable=SC2317
+  case "$*" in
+    *umount*)
+      printf '%s\n' "$*" >> "$ROOT/umount.log"
+      if [ -f "$BUSY_FLAG" ]; then return 1; fi
+      if [ -f "$STACKED_FLAG" ]; then
+        local n; n="$(cat "$STACKED_FLAG")"
+        if [ "$n" -gt 1 ]; then echo $((n - 1)) > "$STACKED_FLAG"
+        else rm -f "$STACKED_FLAG" "$MOUNTED_FLAG"; fi
+      else
+        rm -f "$MOUNTED_FLAG"
+      fi ;;
+  esac
+  return 0
+}
+ok()  { :; }
+warn() { printf 'WARN: %s\n' "$*" >> "$ROOT/warn.log"; }
+info() { :; }
+get_avail_mb() { printf '1024\n'; }
+# get_mem_available_mb se extrae del motor: lee /proc/meminfo real, así que
+# not-used=$TMPFS_UMOUNT_NOTE puede ser 0 y la comprobación solo mira el estado.
+TMPFS_ROOT="$ROOT/tmpfs"
+FULL_PIPELINE_OK=true
+CIZEN_KEEP_TMPFS=0
+: > "$MOUNTED_FLAG"; TMPFS_MOUNTED=true; : > "$ROOT/umount.log"
+unmount_tmpfs_build
+if [ ! -f "$MOUNTED_FLAG" ] && [ "$TMPFS_UMOUNT_STATUS" = unmounted ] && [ "$TMPFS_MOUNTED" != true ]; then
+  rec ok "unmount_tmpfs_build: éxito total -> tmpfs desmontado y RAM devuelta"
+else
+  rec fail "unmount_tmpfs_build: éxito total dejó status=$TMPFS_UMOUNT_STATUS montado=$([ -f "$MOUNTED_FLAG" ] && echo sí || echo no)"
+fi
+# Montajes apilados: los 3 umount del punto apilado.
+: > "$MOUNTED_FLAG"; TMPFS_MOUNTED=true; : > "$ROOT/umount.log"; echo 3 > "$STACKED_FLAG"
+unmount_tmpfs_build
+if [ ! -f "$MOUNTED_FLAG" ] && [ "$(grep -cE '^(-n )?umount ' "$ROOT/umount.log")" -eq 3 ]; then
+  rec ok "unmount_tmpfs_build: también devuelve la RAM de los montajes apilados"
+else
+  rec fail "unmount_tmpfs_build: apilados mal desmontados ($(tr '\n' ' ' < "$ROOT/umount.log" 2>/dev/null))"
+fi
+# EBUSY: dos intentos, avisa y conserva (con el motivo del error).
+: > "$MOUNTED_FLAG"; TMPFS_MOUNTED=true; : > "$ROOT/umount.log"; : > "$ROOT/warn.log"; : > "$BUSY_FLAG"
+unmount_tmpfs_build
+if [ -f "$MOUNTED_FLAG" ] && [ "$TMPFS_UMOUNT_STATUS" = failed ] \
+   && [ "$(grep -c 'umount' "$ROOT/umount.log")" -ge 2 ] \
+   && grep -q 'No se pudo desmontar' "$ROOT/warn.log"; then
+  rec ok "unmount_tmpfs_build: EBUSY -> reintenta, avisa con el motivo y conserva el tmpfs"
+else
+  rec fail "unmount_tmpfs_build: EBUSY mal gestionado (status=$TMPFS_UMOUNT_STATUS, umounts=$(grep -c 'umount' "$ROOT/umount.log" 2>/dev/null))"
+fi
+rm -f "$BUSY_FLAG"
+# Override explícito.
+: > "$MOUNTED_FLAG"; TMPFS_MOUNTED=true; : > "$ROOT/umount.log"; CIZEN_KEEP_TMPFS=1
+unmount_tmpfs_build
+if [ -f "$MOUNTED_FLAG" ] && [ "$TMPFS_UMOUNT_STATUS" = kept ] && [ ! -s "$ROOT/umount.log" ]; then
+  rec ok "unmount_tmpfs_build: CIZEN_KEEP_TMPFS=1 conserva a propósito y lo dice"
+else
+  rec fail "unmount_tmpfs_build: CIZEN_KEEP_TMPFS=1 no respetado (status=$TMPFS_UMOUNT_STATUS)"
+fi
+CIZEN_KEEP_TMPFS=0
+# Flujo parcial (solo check): NO desmonta, para que el build reutilice el árbol.
+: > "$MOUNTED_FLAG"; TMPFS_MOUNTED=true; : > "$ROOT/umount.log"; FULL_PIPELINE_OK=false
+unmount_tmpfs_build
+if [ -f "$MOUNTED_FLAG" ] && [ ! -s "$ROOT/umount.log" ] && [ "$TMPFS_MOUNTED" = true ]; then
+  rec ok "unmount_tmpfs_build: flujo parcial (check) NO desmonta, el árbol queda reutilizable"
+else
+  rec fail "unmount_tmpfs_build: un check desmontó el tmpfs"
+fi
+FULL_PIPELINE_OK=true
+# Red de seguridad: el trap EXIT desmonta si un éxito total no pasó por cleanup_success.
+if grep -q 'if \[ "\$rc" -eq 0 \] && \[ "\$FULL_PIPELINE_OK" = true \] && \[ "\$CLEANUP_DONE" != true \]' "$MOTOR" \
+   && grep -q 'unmount_tmpfs_build' "$MOTOR" && grep -q '^trap cleanup_tmpfs_on_exit EXIT' "$MOTOR"; then
+  rec ok "trap EXIT: un éxito total que no llegó a cleanup_success desmonta igualmente"
+else
+  rec fail "el trap EXIT no monta la red de seguridad del desmontaje"
+fi
+# El informe final tiene que decir la verdad: estado del tmpfs + verificador.
+if grep -q 'Build tmpfs : \$TMPFS_ROOT (size=\$TMPFS_SIZE) → \$TMPFS_LINE' "$MOTOR" \
+   && grep -q 'Verificador: \$VERIFY_STATE_MSG' "$MOTOR" \
+   && grep -q 'Para arrancarlo (no se reinicia solo)' "$MOTOR"; then
+  rec ok "el resumen final informa del tmpfs y del verificador, y solo sugiere el reinicio"
+else
+  rec fail "el resumen final no informa del estado del tmpfs/verificador o no aclara que no reinicia solo"
+fi
+# El resumen no puede prometer un servicio que no exista.
+if grep -q 'verify_service_state()' "$MOTOR" && grep -q 'kernel-update-verify.sh' "$MOTOR"; then
+  rec ok "el resumen comprueba si el verificador está instalado/habilitado antes de prometerlo"
+else
+  rec fail "el resumen sigue prometiendo kernel-update-verify.service sin comprobarlo"
+fi
+unset -f findmnt sudo unmount_tmpfs_build
+
+printf '%s\n' "== kernel-update-verify.sh: todos los schedulers =="
+VERIFY_SRC="$(cd "$(dirname "$0")/.." && pwd)/kernel-update-verify.sh"
+_sx() { # extrae una función del verificador
+  sed -n "/^$1() {/,/^}/p" "$VERIFY_SRC"
+}
+_sx run_state > "$ROOT/vfns.sh"
+_sx sched_symbol_for >> "$ROOT/vfns.sh"
+_sx sched_label >> "$ROOT/vfns.sh"
+_sx expected_sched_from_signature >> "$ROOT/vfns.sh"
+_sx running_sched >> "$ROOT/vfns.sh"
+# shellcheck disable=SC1090,SC1091
+source "$ROOT/vfns.sh"
+declare -A RUN_CFG=()
+for _s in SCHED_BORE SCHED_PDS SCHED_BMQ SCHED_LFBMQ SCHED_MUQSS; do RUN_CFG["$_s"]="n"; done
+_miss=0
+for pair in "bore SCHED_BORE" "pds SCHED_PDS" "bmq SCHED_BMQ" "lfbmq SCHED_LFBMQ" "muqss SCHED_MUQSS"; do
+  set -- $pair
+  if [ "$(sched_symbol_for "$1")" = "$2" ]; then
+    RUN_CFG["$2"]="y"
+    if [ "$(running_sched)" = "$1" ]; then
+      RUN_CFG["$2"]="n"
+      [ "$(running_sched)" = "eevdf" ] || _miss=1
+      RUN_CFG["$2"]="y"
+    else
+      _miss=1
+    fi
+    RUN_CFG["$2"]="n"
+  else
+    _miss=1
+  fi
+done
+[ "$_miss" = 0 ] && rec ok "running_sched: detecta bore/pds/bmq/lfbmq/muqss y eevdf sin ninguno" || rec fail "running_sched no cubre todos los schedulers"
+[ "$(sched_symbol_for eevdf)" = "-" ] && rec ok "sched_symbol_for: eevdf no tiene símbolo propio (mainline)" || rec fail "sched_symbol_for eevdf dio $(sched_symbol_for eevdf)"
+[ "$(sched_symbol_for inventado)" = "" ] && rec ok "sched_symbol_for: lo desconocido no inventa símbolo" || rec fail "sched_symbol_for inventado dio algo"
+# La firma manda; los fallbacks cubren las firmas anteriores a v27.31.19.
+[ "$(expected_sched_from_signature bmq no bmq)" = bmq ] && rec ok "expected: sched= de la firma nueva" || rec fail "expected: sched= bmq"
+[ "$(expected_sched_from_signature "" yes "")" = bore ] && rec ok "expected: firma antigua con bore=yes" || rec fail "expected: bore=yes legacy"
+[ "$(expected_sched_from_signature "" no "bmq pds")" = bmq ] && rec ok "expected: firma antigua deduce el scheduler de patches=" || rec fail "expected: patches= bmq pds"
+[ "$(expected_sched_from_signature "" no "")" = eevdf ] && rec ok "expected: firma sin nada asumible -> eevdf" || rec fail "expected: vacío"
+_miss=""
+for _pair in "bore BORE" "pds PDS" "bmq BMQ" "lfbmq LF-BMQ" "muqss MuQSS" "eevdf EEVDF"; do
+  set -- $_pair
+  case "$(sched_label "$1")" in "$2"*) ;; *) _miss="$_miss $1->$(sched_label "$1")" ;; esac
+done
+[ -z "$_miss" ] && rec ok "sched_label: etiqueta legible para los 6 schedulers" || rec fail "sched_label:$_miss"
+# sched_check tiene que ser un paso propio: dentro de profile_check (subshell)
+# los globales que fija se perderían y el resumen siempre saldría "unknown".
+if grep -q '^sched_check() {' "$VERIFY_SRC" \
+   && grep -q '^sched_check$' "$VERIFY_SRC" \
+   && ! sed -n '/^profile_check() {/,/^}/p' "$VERIFY_SRC" | grep -q 'sched_check\|running_sched'; then
+  rec ok "sched_check es un paso propio (profile_check corre en subshell y perdería los globales)"
+else
+  rec fail "sched_check se ejecuta dentro de profile_check: el resumen mostraría scheduler unknown"
+fi
+if grep -qi '/proc/config.gz legible: el scheduler' "$VERIFY_SRC"; then
+  rec ok "sin /proc/config.gz el verificador lo dice en vez de afirmar el scheduler"
+else
+  rec fail "el verificador no contempla la ausencia de /proc/config.gz"
+fi
+# La unit que hace que esto ocurra en cada arranque. Se mira donde vive de verdad
+# en cada layout: en el repo `systemd/user/`, y al correr instalado la copia de
+# `~/.config/systemd/user/`. Con la ruta relativa sola (../..) el test era
+# imposible de satisfacer desde /usr/local/bin: daba falso rojo sin ningún motivo
+# real, y un test que no puede pasar en uno de los dos layouts entrena a ignorar
+# los tests que fallan.
+_repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+_unit_ok=no
+for _u in "$_repo_root/systemd/user/kernel-update-verify.service" \
+         "$HOME/.config/systemd/user/kernel-update-verify.service"; do
+  if [ -f "$_u" ] && grep -q 'ExecStart=/usr/local/bin/kernel-update/kernel-update-verify.sh' "$_u" \
+     && grep -q 'WantedBy=default.target' "$_u" && grep -q 'After=graphical-session.target' "$_u"; then
+    _unit_ok="$ _u"
+  fi
+done
+if [ "$_unit_ok" != "no" ]; then
+  rec ok "existe la unit de usuario kernel-update-verify.service apuntando al script instalado (${_unit_ok# })"
+else
+  rec fail "falta o está mal la unit systemd/user/kernel-update-verify.service (ni en el repo ni en ~/.config/systemd/user/)"
+fi
+# Si están las dos copias, no pueden haber divergido: la instalada es la que corre.
+if [ -f "$_repo_root/systemd/user/kernel-update-verify.service" ] \
+   && [ -f "$HOME/.config/systemd/user/kernel-update-verify.service" ]; then
+  if cmp -s "$_repo_root/systemd/user/kernel-update-verify.service" \
+            "$HOME/.config/systemd/user/kernel-update-verify.service"; then
+    rec ok "la unit instalada no ha divergido de la del repo"
+  else
+    rec fail "la unit instalada difiere de la del repo"
+  fi
+fi
+unset -f sched_symbol_for sched_label expected_sched_from_signature running_sched
+
+# ============================================================
+# v27.31.21: la notificación solo cuando el estado cambia
+# ============================================================
+printf '%s\n' "== la notificación solo dispara ante un cambio de estado =="
+grep -q 'verify-notify-state' "$VERIFY_SRC" && grep -q 'notify_state_changed()' "$VERIFY_SRC" \
+  && rec ok "el estado de notificación se persiste (verify-notify-state)" || rec fail "no hay estado de notificación persistido"
+if grep -q 'verify_state_fingerprint' "$VERIFY_SRC" \
+   && sed -n '/^verify_state_fingerprint() {/,/^}/p' "$VERIFY_SRC" | grep -qF 'perfil=%s|sched=%s/%s|journal=%s|fw=%s|sb=%s|iss=%s'; then
+  rec ok "la firma del estado cubre perfil/sched/journal/fw/sb/incidencias"
+else
+  rec fail "la firma del estado no cubre los componentes relevantes"
+fi
+# El tiempo de arranque NO puede estar en la firma: 15.8675 vs 15.8671 no es un
+# cambio de estado y con él dentro no se callaría nunca.
+if ! sed -n '/^verify_state_fingerprint() {/,/^}/p' "$VERIFY_SRC" | grep -qE '\$TOT|\$TOT_TXT|Boot'; then
+  rec ok "el tiempo de arranque queda fuera de la firma (no dispara notificaciones por milisegundos)"
+else
+  rec fail "el tiempo de arranque está en la firma del estado: notificaría en cada arranque"
+fi
+# Comportamiento real de notify_state_changed, con un estado escrito a mano.
+NSTATE="$ROOT/notify-state"
+_sx_nsc() { sed -n "/^$1() {/,/^}/p" "$VERIFY_SRC"; }
+{ _sx_nsc verify_state_fingerprint; _sx_nsc notify_state_changed; } > "$ROOT/nfns.sh"
+# shellcheck disable=SC1090,SC1091
+source "$ROOT/nfns.sh"
+BASE_ISSUES=0; SCHED_EXPECTED=bmq; SCHED_RUNNING=bmq; JCOUNT=0; FW_COUNT=0
+SB_STATE="no (SB desconocido)"; ISSUES=0
+NOTIFY_STATE="$NSTATE"
+: > "$NSTATE"
+if notify_state_changed; then
+  rec ok "sin estado previo: la primera verificación sí notifica"
+else
+  rec fail "sin estado previo no se notifica (se perdería el aviso inicial)"
+fi
+verify_state_fingerprint > "$NSTATE"
+if notify_state_changed; then
+  rec fail "estado idéntico: vuelve a notificar (ruido en cada arranque)"
+else
+  rec ok "estado idéntico: NO se repite la notificación"
+fi
+ISSUES=2
+if notify_state_changed; then
+  rec ok "estado distinto (aparecen incidencias): sí notifica"
+else
+  rec fail "no avisa de un cambio real de estado"
+fi
+ISSUES=0
+: > "$NSTATE"
+verify_state_fingerprint > "$NSTATE"; notify_state_changed
+ISSUES=3
+if notify_state_changed; then
+  rec ok "cambio de número de incidencias: notifica"
+else
+  rec fail "no detecta el cambio en el número de incidencias"
+fi
+unset -f verify_state_fingerprint notify_state_changed
+# El cuerpo de la notificación dice qué cambió, y sin incidencias no es alarma.
+if grep -q 'notify_state_diff' "$VERIFY_SRC" && grep -q 'sev=normal; icon=emblem-ok' "$VERIFY_SRC"; then
+  rec ok "la notificación incluye el diff y baja a aviso normal cuando se resuelve"
+else
+  rec fail "la notificación no explica qué cambió / no baja de severidad al resolverse"
+fi
+if grep -q 'if \[ "\$DRY" != true \]; then' "$VERIFY_SRC" \
+   && grep -qF "{ verify_state_fingerprint; printf '\n'; } > \"\$NOTIFY_STATE\"" "$VERIFY_SRC"; then
+  rec ok "--dry-run no guarda el estado (una simulación no puede callar la notificación real)"
+else
+  rec fail "--dry-run guarda el estado y podría silenciar la notificación real"
+fi
+# El fichero de estado debe terminar en \n: sin él `while read` se salta la
+# última línea, que es precisamente la que dice qué estado se guardó.
+if grep -qF "printf '\n'; } > \"\$NOTIFY_STATE\"" "$VERIFY_SRC"; then
+  rec ok "el estado se guarda con salto de línea final (while read no perdería la línea)"
+else
+  rec fail "el estado se guarda sin salto de línea final: while read se saltaría la última línea"
+fi
+
+# ============================================================
+# v27.31.21: el estado real de Secure Boot (regresión)
+# ============================================================
+# El verificador daba "SB desconocido" en un equipo con Secure Boot perfectamente
+# activo, porque el patrón era *'enabled': exige que la línea TERMINE en
+# "enabled" y bootctl imprime "Secure Boot: enabled (user)". El desenlace era el
+# peor posible: una incidencia inventada que pedía "activar Secure Boot" a quien
+# ya lo tenía activo, y que se repetía en cada arranque.
+printf '%s\n' "== Secure Boot: se lee el valor real, no un sufijo =="
+if grep -qF "*'Secure Boot: enabled'*)" "$VERIFY_SRC" && grep -qF "*'Secure Boot: disabled'*)" "$VERIFY_SRC"; then
+  rec ok "el patrón de Secure Boot está anclado al campo (con comodín final)"
+else
+  rec fail "el patrón de Secure Boot no está anclado: *'enabled' nunca casa con 'enabled (user)'"
+fi
+# Comportamiento real contra un bootctl de mentira con la salida auténtica.
+_sbx="$ROOT/sbprobe"
+mkdir -p "$_sbx/bin"
+sed -n '/^secureboot_check() {/,/^}/p' "$VERIFY_SRC" > "$ROOT/sbcheck.sh"
+printf 'sb=yes\n' > "$_sbx/build-sig"
+# shellcheck disable=SC1090,SC1091
+source "$ROOT/sbcheck.sh"
+warn() { :; }
+info() { :; }
+_sb_probe() { # $1 = línea que emite el bootctl falso
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '[ "$1" = status ] || exit 1\n'
+    printf "printf '%%s\\\\n' '%s'\n" "$1"
+  } > "$_sbx/bin/bootctl"
+  chmod +x "$_sbx/bin/bootctl"
+  # OJO: en bash 5.3 las asignaciones que preceden a una llamada a función
+  # (SB_STATE=... secureboot_check) son locales a ella, así que al volver
+  # seguirían los valores viejos de antes y la sonda mediría lo que le da la gana.
+  # Asignación normal y llamada aparte, y así lo que sale es lo que devolvió.
+  local _oldpath="$PATH"
+  PATH="$_sbx/bin:$PATH"
+  BUILD_SIG="$_sbx/build-sig"
+  SB_STATE=""
+  ISSUES=0
+  DRY=true
+  secureboot_check
+  printf '%s|%s' "$SB_STATE" "$ISSUES"
+  PATH="$_oldpath"
+}
+_r=$(_sb_probe '   Secure Boot: enabled (user)')
+case "$_r" in
+  *"HABILITADO"*)
+    if [ "${_r##*|}" = 0 ]; then
+      rec ok "«Secure Boot: enabled (user)» se lee como HABILITADO y no cuenta incidencia"
+    else
+      rec fail "«enabled (user)» se lee bien pero suma incidencia: $_r"
+    fi ;;
+  *) rec fail "«Secure Boot: enabled (user)» NO se reconoce como HABILITADO (sale: $_r)" ;;
+esac
+_r=$(_sb_probe '   Secure Boot: disabled')
+case "$_r" in
+  *"desactivado"*) rec ok "«Secure Boot: disabled» se lee como desactivado" ;;
+  *)               rec fail "«Secure Boot: disabled» mal leído (sale: $_r)" ;;
+esac
+_r=$(_sb_probe '')
+case "$_r" in
+  *"desconocido"*) rec ok "sin dato de bootctl se declara desconocido, no se inventa" ;;
+  *)               rec fail "sin dato de bootctl se inventa un estado (sale: $_r)" ;;
+esac
+unset -f secureboot_check _sb_probe
+
+printf '%s\n' "== falsos positivos del verificador (los aceptaba el motor) =="
+# El motor cuenta y|m como OPTS_ENABLE satisfecho (validate_config) porque el
+# modo lite degrada con localmodconfig. El verificador no puede ser más estricto.
+_motor_ok=0
+if sed -n '/^validate_config() {/,/^}/p' "$MOTOR" | grep -q 'if \[ "\$state" = y \] || \[ "\$state" = m \]'; then
+  _motor_ok=1
+fi
+if [ "$_motor_ok" = 1 ] \
+   && sed -n '/^profile_check() {/,/^}/p' "$VERIFY_SRC" | grep -q 'm) demoted+=' \
+   && ! sed -n '/^profile_check() {/,/^}/p' "$VERIFY_SRC" | grep -q 'bad+=.*=m'; then
+  rec ok "OPTS_ENABLE en =m: el verificador coincide con validate_config del motor (aviso, no incidencia)"
+else
+  rec fail "el verificador cobra como incidencia un =m que el motor acepta"
+fi
+# Un firmware presente en el árbol (comprimido) que la carga no|goals a resolver no
+# es una incidencia; uno ausente del todo sí lo es.
+if grep -q 'kpresent' "$VERIFY_SRC" && grep -q 'FIRMWARE_DIR/\$fw_rel.zst' "$VERIFY_SRC"; then
+  rec ok "firmware: 'carga fallida con el fichero presente en el árbol' se informa, no se cuenta"
+else
+  rec fail "el verificador no distingue firmware presente de firmware ausente"
+fi
+if grep -q 'kfail+=("\$line")' "$VERIFY_SRC" && grep -q 'ISSUES=\$((ISSUES + FW_COUNT))' "$VERIFY_SRC"; then
+  rec ok "firmware: lo que de verdad falta del árbol sigue contando como incidencia"
+else
+  rec fail "el firmware ausente dejó de contar como incidencia (no debe pasar)"
+fi
+# La extracción del nombre tiene que admitir rutas con '/' (i915/..., intel/ice/...).
+if bash -c 'printf "%s\n" "Direct firmware load for i915/kbl_dmc_ver1_04.bin failed" | sed -nE -e "s#^Direct firmware load for ([^ ]+) failed.*#\\1#p" | grep -q "^i915/kbl_dmc_ver1_04.bin$"'; then
+  rec ok "extracción del nombre de firmware: admite rutas con subdirectorios"
+else
+  rec fail "la extracción del nombre de firmware rompe con rutas tipo i915/..."
+fi
 
 # --- resumen ---
 echo

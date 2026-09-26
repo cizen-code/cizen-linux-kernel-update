@@ -157,8 +157,16 @@ directo `sync_cizen_efi` del motor) con `sbctl sign`/`sbctl verify` sobre cada
 objetivo; si no hay claves generadas, avisa y no firma (o aborta si Secure
 Boot está activo). `kernel-update-verify.sh` cruza la
 firma del último build (`sb=` en `last-build`) con el estado real de Secure Boot
-(check **SECURE BOOT**) y avisa si la UKI se firmó pero SB está desactivado, o
-al revés (SB activo con UKI sin firmar).
+(leído de `bootctl status`, check **SECURE BOOT**) y avisa si la UKI se firmó
+pero SB está desactivado, o al revés (SB activo con UKI sin firmar).
+
+El estado se lee anclando el patrón al campo (`Secure Boot: enabled`, no
+`*enabled`): `bootctl` imprime `Secure Boot: enabled (user)`, y un patrón sin
+comodín final exigiría que la línea **terminase** en "enabled" — no casa nunca y
+el verificador informaría "SB desconocido" en un equipo con el SB
+perfectamente activo. La batería ejecuta `secureboot_check` contra un `bootctl`
+de prueba con la salida real (`enabled (user)` / `disabled` / vacío) para que no
+vuelva a colarse.
 
 ### Anclaje SHA256 de los parches
 
@@ -182,11 +190,65 @@ configurables: `CIZEN_BUILD_MIN_MEM_MB=8192`, `CIZEN_BUILD_MIN_TMPFS_MB=6144`,
 ### Verificación post-boot (kernel-update-verify.sh)
 
 Además de PERFIL/BOOT/JOURNAL, el verificador hace en cada arranque:
+- **SCHED**: comprueba que el scheduler **en ejecución** es el que kronizó el
+  último build. Se cubren **todos** los que el motor ofrece —`inherit`,
+  `eevdf`, `bore`, `pds`, `bmq`, `lfbmq`, `muqss`— leyendo `SCHED_BORE`,
+  `SCHED_PDS`, `SCHED_BMQ`, `SCHED_LFBMQ` y `SCHED_MUQSS` del config en
+  ejecución (`/proc/config.gz`). El motor graba el scheduler **efectivo** en la
+  firma (`sched=` en `~/.local/state/kernel-update/last-build`), así que
+  `inherit` se resuelve a lo que realmente se aplicó. Antes (≤ v27.31.18) solo
+  se miraba BORE: un build con `bmq` se reportaba como "EEVDF vanilla" y se
+  daba por bueno sin comprobar nada. Las firmas antiguas sin `sched=` se siguen
+  deduciendo de `bore=`/`patches=`.
 - **GUARD**: avisa si arrancó un kernel que no es el último Cizen instalado
   (fallback por boot counting o selección manual del LTS).
 - **FIRMWARE**: por cada módulo cargado, `modinfo -F firmware` se contrasta
   contra `/usr/lib/firmware` (acepta binarios `.zst`) y se escanean los fallos
   "Direct firmware load failed" del journal del boot actual.
+
+La comprobación corre en la unit de usuario `systemd/user/kernel-update-verify.service`:
+
+```sh
+sudo install -Dm755 kernel-update/kernel-update-verify.sh /usr/local/bin/kernel-update/kernel-update-verify.sh
+install -Dm644 systemd/user/kernel-update-verify.service ~/.config/systemd/user/kernel-update-verify.service
+systemctl --user daemon-reload
+systemctl --user enable --now kernel-update-verify.service
+```
+
+`--dry-run` no persiste estado ni notifica. El resumen del build dice si el
+verificador está instalado y habilitado, en vez de prometer una comprobación
+que no existe.
+
+#### La notificación solo cuando el estado cambia (v27.31.21)
+
+La comprobación corre en **cada arranque**, así que notificar en cada una
+convertiría un aviso en ruido: hay incidencias que no se resuelven solas (el
+scheduler que se arregla reiniciando, o el SB desactivado con la UKI ya firmada)
+y un `critical` repetido cada mañana acaba por ignorarse — y cuando algo pase de
+verdad ya no se mira. Por eso la notificación está **condicionada al cambio de
+estado**:
+
+- Se calcula una **firma** con lo accionable —`perfil`, `sched` (kronizado/en
+  ejecución), `journal`, `fw`, `sb` e `iss`— y se guarda en
+  `~/.local/state/kernel-update/verify-notify-state`. Firma idéntica = silencio;
+  firma distinta = un aviso, con el **diff** en el cuerpo
+  (`• sched: bmq/bore → bmq/bmq`).
+- El **tiempo de arranque queda fuera de la firma** a propósito: 15.8675 s frente
+  a 15.8671 s no es un cambio de estado y, si estuviera dentro, no se callaría
+  nunca. Un boot que empeora avisa igualmente, pero como incidencia (umbral de
+  factor y delta), no porque el número se mueva.
+- Al **quedarse en 0 incidencias** la notificación baja a severidad `normal`
+  con icono `emblem-ok`: resolver no es una alarma.
+- El **primer arranque de un kernel nuevo** avisa siempre (eso sí es novedad).
+- `--no-notify` verifica y actualiza el estado **sin** lanzar notificación. Es
+  lo que hay que usar para **sembrar la línea base** (si no, la primera
+  ejecución dispararía un "cambio" que no lo es) y para pasar la comprobación a
+  mano sin que salte un aviso en el escritorio:
+
+```sh
+kernel-update-verify.sh --dry-run     # simula: ni persiste ni notifica
+kernel-update-verify.sh --no-notify   # verifica y fija el estado, en silencio
+```
 
 El modo lite es el **ÚNICO modo de compilación** de esta suite (v27.25.4): la
 config siempre se adelgaza con `make localmodconfig` antes de compilar. No

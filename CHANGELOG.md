@@ -1,3 +1,190 @@
+## [27.31.21] - 2026-09-25
+
+La notificación del verificador solo sale cuando el estado **cambia**.
+
+Lo que pasaba: con el estado ya limpio de v27.31.20 quedaban 2 incidencias
+recurrentes —el scheduler arrancado hasta que haya reboot, y Secure Boot
+desconocido, que no se arregla solo— y la unit, que corre en cada arranque,
+volvía a lanzar una notificación `critical` con icono de alarma **por lo mismo**
+una y otra vez. Un aviso que se repite no informa de nada: entrena al usuario a
+ignorarlo, y el día que aparezca algo de verdad ya no se mira.
+
+- **Firma de estado** (`verify_state_fingerprint`) con lo que hay que reaccionar:
+  `perfil`, `sched` (kronizado/en ejecución), `journal`, `fw`, `sb` e
+  `iss`. Se guarda en `~/.local/state/kernel-update/verify-notify-state`.
+- **El tiempo de arranque queda fuera de la firma a propósito**: 15.8675 s frente
+  a 15.8671 s no es un cambio de estado, y si estuviera dentro no se callaría
+  nunca. Un boot que empeora sí notifica, pero porque lo marca como incidencia
+  (umbral de factor y delta), no porque el número se mueva.
+- **La notificación explica qué cambió**: cuerpo con el diff componente a
+  componente (`• sched: bmq/bore → bmq/bmq`, `• journal: 0 → 1`).
+- **Resolver no es una alarma**: a 0 incidencias la notificación baja a
+  severidad `normal` con icono `emblem-ok` («sin incidencias»).
+- **Primer arranque de un kernel nuevo** sigue avisando siempre: eso sí es novedad.
+- **`--no-notify`**: verifica y actualiza el estado sin lanzar notificación.
+  Sirve para sembrar la línea base (si no, la primera ejecución habría disparado
+  un «cambio» que no lo es) y para pasar la comprobación a mano sin que salte un
+  aviso en el escritorio. `--dry-run` no guarda estado, para que una simulación
+  no pueda silenciar la notificación real siguiente.
+
+**Falso positivo que sale de paso: Secure Boot no estaba pendiente.** El
+verificadorlehía el estado de Secure Boot con `case` sobre la línea de
+`bootctl status`, y los patrones eran `*'enabled'` / `*'disabled'`. En `case`, un
+patrón sin comodín final exige que la cadena **termine** ahí, y `bootctl` imprime
+`Secure Boot: enabled (user)` — que acaba en `(user)`. El patrón no casaba nunca,
+así que el verificador informaba **"SB desconocido" con Secure Boot
+perfectamente activo** y pedía activarlo en la BIOS a quien ya lo tenía
+activado, con `critical` incluido, y lo repetía en cada arranque. Anclado al
+campo (`*'Secure Boot: enabled'*`).
+
+Con el arreglo, en este host: `Secure Boot: yes (UKI firmada; SB HABILITADO)`
+(`sbctl`: Setup Mode **Disabled**, Secure Boot **Enabled**), y las incidencias
+bajan de 2 a 1: **solo queda el scheduler**, que sí está pendiente hasta que
+reinicies en la UKI BMQ.
+
+Tests: 9 nuevos sobre la notificación (selftest **207 → 222, 0 fail**): estado
+persistido, cobertura de la firma, tiempo de arranque fuera de la firma, y el
+comportamiento real de `notify_state_changed` con el estado escrito a mano
+(primera vez notifica, idéntico no, cambio en el número de incidencias sí), diff
+en el cuerpo, bajada de severidad al resolverse y `--dry-run` sin persistir. El
+4 de los 15 nuevos fijan el estado real de Secure Boot, contra un `bootctl` de
+mentira con la salida auténtica (`enabled (user)` → HABILITADO y sin incidencia,
+`disabled` → desactivado, sin dato → desconocido): el patrón roto convivía con
+los tests porque **nadie comprobaba que la función leyera bien el valor** —que es
+justo el fallo que hacía que dijera "desconocido"—. Los 2 restantes no son del
+parche. Uno es un test de la unit que desde v27.31.19
+era **imposible de satisfacer** al correr el selftest instalado (buscaba
+`/usr/local/bin/systemd/user/…` con una ruta relativa): falso rojo sin motivo
+real, el tipo de test que entrena a ignorar los que fallan. Ahora mira la unit
+donde vive en cada layout (repo o `~/.config/systemd/user/`) y, si están las dos
+copias, exige que no hayan divergido. El otro fija que el fichero de estado se
+guarde con `
+` final: sin él, `while read` se salta la última línea, que es
+justo la que dice qué estado se guardó.
+
+- En **rojo** contra el verify de v27.31.20: **209 ok, 7 fail**; contra el
+  commiteado de v27.31.18: **199 ok, 19 fail** (6 de ellos de este parche).
+- Selftest **instalado**: **221 ok, 0 fail** (un test menos: el de comparar las
+  dos copias de la unit solo aplica en el layout del repo).
+
+Verificado en el host: sembrada la línea base con `--no-notify` y, tras dos
+ejecuciones más de la unit, `Incidencias: 2` con **ninguna notificación** nueva.
+El próximo aviso llegará cuando cambies de kernel (al reiniciar en la UKI bmq)
+o cuando se arregle Secure Boot.
+
+## [27.31.20] - 2026-09-25
+
+El verificador deja de contar como fallos cosas que el propio motor acepta.
+
+Lo que pasaba: con la unit ya instalada y habilitada (v27.31.19), la primera
+notificación llegó con **6 incidencias** en un arranque perfectamente bueno:
+
+    Kernel Cizen: 7.2.7-cizen-v3 verificado con 6 incidencias
+    Perfil: FALLO | Boot: 15.867s | Journal: 0 patrones | FW: 1
+
+Cuatro de las seis no eran nada:
+
+- **3 × `Perfil: FALLO`** (`CONFIG_BT_HCIBTUSB`, `CONFIG_SND_HDA_CODEC_ALC269`,
+  `CONFIG_SND_HDA_CODEC_HDMI_INTEL` en `=m` donde el perfil pide `y`). El motor
+  **acepta `y` o `m`** en `OPTS_ENABLE` (`validate_config`) porque el modo lite
+  hace `make localmodconfig`, que degrada a módulo lo que este hardware no tiene
+  cargado; el config promovido del build nuevo los tiene igual en `=m`. El
+  verificador era más estricto que el motor y cobraba como fallo algo que él
+  mismo acaba de producir. Ahora `=m` se informa como nota y no cuenta;
+  `=n` y `missing` siguen contando.
+- **`FW: 1`** — `Direct firmware load for i915/kbl_dmc_ver1_04.bin failed`. El
+  fichero **sí está** en el árbol: `/usr/lib/firmware/i915/kbl_dmc_ver1_04.bin.zst`
+  (`linux-firmware-intel` 20260916-1, instalado el 21 de septiembre, antes del
+  arranque). El driver pide el nombre sin extensión, el kernel tiene el
+  comprimido y sigue funcionando: el propio driver lo dice
+  («Disabling runtime power management»). Ahora se distingue: carga fallida con
+  el fichero presente en el árbol = nota; fichero ausente de verdad = incidencia.
+
+Las dos que quedan son reales y accionables: el **scheduler** arrancado (`BORE`)
+no es el que kronizó el último build (`BMQ`) —se arregla reiniciando en la UKI
+nueva, que ya tiene `CONFIG_SCHED_BMQ=y`— y **Secure Boot desconocido** (la UKI
+se firmó con sbctl, pero sin SB activado la firma no efecto; falta
+`sbctl enroll-keys --microsoft` + activar SB en la BIOS).
+
+Tests: 4 nuevos (selftest **203 → 207, 0 fail**): el verificador acepta `=m`
+como el motor, distingue firmware presente de ausente, lo ausente sigue
+contando, y la extracción del nombre de firmware admite rutas con
+subdirectorios (`i915/…`, `intel/ice/…`). En **rojo** contra el verify instalado
+de v27.31.19: **205 ok, 2 fail**. Comprobado además en vivo: con
+`CIZEN_FIRMWARE_DIR` apuntando a un árbol vacío el chequeo de firmware vuelve a
+dar 5 problemas, o sea que la rama de «ausente de verdad» sigue viva.
+
+## [27.31.19] - 2026-09-25
+
+El verificador post-boot comprueba **todos** los schedulers, y el tmpfs de
+compilación se desmonta de verdad tras cualquier build exitoso.
+
+Lo que pasaba (v27.31.18 y anteriores): el resumen de un build terminado
+prometía «Después del reboot, kernel-update-verify.service comprueba que el
+kernel cumple el perfil (y BORE si se pidió)» cuando **ese servicio no existía**
+—ni de sistema ni de usuario— y su script ni siquiera estaba instalado. Y lo
+peor: el verificador solo miraba `CONFIG_SCHED_BORE`, así que un build `bmq`
+se reportaba como «EEVDF vanilla» y se daba por bueno **sin comprobar nada**.
+
+- **SCHED para todos los schedulers.** El motor graba el scheduler **efectivo**
+  en la firma (`sched=` en `~/.local/state/kernel-update/last-build`, vía la
+  nueva `effective_scheduler`; `inherit` se resuelve a lo que se aplicó de
+  verdad, porque «inherit» no es comprobable). El verificador lee
+  `SCHED_BORE`/`SCHED_PDS`/`SCHED_BMQ`/`SCHED_LFBMQ`/`SCHED_MUQSS` del config en
+  ejecución y compara: cubre `inherit`, `eevdf`, `bore`, `pds`, `bmq`, `lfbmq` y
+  `muqss`. Es tolerante a que un kernel tenga más de un símbolo activo (BORE y
+  los conviven en el fork): se exige el del scheduler prometido, no que los
+  demás estén apagados. Las firmas anteriores sin `sched=` se siguen deduciendo
+  de `bore=`/`patches=`, así que no hay que reconstruir.
+- **`sched_check` es un paso propio.** Estaba dentro de `profile_check`, que
+  corre en sustitución de comandos: los globales que fijaba se perdían y el
+  resumen siempre imprimía `Scheduler: unknown`. Además, `sched_check` vive
+  fuera porque su salida va al journal mientras que el resumen va a stdout.
+- **Desmontaje garantizado tras éxito total.** `unmount_tmpfs_build` reintenta
+  (2 intentos, 2 s de margen para el subproceso que suele sujetar el árbol) y
+  **mide la RAM recuperada** con la nueva `get_mem_available_mb`
+  (`MemAvailable` del sistema, no el espacio del tmpfs). Distingue los dos fallos
+  posibles: sin credenciales sudo utilizables, o EBUSY — y en el EBUSY lista los
+  procesos que están dentro del tmpfs. `sudo -n umount`: nunca se queda
+  esperando una contraseña a mitad de un build. `CIZEN_KEEP_TMPFS=1` sigue siendo
+  el opt-out, y ahora se dice que es deliberado. Los flujos parciales (un `check`
+  que prepara el entorno) **no** desmontan: el build siguiente reutiliza el árbol.
+- **Red de seguridad en el trap EXIT.** Si un flujo completo saliera por una vía
+  que no llegue a `cleanup_success`, el tmpfs se desmonta igualmente al salir
+  (`rc == 0 && FULL_PIPELINE_OK && !CLEANUP_DONE`).
+- **El resumen dice la verdad.** `Build tmpfs:` termina con su estado real
+  (desmontado y cuántos GB volvieron a la RAM / no desmontado con el motivo /
+  conservado a propósito) y `Verificador:` comprueba si el script y la unit
+  existen y están habilitados, en vez de prometer una comprobación que no ocurre.
+  El reinicio se **sugiere** (`Para arrancarlo (no se reinicia solo)`), nunca se
+  ejecuta.
+- **La unit existe.** `systemd/user/kernel-update-verify.service` (nuevo),
+  `Type=oneshot`, `After=graphical-session.target`, `WantedBy=default.target`,
+  `TimeoutStartSec=300` (el escaneo de firmware de todos los módulos cargados es
+  la parte lenta). Instalada y habilitada; con `--dry-run` se puede ejecutar a
+  mano sin persistir estado ni notificar.
+
+Tests: 30 nuevos (selftest **173 → 203, 0 fail**): `effective_scheduler` para los
+6 schedulers + `inherit` nunca devuelto + bore dentro de `PATCHES_APPLIED` +
+solo-`ntsync` = eevdf; `sched=` en la firma; desmontaje en éxito total, en
+apilados, con EBUSY (2 intentos + aviso), con `CIZEN_KEEP_TMPFS=1` y en flujo
+parcial; red de seguridad del trap EXIT; las cuatro variantes del resumen;
+`running_sched`/`sched_symbol_for`/`sched_label`/`expected_sched_from_signature`
+(incluidos los fallbacks de firma antigua); `sched_check` fuera de
+`profile_check`; existencia y contenido de la unit. En **rojo** contra el
+v27.31.18 instalado: **186 ok, 17 fail**. `shellcheck` sin avisos nuevos (los
+SC2034 que quedan son preexistentes).
+
+Dos cosas que solo aparecieron probando de verdad: (1) la sonda previa
+`sudo -n true` **nunca habría dejado desmontar nada** en un host con allowlist de
+sudoers por comando (este host la tiene): se deniega aunque `umount` sí esté
+permitido, así que el `umount` ni siquiera llegaba a intentarse — ahora la sonda se
+quitó y solo se usa el error real para explicar el fallo; (2) la RAM devuelta se
+medía con `df` del tmpfs, que tras el desmontaje cambia de filesystem y daba
+siempre «~0 GB» — por eso `get_mem_available_mb`. Con el código nuevo, el
+tmpfs de 7,1 GB que había quedado del build `7.2.7-cizen-v3` se desmontó y
+`MemAvailable` pasó de 2,5 GB a 7,9 GB.
+
 ## [27.31.18] - 2026-09-25
 
 El motor ya no ofrece compilar una versión que no puede compilar (cierra la

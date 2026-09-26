@@ -5,23 +5,32 @@
 # Corre tras cada arranque (unit de usuario kernel-update-verify.service,
 # tras graphical-session.target; también manualmente) y comprueba:
 #
-#   a) PERFIL   : que la configuración del kernel EN EJECUCIÓN cumple el
+#   a) SCHED    : que el scheduler EN EJECUCIÓN es el que promesses el
+#                 último build. Se cubren TODOS los que el motor ofrece
+#                 (inherit, eevdf, bore, pds, bmq, lfbmq, muqss) leyendo
+#                 SCHED_BORE/PDS/BMQ/LFBMQ/MUQSS del config en ejecución;
+#                 antes solo se miraba BORE y un build con bmq se reportaba
+#                 como "EEVDF vanilla", es decir, se daba por bueno.
+#   b) PERFIL   : que la configuración del kernel EN EJECUCIÓN cumple el
 #                 perfil cizen (OPTS_ENABLE / CRITICAL_OPTS / SETVAL / SETSTR)
 #                 aplicando el mapa de renames, y que el scheduler coincide
-#                 con la firma del último build (BORE, BTF si se pidieron).
-#   b) BOOT     : compara systemd-analyze (kernel/userspace/total) del boot
+#                 con la firma del último build (BTF si se pidieron).
+#                 v27.31.20: OPTS_ENABLE acepta =y y =m igual que la validación
+#                 del motor (el modo lite degrada con localmodconfig) y un
+#                 firmware presente en el árbol no cuenta como incidencia.
+#   c) BOOT     : compara systemd-analyze (kernel/userspace/total) del boot
 #                 actual con el del boot previo registrado y avisa si el total
 #                 empeora más allá de un factor/umbral.
-#   c) JOURNAL  : cuenta patrones de regresión del kernel (oops/panic/GPU
+#   d) JOURNAL  : cuenta patrones de regresión del kernel (oops/panic/GPU
 #                 hang/hung task/... ) en el journal del boot actual y avisa
 #                 si aparecen más que en el boot previo.
-#   d) GUARD    : avisa si el kernel arrancado NO es el último Cizen instalado
+#   e) GUARD    : avisa si el kernel arrancado NO es el último Cizen instalado
 #                 (fallback de sd-boot por boot counting, o selección manual).
-#   e) FIRMWARE : por cada módulo cargado, modinfo -F firmware → se verifica que
+#   f) FIRMWARE : por cada módulo cargado, modinfo -F firmware → se verifica que
 #                 el fichero exista en /usr/lib/firmware; además se escanea el
 #                 journal del kernel por "Direct firmware load failed". Avisa
 #                 de cualquier firmware ausente/infallible del boot actual.
-#   f) SECURE BOOT: cruza la firma del último build (sb= en last-build) con el
+#   g) SECURE BOOT: cruza la firma del último build (sb= en last-build) con el
 #                 estado real de Secure Boot (bootctl status, salida fija con
 #                 LC_ALL=C). Avisa si la UKI se firmó pero SB está desactivado,
 #                 o si SB está activo con la UKI sin firmar (no arrancaría).
@@ -46,6 +55,11 @@ STATE_DIR="${CIZEN_VERIFY_STATE_DIR:-$HOME/.local/state/kernel-update}"
 LOG="$STATE_DIR/verify.log"
 LAST="$STATE_DIR/verify-last"
 HIST="$STATE_DIR/verify-history"
+# Firma del último estado notificado. La notificación solo sale cuando el estado
+# CAMBIA: un estado recurrente (p. ej. «la UKI está firmada pero Secure Boot está
+# desconocido», que no se arregla solo) no puede repetir una notificación
+# crítica en cada arranque, que es justo lo que la vuelve ruido.
+NOTIFY_STATE="$STATE_DIR/verify-notify-state"
 BUILD_SIG="$STATE_DIR/last-build"
 RENAME_MAP_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/kernel-update/rename-map.conf"
 NOTIFY_BIN="${CIZEN_NOTIFY_BIN:-notify-send}"
@@ -88,7 +102,13 @@ fi
 alog() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG" 2>/dev/null || true; }
 
 DRY=false
+QUIET=false
 [ "${1:-}" = "--dry-run" ] && DRY=true
+# --no-notify: verifica y actualiza el estado, pero sin lanzar notificación.
+# Sirve para establecer la línea base del estado actual (que si no dispararía una
+# notificación por "cambio") y para pasar la comprobación a mano sin que salte
+# un aviso en el escritorio.
+[ "${1:-}" = "--no-notify" ] && QUIET=true
 
 if [ -t 1 ]; then
   G=$'\033[0;32m'; Y=$'\033[1;33m'; R=$'\033[0;31m'; C=$'\033[0;36m'; N=$'\033[0m'
@@ -143,8 +163,12 @@ ensure_session_env() {
 
 # ---------- 1) PERFIL ----------
 declare -A RUN_CFG=()
+CFG_LOADED=0
+SCHED_RUNNING="unknown"
+SCHED_EXPECTED=""
 load_running_config() {
   RUN_CFG=()
+  CFG_LOADED=0
   local line
   zcat /proc/config.gz >/dev/null 2>&1 || return 1
   while IFS= read -r line || [ -n "$line" ]; do
@@ -154,11 +178,84 @@ load_running_config() {
       RUN_CFG["${BASH_REMATCH[1]}"]="n"
     fi
   done < <(zcat /proc/config.gz 2>/dev/null)
+  CFG_LOADED=1
   return 0
 }
 
 run_state() { # $1 = símbolo (ya resuelto a nombre actual); imprime y/m/n/missing
   if [ -n "${RUN_CFG[$1]+x}" ]; then printf '%s\n' "${RUN_CFG[$1]}"; else printf '%s\n' "missing"; fi
+}
+
+# ---------- 1b) SCHEDULER ----------
+# Todos los schedulers que el motor ofrece como opción (--sched / CIZEN_SCHED):
+# inherit | eevdf | bore | pds | bmq | lfbmq | muqss. Cada uno se reconoce en el
+# kernel EN EJECUCIÓN por su símbolo de configuración; eevdf es el de mainline y
+# no tiene símbolo propio (se deduce por ausencia de los demás).
+# Antes solo se miraba SCHED_BORE, así que un build con bmq/pds/lfbmq/muqss se
+# reportaba como "EEVDF vanilla en ejecución": el verificador daba por bueno un
+# kernel con el scheduler equivocado.
+sched_symbol_for() { # $1 = scheduler -> símbolo CONFIG_ esperado en y (o "-")
+  case "$1" in
+    bore)  printf 'SCHED_BORE\n' ;;
+    pds)   printf 'SCHED_PDS\n' ;;
+    bmq)   printf 'SCHED_BMQ\n' ;;
+    lfbmq) printf 'SCHED_LFBMQ\n' ;;
+    muqss) printf 'SCHED_MUQSS\n' ;;
+    eevdf) printf -- '-\n' ;;
+    *)     printf '\n' ;;
+  esac
+}
+
+sched_label() { # $1 = scheduler -> texto legible
+  case "$1" in
+    bore)  printf 'BORE\n' ;;
+    pds)   printf 'PDS (Project C)\n' ;;
+    bmq)   printf 'BMQ\n' ;;
+    lfbmq) printf 'LF-BMQ\n' ;;
+    muqss) printf 'MuQSS\n' ;;
+    eevdf) printf 'EEVDF (mainline)\n' ;;
+    *)     printf '%s\n' "$1" ;;
+  esac
+}
+
+# Scheduler efectivo del último build. Las firmas escritas desde v27.31.19 traen
+# sched=; las anteriores (solo bore=no y patches=) se deducen para no perder la
+# comprobación: bore si bore=yes, si no el primer parche de la lista de
+# schedulers del proyecto, si no eevdf.
+expected_sched_from_signature() {
+  local s="${1:-}" p
+  case "$s" in
+    inherit|"") ;;
+    *) printf '%s\n' "$s"; return 0 ;;
+  esac
+  s="${2:-}"   # bore= yes|no
+  if [ "$s" = "yes" ]; then printf 'bore\n'; return 0; fi
+  for p in ${3:-}; do   # patches=
+    case "$p" in
+      bore|pds|bmq|lfbmq|muqss) printf '%s\n' "$p"; return 0 ;;
+    esac
+  done
+  printf 'eevdf\n'
+}
+
+# Qué scheduler hay realmente en el kernel en ejecución: el símbolo propio en y,
+# o, si no, cualquiera de los del proyecto (así un kernel con pds no se
+# reporta como eevdf solo porque buscando SCHED_BMQ no aparece).
+running_sched() {
+  local sym s
+  for sym in SCHED_BORE SCHED_PDS SCHED_BMQ SCHED_LFBMQ SCHED_MUQSS; do
+    case "$(run_state "$sym")" in y) ;; *) continue ;; esac
+    case "$sym" in
+      SCHED_BORE)  s=bore ;;
+      SCHED_PDS)   s=pds ;;
+      SCHED_BMQ)   s=bmq ;;
+      SCHED_LFBMQ) s=lfbmq ;;
+      SCHED_MUQSS) s=muqss ;;
+    esac
+    printf '%s\n' "$s"
+    return 0
+  done
+  printf 'eevdf\n'
 }
 
 declare -A RENAMES=()
@@ -199,19 +296,28 @@ profile_check() {
   source "$profile" || { pc_warn "No se pudo cargar el perfil $profile; se omite perfil."; printf '%s\n' "0"; return 0; }
   load_renames
   local opt r st exp line
-  local -a bad=()
+  local -a bad=() demoted=()
 
 for opt in "${OPTS_ENABLE[@]:-}"; do
     [ -n "$opt" ] || continue
     r="$(resolve_sym "$opt")"
     st="$(run_state "$r")"
     case "$st" in
-      y) : ;; # OPTS_ENABLE exige =y
-      m) bad+=("ENABLE: CONFIG_$opt quedó en =m (perfil pide y)") ;;
+      y) : ;;
+      # v27.31.20: =m NO es una incidencia. El motor acepta y|m en OPTS_ENABLE
+      # (validate_config) porque el modo lite hace `make localmodconfig`, que
+      # degrada a módulo todo lo que este hardware no tiene cargado. Cobrarlo
+      # como fallo daba un "Perfil: FALLO" permanente en cada arranque sin que
+      # hubiera nada que arreglar. Se informa, no se cuenta.
+      m) demoted+=("CONFIG_$opt quedó en =m (localmodconfig del modo lite lo degradó; el perfil pide y)") ;;
       n) bad+=("ENABLE: CONFIG_$opt quedó en n") ;;
       *) bad+=("ENABLE: CONFIG_$opt no existe (missing en el kernel en ejecución)") ;;
     esac
   done
+  if [ "${#demoted[@]}" -gt 0 ]; then
+    pc_info "OPTS_ENABLE: ${#demoted[@]} símbolo(s) en =m por el modo lite (no es una incidencia):"
+    for line in "${demoted[@]}"; do pc_out "      $line"; done
+  fi
   for opt in "${CRITICAL_OPTS[@]:-}"; do
     [ -n "$opt" ] || continue
     r="$(resolve_sym "$opt")"
@@ -253,35 +359,18 @@ for opt in "${OPTS_ENABLE[@]:-}"; do
     pc_ok "Perfil: el kernel en ejecución cumple OPTS/CRITICAL/SETVAL/SETSTR."
   fi
 
-  # BORE vs firma de build
-  local bore_run=""
-  if [ -n "${RUN_CFG[SCHED_BORE]+x}" ]; then bore_run="${RUN_CFG[SCHED_BORE]}"; fi
-  if [ "${bore_run:-}" = "y" ]; then
-    pc_ok "Scheduler BORE presente (SCHED_BORE=y) en ejecución."
-  else
-    pc_info "Scheduler EEVDF vanilla en ejecución (SCHED_BORE no activo)."
-  fi
-
   # Firmado de módulos
   if [ -n "${RUN_CFG[MODULE_SIG_FORCE]+x}" ] && [ "${RUN_CFG[MODULE_SIG_FORCE]}" = "y" ]; then
     pc_ok "MODULE_SIG_FORCE activo en ejecución."
   fi
 
   if [ -f "$BUILD_SIG" ]; then
-    local sig_bore="no" sig_btf="no" sig_ver="" sig_patches=""
+    local sig_btf="no" sig_ver="" sig_patches=""
     # shellcheck disable=SC1090,SC1091
     source "$BUILD_SIG"
-    sig_bore="${bore:-no}"
     sig_btf="${btf:-no}"
     sig_ver="${version:-}"
     sig_patches="${patches:-}"
-    if [ "$sig_bore" = "yes" ] && [ "${bore_run:-}" != "y" ]; then
-      pc_warn "El último build pedía BORE pero el kernel arrancado NO lo tiene (SCHED_BORE=${bore_run:-no})."
-      issues=$((issues + 1))
-    elif [ "$sig_bore" != "yes" ] && [ "${bore_run:-}" = "y" ]; then
-      pc_warn "El kernel arrancado tiene BORE pero el último build era vanilla (¿paquete foráneo o rollback?)."
-      issues=$((issues + 1))
-    fi
     if [ "$sig_btf" = "yes" ]; then
       local btf_run=""
       [ -n "${RUN_CFG[DEBUG_INFO_BTF]+x}" ] && btf_run="${RUN_CFG[DEBUG_INFO_BTF]}"
@@ -308,6 +397,60 @@ for opt in "${OPTS_ENABLE[@]:-}"; do
     fi
   fi
   printf '%s\n' "${issues:-0}"
+  return 0
+}
+
+# Compara el scheduler EN EJECUCIÓN con el que kronizó el último build.
+# Es un paso propio (no dentro de profile_check) porque profile_check corre en
+# una sustitución de comandos: los globales que fija ahí no se verían fuera.
+sched_check() {
+  local run expect sym ok_sym=0 s
+  SCHED_RUNNING="unknown"
+  SCHED_EXPECTED=""
+
+  if [ "${CFG_LOADED:-0}" != "1" ]; then
+    info "Sin /proc/config.gz legible: el scheduler en ejecución no se puede comprobar."
+    return 0
+  fi
+
+  run="$(running_sched)"
+  SCHED_RUNNING="$run"
+
+  if [ ! -f "$BUILD_SIG" ]; then
+    ok "Scheduler en ejecución: $(sched_label "$run") (sin firma de build con qué compararlo)."
+    return 0
+  fi
+  # shellcheck disable=SC1090,SC1091
+  source "$BUILD_SIG"
+  expect="$(expected_sched_from_signature "${sched:-}" "${bore:-no}" "${patches:-}")"
+  SCHED_EXPECTED="$expect"
+
+  # Tolerante a que un kernel tenga más de un símbolo del proyecto activo (BORE
+  # y los alt conviven en el fork): lo que se exige es que el símbolo del
+  # scheduler prometido esté activo, no que los demás estén apagados.
+  if [ "$expect" = "eevdf" ]; then
+    for s in SCHED_BORE SCHED_PDS SCHED_BMQ SCHED_LFBMQ SCHED_MUQSS; do
+      [ "$(run_state "$s")" = "y" ] && ok_sym=1
+    done
+    if [ "$ok_sym" = "1" ]; then
+      warn "El último build kronizó EEVDF (mainline) pero el kernel arrancado tiene un scheduler del proyecto activo (se detecta $(sched_label "$run"))."
+      ISSUES=$((ISSUES + 1))
+    else
+      ok "Scheduler en ejecución: EEVDF (mainline), como kronizó el build (${version:-?})."
+    fi
+    return 0
+  fi
+
+  sym="$(sched_symbol_for "$expect")"
+  case "$(run_state "$sym")" in
+    y)
+      ok "Scheduler en ejecución: $(sched_label "$expect"), como kronizó el build (${version:-?}); CONFIG_${sym}=y."
+      ;;
+    *)
+      warn "El último build kronizó $(sched_label "$expect") (CONFIG_${sym}=y) pero el kernel arrancado no lo tiene: se detecta $(sched_label "$run") (${version:-?})."
+      ISSUES=$((ISSUES + 1))
+      ;;
+  esac
   return 0
 }
 
@@ -407,7 +550,7 @@ firmware_missing_for_module() {
 
 firmware_check() {
   local mod f line
-  local -a missing=() kfail=() all=()
+  local -a missing=() kfail=() kpresent=() all=()
   FW_COUNT=0
   while IFS= read -r mod; do
     [ -n "$mod" ] || continue
@@ -415,17 +558,49 @@ firmware_check() {
       [ -n "$f" ] && missing+=("$f")
     done < <(firmware_missing_for_module "$mod")
   done < <(cut -d' ' -f1 /proc/modules 2>/dev/null || true)
+  # v27.31.20: un "Direct firmware load ... failed" cuyo binario SÍ está en el
+  # árbol (normalmente comprimido: i915/kbl_dmc_ver1_04.bin -> .bin.zst) no es
+  # una incidencia: el driver pide el nombre sin extensión, el kernel tiene el
+  # comprimido y sigue funcionando (en el i915 eso solo desactiva el runtime
+  # power management). Contarlo como problema era un aviso permanente en cada
+  # arranque. Sí cuenta si el fichero no está de ninguna forma: eso sí es
+  # un paquete de firmware que falta de verdad.
+  local fw_name fw_rel
   while IFS= read -r line; do
-    [ -n "$line" ] && kfail+=("$line")
+    [ -n "$line" ] || continue
+    # La línea puede venir de varias formas ("Direct firmware load for X
+    # failed", "firmware: failed to load X"); se saca el nombre sin exigir que
+    # no lleve "/" (los firmwares de i915/ice son rutas con directorios).
+    fw_name="$(printf '%s' "$line" \
+      | sed -nE -e 's#^Direct firmware load for ([^ ]+) failed.*#\1#p' \
+                   -e 's#.*\bfor ([^ ]+) failed.*#\1#p' \
+                   -e 's#.*failed to load ([^ ]+).*#\1#p' \
+      | head -n1)"
+    fw_name="${fw_name%.}"
+    fw_rel="${fw_name#firmware/}"
+    if [ -n "$fw_name" ] && { [ -f "$FIRMWARE_DIR/$fw_rel" ] || [ -f "$FIRMWARE_DIR/$fw_rel.zst" ] \
+       || [ -f "$FIRMWARE_DIR/$fw_rel.xz" ] || [ -f "$FIRMWARE_DIR/$fw_rel.gz" ]; }; then
+      kpresent+=("$line  [el fichero SÍ está: $fw_rel.zst]")
+    else
+      kfail+=("$line")
+    fi
   done < <(journalctl -k -b 2>/dev/null | grep -oiE 'Direct firmware load (for [^ ]+ )?failed|firmware: failed to load [^ ]+|request_firmware[^)]*failed' | sed -E 's/^[[:space:]]+//' | sort -u || true)
 
-  if [ "${#missing[@]}" -eq 0 ] && [ "${#kfail[@]}" -eq 0 ]; then
+  if [ "${#missing[@]}" -eq 0 ] && [ "${#kfail[@]}" -eq 0 ] && [ "${#kpresent[@]}" -eq 0 ]; then
     [ "${DRY:-false}" = true ] && info "Firmware: presentes los requeridos por los módulos cargados."
     return 0
   fi
   while IFS= read -r f; do [ -n "$f" ] && all+=("$f"); done < <(printf '%s\n' "${missing[@]}" "${kfail[@]}" | sort -u || true)
   FW_COUNT="${#all[@]}"
-  warn "Firmware del boot actual: $FW_COUNT problema(s) (ausentes del árbol o fallos de carga):"
+  if [ "${#kpresent[@]}" -gt 0 ]; then
+    info "Firmware: ${#kpresent[@]} carga(s) fallida(s) con el fichero presente en el árbol (no cuentan como incidencia):"
+    for f in "${kpresent[@]}"; do printf '      %s\n' "$f"; done
+  fi
+  if [ "$FW_COUNT" -eq 0 ]; then
+    [ "${DRY:-false}" = true ] && info "Firmware: ningún fichero ausente de verdad."
+    return 0
+  fi
+  warn "Firmware del boot actual: $FW_COUNT problema(s) (fichero ausente del árbol):"
   for f in "${all[@]}"; do printf '      %s\n' "$f"; done
   ISSUES=$((ISSUES + FW_COUNT))
   return 0
@@ -441,9 +616,14 @@ secureboot_check() {
     source "$BUILD_SIG" 2>/dev/null || true
     sb_build="${sb:-no}"
   fi
+  # OJO con el patrón: bootctl imprime "Secure Boot: enabled (user)", así que un
+  # *'enabled' a secas NO casa (exigiría que la línea terminara en "enabled") y el
+  # verificador daba "desconocido" con Secure Boot perfectamente activo. El
+  # comodín final es imprescindible, y el patrón se ancla al campo para no
+  # confundirlo con nada otro.
   case "$(bootctl status 2>/dev/null | grep -m1 'Secure Boot:' || true)" in
-    *'enabled')  sboot="HABILITADO" ;;
-    *'disabled') sboot="desactivado" ;;
+    *'Secure Boot: enabled'*)  sboot="HABILITADO" ;;
+    *'Secure Boot: disabled'*) sboot="desactivado" ;;
   esac
   if [ "$sb_build" = "yes" ]; then
     if [ "$sboot" = "HABILITADO" ]; then
@@ -466,18 +646,84 @@ secureboot_check() {
 }
 
 # ---------- notificación ----------
+# Firma del estado verificable, SIN los tiempos de arranque: 15.8675 s frente a
+# 15.8671 s no es un cambio de estado, y si estuviera en la firma no se callaría
+# nunca. Refleja lo que el usuario tiene que reaccionar a: perfil, scheduler,
+# patrones del journal, firmware y Secure Boot.
+verify_state_fingerprint() {
+  printf 'perfil=%s|sched=%s/%s|journal=%s|fw=%s|sb=%s|iss=%s' \
+    "${BASE_ISSUES:-0}" "${SCHED_EXPECTED:-?}" "${SCHED_RUNNING:-?}" \
+    "${JCOUNT:-0}" "${FW_COUNT:-0}" "${SB_STATE:-?}" "${ISSUES:-0}"
+}
+
+# Devuelve 0 si el estado es NUEVO (o no hay previo): entonces toca notificar.
+notify_state_changed() {
+  local prev cur
+  cur="$(verify_state_fingerprint)"
+  [ -s "$NOTIFY_STATE" ] || return 0
+  prev="$(head -n1 "$NOTIFY_STATE")"
+  [ "$prev" != "$cur" ] && return 0
+  return 1
+}
+
+# Texto "quÃ© ha cambiado" para el cuerpo de la notificaciÃ³n: componente a
+# componente contra la firma guardada (sin columna "antes" la primera vez).
+notify_state_diff() {
+  local prev cur key ov nv first=true
+  local -a keys=(perfil sched journal fw sb iss) lines=()
+  prev="$( [ -s "$NOTIFY_STATE" ] && head -n1 "$NOTIFY_STATE" || true )"
+  cur="$(verify_state_fingerprint)"
+  for key in "${keys[@]}"; do
+    ov="$(printf '%s' "$prev" | grep -oE "(^|\|)${key}=[^|]*" | head -n1 | sed -E "s#^(\||)${key}=##")"
+    nv="$(printf '%s' "$cur"  | grep -oE "(^|\|)${key}=[^|]*" | head -n1 | sed -E "s#^(\||)${key}=##")"
+    [ "$ov" = "$nv" ] && continue
+    if [ -z "$prev" ] || [ -z "$ov" ]; then
+      lines+=("  • $key: $nv")
+    else
+      lines+=("  • $key: $ov → $nv")
+    fi
+  done
+  [ "${#lines[@]}" -eq 0 ] && return 0
+  local ln
+  for ln in "${lines[@]}"; do
+    [ "$first" = true ] || printf '
+'
+    first=false
+    printf '%s' "$ln"
+  done
+  printf '
+'
+  return 0
+}
+
 notify_issues() {
   local title body prof_txt
   if [ "$PROFILE_OK" = 1 ]; then prof_txt="OK"; else prof_txt="FALLO"; fi
-  title="Kernel Cizen: $CUR_VERSION verificado con ${ISSUES} incidencias"
+  local diff sev icon
+  diff="$(notify_state_diff)"
+  # Resolver no es una alarma: sin incidencias la notificación baja a normal y
+  # cambia el icono, para que un "todo verde" no parezca un problema.
+  if [ "$ISSUES" -gt 0 ]; then
+    title="Kernel Cizen: $CUR_VERSION verificado con ${ISSUES} incidencias"
+    sev=critical; icon=dialog-warning
+  else
+    title="Kernel Cizen: $CUR_VERSION sin incidencias"
+    sev=normal; icon=emblem-ok
+  fi
   body="Perfil: $prof_txt | Boot: $TOT_TXT | Journal: $JCOUNT patrones | FW: $FW_COUNT"
+  [ -n "$diff" ] && body="$body
+$diff"
   if [ "$DRY" = true ]; then
     echo "  (dry-run) Notificarías: $title — $body"
     return 0
   fi
+  if [ "$QUIET" = true ]; then
+    alog "Notificación suprimida (--no-notify): $title — $body"
+    return 0
+  fi
   command -v "$NOTIFY_BIN" >/dev/null 2>&1 || { alog "notify-send no disponible; no se notifica."; return 1; }
   ensure_session_env
-  "$NOTIFY_BIN" -a 'Kernel Updater' -u critical -t 10000 -i dialog-warning "$title" "$body" >/dev/null 2>&1 || true
+  "$NOTIFY_BIN" -a 'Kernel Updater' -u "$sev" -t 10000 -i "$icon" "$title" "$body" >/dev/null 2>&1 || true
   alog "Notificación de verificación: $title — $body"
 }
 
@@ -488,6 +734,10 @@ notify_first_boot() {
   body="Verificación post-boot: $iss_txt | boot total $TOT_TXT"
   if [ "$DRY" = true ]; then
     echo "  (dry-run) Notificarías (primer arranque): $title — $body"
+    return 0
+  fi
+  if [ "$QUIET" = true ]; then
+    alog "Notificación suprimida (--no-notify): $title — $body"
     return 0
   fi
   command -v "$NOTIFY_BIN" >/dev/null 2>&1 || { alog "notify-send no disponible."; return 1; }
@@ -512,6 +762,8 @@ else
   [ "${BASE_ISSUES:-0}" -eq 0 ] && PROFILE_OK=1 || PROFILE_OK=0
   ISSUES=$((ISSUES + ${BASE_ISSUES:-0}))
 fi
+
+sched_check
 
 BT="$(boot_times)"
 read -r BT_FW BT_LD BT_KE BT_US BT_TOT <<< "$BT"
@@ -551,6 +803,12 @@ echo "${C} Verificación post-boot — kernel $CUR_VERSION${N}"
 echo "${C}========================================================${N}"
 echo " Kernel en ejecución : $CUR_VERSION"
 echo " Perfil              : $PROFILE_OUT_TXT"
+# Sin ${VAR:+ $(...)} anidado: dentro de una expansión "${...}" las comillas
+# del comando sustituto confunden al parser de bash.
+_sched_run_lbl="$(sched_label "$SCHED_RUNNING")"
+_sched_exp_lbl=""
+[ -n "$SCHED_EXPECTED" ] && _sched_exp_lbl=" [build: $(sched_label "$SCHED_EXPECTED")]"
+echo " Scheduler           : ${_sched_run_lbl}${_sched_exp_lbl}"
 echo " Boot (systemd)      : total $TOT_TXT (previo: ${P_TOT:-—}s, ${P_VER:-—})"
 echo " Journal (boot atual): $JCOUNT patrones (previo: ${P_J:-—})"
 echo " Firmware            : $FW_COUNT problema(s)"
@@ -559,14 +817,33 @@ echo " Firmware            : $FW_COUNT problema(s)"
  logger_line="${CUR_VERSION} perf=$PROFILE_OK boot=$TOT_N j=$JCOUNT fw=$FW_COUNT sb=${SB_STATE:-?} iss=$ISSUES prev=${P_TOT:-0} prevver=${P_VER:-none}"
 alog "verify done: $logger_line"
 
+# v27.31.21: solo se notifica si el estado cambió. Con --dry-run no se guarda
+# el estado (una simulación no debe callar la notificación real siguiente).
 if [ "$ISSUES" -gt 0 ]; then
-  notify_issues
-  [ "$DRY" = true ] && echo "  RESULTADO: $ISSUES incidencia(s) detectadas."
+  if notify_state_changed; then
+    notify_issues
+    [ "$DRY" = true ] && echo "  RESULTADO: $ISSUES incidencia(s) detectadas (estado nuevo: se notifica)."
+  else
+    [ "$DRY" = true ] && echo "  RESULTADO: $ISSUES incidencia(s) ya notificadas; sin cambios desde la última verificación (no se repite la notificación)."
+  fi
 elif [ "$FIRST_BOOT" = true ]; then
+  # Arrancar un kernel nuevo siempre es novedad: se avisa aunque esté limpio.
   notify_first_boot
   [ "$DRY" = true ] && echo "  RESULTADO: sin incidencias (primer arranque de $CUR_VERSION)."
 else
-  [ "$DRY" = true ] && echo "  RESULTADO: sin incidencias."
+  if notify_state_changed; then
+    notify_issues
+    [ "$DRY" = true ] && echo "  RESULTADO: sin incidencias (estado nuevo: se notifica la resolución)."
+  else
+    [ "$DRY" = true ] && echo "  RESULTADO: sin incidencias, sin cambios."
+  fi
+fi
+
+# Guardar la firma del estado actual: a partir de aquí, repetirlo no notifica.
+if [ "$DRY" != true ]; then
+  # \n final a propósito: sin él, `while read` se salta la última línea, que es
+  # justo la que dice qué estado se guardó.
+  { verify_state_fingerprint; printf '\n'; } > "$NOTIFY_STATE" 2>/dev/null || true
 fi
 
 exit 0
