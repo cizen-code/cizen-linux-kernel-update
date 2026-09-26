@@ -219,6 +219,32 @@ systemctl --user enable --now kernel-update-verify.service
 verificador está instalado y habilitado, en vez de prometer una comprobación
 que no existe.
 
+#### Medir el scheduler: `sched-bench.sh` (v27.31.23)
+
+Los schedulers alternativos (BORE, BMQ/PDS, LF-BMQ) no compiten en
+throughput: ceden rendimiento en paralelo a cambio de **latencia
+interactiva** con la máquina saturada. El banco mide las tres cosas por eso,
+y ninguna es un arranque — un arranque va de firmware, I/O y servicios, y con
+el mismo hardware se mueve ±1,5 s solo:
+
+```sh
+sudo install -Dm755 kernel-update/sched-bench.sh /usr/local/bin/kernel-update/sched-bench.sh
+/usr/local/bin/kernel-update/sched-bench.sh            # mide y añade el resultado al histórico
+/usr/local/bin/kernel-update/sched-bench.sh --resumen  # tabla de todo lo medido, por scheduler
+```
+
+Cada ejecución añade un bloque a
+`~/.local/state/kernel-update/sched-bench-<kernel>-<scheduler>.txt`; el
+scheduler va en el nombre porque dos builds del mismo kernel (7.2.7-cizen-v3
+con `bore` y con `bmq`) se llaman igual. El scheduler medido se deduce de
+`/proc/config.gz` —del kernel **en marcha**, no del que se pidió en el build—,
+así que si el arranque falló y arrancó otro, el resultado es del que hay.
+
+`--resumen` da la mediana de cada cifra por kernel, que es la que vale: con
+tres o cuatro tiradas se ve si la diferencia supera el ruido. Para comparar dos
+schedulers en serio hace falta el mismo estado en ambos (misma carga de
+escritorio, sin compilando nada), y mejor dos arranques de cada uno que uno solo.
+
 #### La notificación solo cuando el estado cambia (v27.31.21)
 
 La comprobación corre en **cada arranque**, así que notificar en cada una

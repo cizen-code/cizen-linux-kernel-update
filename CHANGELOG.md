@@ -1,3 +1,54 @@
+## [27.31.23] - 2026-09-25
+
+Un banco para comparar schedulers, porque el tiempo de arranque no sirve.
+
+Preguntar "¿qué scheduler va mejor?" con los datos que había era comparar
+manzanas con peras. El verificador solo guarda **el último arranque**, y de los
+anteriores no queda ni el scheduler. Rehecha la extracción desde el journal, la
+tabla que sale es esta:
+
+| kernel | n | total min/med/máx | kernel | userspace |
+|---|---|---|---|---|
+| cizen-3 = **BMQ** | **1** | 18.406 | 2.321 | 6.963 |
+| cizen-2 = **BORE** | **6** | 13.533 / **15.900** / 17.193 | 1.494 | 3.718 |
+
+Se lee "BMQ es un 16% más lento" y no significa nada: **n=1 en el lado de BMQ**,
+y ese arranque es el primero tras compilar e instalar (caché fría, mkinitcpio
+recién ejecutado, UKI sin estrenar). Encima el tramo `firmware` —el mismo
+hardware, cero influence del scheduler— se mueve de 4.639 a 7.240 s entre
+arranques: ±1,5 s de ruido para una diferencia de 2,5 s. Y el 70% de la
+diferencia está en `userspace`, que va de I/O y servicios. Los schedulers
+alternativos compiten en **latencia interactiva**, no en arranque; un arranque
+no es su métrica.
+
+- **`kernel-update/sched-bench.sh`**: mide throughput de un hilo, escalado en
+  paralelo y —la que de verdad distingue a estos schedulers— **cuánto tarda una
+  tarea de primer plano con la máquina saturada**. Sin `time(1)`, con el
+  `TIMEFORMAT` de bash y `date +%s%3N`: `/usr/bin/time` no está en el host, y
+  el `time` de bash no da milisegundos.
+- **`--resumen`**: tabla con la **mediana** de cada cifra por kernel, que es la
+  que vale cuando hay que comparar dos builds.
+- **Histórico acumulativo**: un bloque por ejecución en
+  `~/.local/state/kernel-update/sched-bench-<kernel>-<scheduler>.txt`. El
+  scheduler va en el nombre porque 7.2.7-cizen-v3 con `bore` y con `bmq` se
+  llaman igual, y sin eso el segundo machacaba al primero y la comparación se
+  comparaba consigo misma.
+- **El scheduler medido sale de `/proc/config.gz`**, del kernel en marcha y no
+  del que se pidió en el build: si el arranque falló y arranque otro, el
+  resultado es del que hay.
+- **La carga en paralelo se mata por PID**, nunca con `pkill -f`: el patrón
+  coincide con la propia línea de órdenes de quien lanza el banco y se mata
+  solo (pasó: dejó la máquina al 400% hasta que venció el tiempo).
+- Se anota el **load average de antes** de medir, que es la única referencia
+  útil para descartar una tirada hecha con el escritorio ocupado.
+- Un parámetro mal escrito sale con `rc=2` **antes de medir**, no después de
+  quemarte dos minutos de CPU al 100%.
+
+Con el banco ya instalado, la mitad de BMQ queda medida: 7.459 ms de un hilo,
+20.405 ms con 4, 10.107 ms de latencia con la máquina saturada. La mitad de BORE
+no se puede tomar sin recompilar ese kernel (el rollback solo guarda el
+tarball de fuentes), así que el par queda pendiente hasta que haya un build BORE.
+
 ## [27.31.22] - 2026-09-25
 
 El verificador ya no confunde "imposible de habilitar" con "incumplido".

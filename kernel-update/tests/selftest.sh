@@ -1271,6 +1271,46 @@ else
   printf '  (sin %s: se omiten los tests del menú)\n' "$MENU"
 fi
 
+# --- sched-bench.sh: la brújula para comparar schedulers (v27.31.23) ---
+# Los schedulers alternativos compiten en latencia interactiva, no en arranque
+# ni en throughput. El banco mide las tres cosas; aquí solo se comprueba que no
+# se rompe ni arranca una medición de 2 minutos por un argumento mal escrito.
+BENCH="$(dirname "$MOTOR")/sched-bench.sh"
+if [ -r "$BENCH" ]; then
+  bash -n "$BENCH" 2>/dev/null \
+    && rec ok "banco: bash -n limpio" \
+    || rec fail "banco: no pasa bash -n"
+  # Un argumento inválido tiene que salir YA: si se cuela, el usuario se come una
+  # medición entera (minutos de CPU al 100%) pensando que va a ver un resumen.
+  bash "$BENCH" --basura >/dev/null 2>&1
+  [ "$?" -eq 2 ] && rec ok "banco: un argumento desconocido sale con rc=2 sin medir" \
+                 || rec fail "banco: un argumento desconocido no corta (rc=$?)"
+  SCHED_BENCH_ITERS=0 bash "$BENCH" >/dev/null 2>&1
+  [ "$?" -eq 2 ] && rec ok "banco: parámetro fuera de rango sale con rc=2 sin medir" \
+                 || rec fail "banco: ITERS=0 no se rechaza"
+  CIZEN_VERIFY_STATE_DIR="$ROOT/bench" bash "$BENCH" --resumen >/dev/null 2>&1
+  [ "$?" -eq 0 ] && rec ok "banco: --resumen funciona sin historial" \
+                 || rec fail "banco: --resumen falla sin ficheros"
+  # El scheduler va en el NOMBRE del resultado: dos builds del mismo kernel
+  # (7.2.7-cizen-v3 con bore y con bmq) se llaman igual y el segundo machacaba al
+  # primero, con lo que la comparación se comparaba consigo misma.
+  if grep -q 'sched-bench-\$(uname -r)-\$sched\.txt' "$BENCH"; then
+    rec ok "banco: el resultado se nombra por kernel Y scheduler (no se pisan entre builds)"
+  else
+    rec fail "banco: el nombre del resultado no incluye el scheduler"
+  fi
+  # Y el scheduler se lee del kernel EN MARCHA, no del pedido: si el arranque
+  # Felló y arrancó otro, hay que medir el que hay.
+  if grep -q 'sched_actual()' "$BENCH" && grep -q '/proc/config\.gz' "$BENCH" \
+     && ! grep -qE 'CIZEN_SCHED|\$SCHED_.*-e |--sched' "$BENCH"; then
+    rec ok "banco: el scheduler se deduce de /proc/config.gz, no del que se pidió"
+  else
+    rec fail "banco: el scheduler medido puede no ser el que está en marcha"
+  fi
+else
+  printf '  (sin %s: se omiten los tests del banco)\n' "$BENCH"
+fi
+
 # --- identidad del árbol de fuentes y desmontaje inteligente (v27.31.17) ---
 # El directorio del árbol solo lleva la versión, así que dos builds con
 # distinto parche/scheduler (vanilla vs cachyos) o distinta versión pueden
