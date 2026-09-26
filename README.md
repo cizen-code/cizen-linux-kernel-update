@@ -93,10 +93,22 @@ descargar y validar):
 Un perfil pide símbolos por nombre, y el kernel los va renombrando. Desde
 v27.31.28 el motor no se limita a avisar: si un símbolo que pide el perfil no
 existe en la versión que se va a compilar, busca el más parecido entre los ~21.700
-símbolos que sí existen y aplica el renombrado **solo si hay un candidato único**
-(con empate no inventa nada, porque activar el símbolo equivocado en un kernel
-que se va a arrancar es peor que preguntar). Se informa de cada renombrado
-aplicado y con `--save-auto-renames` quedan escritos para el siguiente kernel.
+símbolos que sí existen y aplica el renombrado **solo si hay un candidato único y
+deliberadamente obvio**: prefijo común de 6+ caracteres, ninguno prefijo del otro
+y 4 caracteres o menos de diferencia (o sea, el final cambiado). Se rechazan a
+propósito los dos falsos positivos que salían con una regla más laxa:
+
+| Petición | Renombrado laxo | Por qué se rechaza |
+|---|---|---|
+| `PERF_GUEST_EVENTS` | → `PERF_EVENTS` | No es un renombrado: es otro símbolo. Con `--absorb-rebels` la auditoría lo escribía en el perfil y el fallo se volvía permanente |
+| `PREEMPT_DYNAMIC_KSYMS` | → `PREEMPT_DYNAMIC` | División de feature: encender la padre no es encender la hija |
+| `SCHED_BORE_MITIGATION` | → `SCHED_BORE` | Opción nueva, no renombrada |
+
+Sin candidato inequívoco, el motor lo dice y lo omite, que es lo correcto. Se
+informa de cada renombrado aplicado y con `--save-auto-renames` quedan escritos
+para el siguiente kernel. Los tipos también se respetan: un `int` no es un
+booleano, así que forzarlo a `=y` es un valor que `olddefconfig` revierte
+(`MIN_BASE_SLICE_NS` de BORE es exactamente ese caso).
 
 El índice de símbolos se rehace cuando un parche modifica el árbol, así que los
 símbolos que introduce un parche (BORE añade `SCHED_BORE` y `MIN_BASE_SLICE_NS`)

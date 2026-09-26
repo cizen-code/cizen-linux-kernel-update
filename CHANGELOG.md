@@ -1,3 +1,57 @@
+## [27.31.29] - 2026-09-26
+
+Regresiones de v27.31.28, cazadas con un `--check` real contra 7.2.8 + BORE.
+
+**El tipo de los símbolos nunca se leía.** El motor trabaja con `IFS=$'\n\t'`, así
+que el `read -r sym tipo` del índice **no partía por el espacio**: las claves
+quedaban siendo `"MIN_BASE_SLICE_NS int"` enteras. Ninguna búsqueda por nombre
+encontraba nada, todos los símbolos parecían booleanos y `MIN_BASE_SLICE_NS`
+volvía a la rama de "forzar a `=y`": el `37/38` que v27.31.28 juraba haber
+arreglado. Se lee con tabulador explícito, y el selftest reproduce ya el IFS del
+motor (el arnés no lo fijaba, y por eso el test pasaba con el bug dentro).
+
+```
+✗ línea 6718: ${#PATCH_VALUE_SYMBOLS[@]:-}: bad substitution
+```
+
+`${#ARR[@]:-}` no es sintaxis de bash (sí lo es `${ARR[@]:-}`, que el motor usa
+en 12 sitios y es válido): el motor se caía al imprimir el resumen.
+
+**El renombrado automático era demasiado listo.** Con la regla laxa de v27.31.28
+resolvía `PERF_GUEST_EVENTS` a `PERF_EVENTS` (comparten 5 letras al principio y
+`EVENTS` al final) y activaba un símbolo que el perfil no había pedido nunca. Con
+`--absorb-rebels` la auditoría lo acababa **escribiendo en el perfil**, así que el
+fallo era persistente. Y `PREEMPT_DYNAMIC_KSYMS` se "renombraba" a
+`PREEMPT_DYNAMIC`, que es su padre, no su versión nueva. Ahora solo se resuelve
+cuando es **el mismo nombre**: prefijo común de 6+ caracteres, ninguno prefijo
+del otro y diferencia de 4 caracteres o menos (el final cambiado). Se rechazan a
+propósito las divisiones de feature y las opciones nuevas; si no hay candidato
+inequívoco se dice y se omite, que es lo correcto.
+
+**El árbol conservado ya parcheado no invalidaba el índice.** Con el árbol
+reutilizado (`BORE ya estaba aplicado`) se saltaba la invalidación, que es
+justo cuando el árbol no cambia pero el proceso sí ha construido el índice antes.
+Igual que en la aplicación real.
+
+**Las claves de SETVAL/SETSTR se corrompían al renombrar.** El round-trip
+`"SYM=$>valor"` con `${x%%=*>}`/`${x#*=>}` no casaba nunca (exige un `>` al final
+del match, y el valor va detrás del separador): la clave acababa siendo
+`"HZ=$>1000"`, el validador contaba 28 valores numéricos y 1 de texto como
+inexistentes con una `.config` correcta, y `scripts/config` escribía basura real.
+
+Resultado del mismo `--check` que fallaba, ahora sobre el árbol de verdad:
+
+```
+✓ [ENABLE]   37/37 activaciones satisfechas
+✓ [CRITICAL] 13/13 críticos presentes
+✓ [DISABLE]  249/249 desactivaciones resueltas
+✓ [SETVAL]   28/28 valores numéricos
+✓ [SETSTR]   2/2 valores de texto
+• Símbolos de valor que aportan los parches (no booleanos): MIN_BASE_SLICE_NS
+```
+
+Selftest: 301 -> 305.
+
 ## [27.31.28] - 2026-09-26
 
 La variante se pregunta antes que el compilador, y los símbolos Kconfig se

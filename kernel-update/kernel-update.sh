@@ -135,7 +135,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.28"
+SCRIPT_VERSION="27.31.29"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -5575,6 +5575,12 @@ apply_patch_plugin() {
   # degradaría a vanilla pese a que el árbol SÍ lo lleva.
   if patch_markers_hit; then
     ok "${PATCH_DISP_NAME:-$name} ya estaba aplicado en el árbol conservado."
+    # El árbol conservado YA viene parcheado, pero el índice de símbolos puede
+    # haberse construido antes (mismo proceso, otra rama). Se tira igual que en
+    # la aplicación real: los tipos de PATCH_SYMBOLS (bool vs int) se deciden
+    # con el árbol parcheado, y con el índice viejo un `int` como
+    # MIN_BASE_SLICE_NS se clasificaba como bool y acababa forzado a "=y".
+    kconfig_index_invalidate
     apply_patch_register "$name"
     _sched_alt_rtmutex_futex_fixup
     return 0
@@ -6161,7 +6167,12 @@ kconfig_index_invalidate() {
 build_kconfig_type_index() {
   [ "$KCONFIG_TYPE_INDEX_BUILT" = true ] && return 0
   local pair sym tipo
-  while read -r sym tipo; do
+  # v27.31.29: separador TAB y IFS explícito. El motor trabaja con IFS=$'\n\t',
+  # así que un "read -r sym tipo" NO parte por el espacio: las claves acababan
+  # siendo "MIN_BASE_SLICE_NS int" enteras, ninguna búsqueda por nombre encontraba
+  # nada y TODOS los símbolos parecían booleanos (que es justo el bug que esto
+  # iba a arreglar: el int de BORE volvía a la rama de forzar a "=y").
+  while IFS=$'\t' read -r sym tipo; do
     [ -n "$sym" ] || continue
     KCONFIG_SYMBOL_TYPE["$sym"]="$tipo"
   done < <(
@@ -6169,14 +6180,14 @@ build_kconfig_type_index() {
       xargs -0 -r cat 2>/dev/null |
       awk '
         /^[[:space:]]*(menuconfig|config)[[:space:]]+[A-Za-z0-9_]+/ {
-          if (sym != "") print sym, tipo
+          if (sym != "") printf "%s\t%s\n", sym, tipo
           sym = $2; tipo = ""; next
         }
         sym != "" && tipo == "" &&
           match($0, /^[[:space:]]*(bool|tristate|int|hex|string|def_bool|def_tristate|def_int|def_hex|def_string)([[:space:]]|$)/) {
           tipo = substr($0, RSTART, RLENGTH); gsub(/[[:space:]]/, "", tipo); sub(/^def_/, "", tipo)
         }
-        END { if (sym != "") print sym, tipo }
+        END { if (sym != "") printf "%s\t%s\n", sym, tipo }
       ' 2>/dev/null | sort -u || true
   )
   KCONFIG_TYPE_INDEX_BUILT=true
@@ -6194,7 +6205,7 @@ kconfig_symbol_type() { # vacío = bool (el tipo por defecto de Kconfig)
 #símbolo equivocado en un kernel que se está a punto de arrancar.
 kconfig_auto_candidate() { # $1 = símbolo desconocido
   local sym="$1" best="" second=0 best_score=0 tie=0
-  local s c i n cp score suffix
+  local s c i n cp score suffix best_cp=0
   build_kconfig_symbol_index
   [ "${#KCONFIG_SYMBOL_KNOWN[@]}" -gt 0 ] || return 0
   s="${sym#CONFIG_}"
@@ -6222,16 +6233,37 @@ kconfig_auto_candidate() { # $1 = símbolo desconocido
     fi
     score=$((cp + suffix))
     if [ "$score" -gt "$best_score" ]; then
-      second=$best_score; best_score=$score; best="$c"; tie=0
+      second=$best_score; best_score=$score; best="$c"; best_cp=$cp; tie=0
     elif [ "$score" -eq "$best_score" ] && [ -n "$best" ]; then
       tie=1
     elif [ "$score" -gt "$second" ]; then
       second=$score
     fi
   done
-  if [ -n "$best" ] && [ "$tie" = 0 ] && [ "$best_score" -gt "$second" ]; then
-    printf '%s' "$best"
+  # Que sea el mejor no basta: tiene que ser *el mismo nombre*. Se exige un
+  # prefijo común largo (>= 6), que ninguno sea prefijo del otro y que la
+  # diferencia sea corta (4 caracteres o menos: el final cambiado, un renombrado
+  # de verdad). Se rechazan a propósito los dos casos que parecen renombres y no
+  # lo son, porque activar el símbolo equivocado en un kernel que se va a
+  # arrancar es peor que no renombrar nada:
+  #   - división de feature: PREEMPT_DYNAMIC_KSYMS -> PREEMPT_DYNAMIC (una es
+  #     parte de la otra; encender la padre no es encender la hija)
+  #   - opción nueva: SCHED_BORE -> SCHED_BORE_MITIGATION (apareció algo, no se
+  #     renombró nada)
+  # Con la regla laxa, PERF_GUEST_EVENTS se "renombraba" a PERF_EVENTS y
+  # activaba un símbolo que el perfil no pidió nunca.
+  if [ -z "$best" ] || [ "$tie" = 1 ] || [ "$best_score" -le "$second" ]; then
+    return 0
   fi
+  if [ "$best_cp" -lt 6 ]; then
+    return 0
+  fi
+  case "$s" in "$best"|"$best"_*|"$best"-*) return 0 ;; esac
+  case "$best" in "$s"|"$s"_*|"$s"-*) return 0 ;; esac
+  if [ $(( ${#s} > ${#best} ? ${#s} - ${#best} : ${#best} - ${#s} )) -gt 4 ]; then
+    return 0
+  fi
+  printf '%s' "$best"
   return 0
 }
 
@@ -6265,7 +6297,7 @@ auto_resolve_effective_symbols() {
   # Se reconstruyen las listas limpias, sin duplicados y con el orden original.
   if [ "$any" = true ]; then
     local -A seen=()
-    local -a e=() d=() c=() sv=() ss=()
+    local -a e=() d=() c=()
     for o in "${EFF_ENABLE[@]}"; do
       cand="${APPLIED_RENAMES[$o]:-$o}"; [ -n "${seen[e$cand]:-}" ] || { seen[e$cand]=1; e+=("$cand"); }
     done
@@ -6275,19 +6307,26 @@ auto_resolve_effective_symbols() {
     for o in "${EFF_CRITICAL[@]}"; do
       cand="${APPLIED_RENAMES[$o]:-$o}"; [ -n "${seen[c$cand]:-}" ] || { seen[c$cand]=1; c+=("$cand"); }
     done
-    local -A seen2=()
+    # v27.31.29: SETVAL/SETSTR se reconstruyen con arrays asociativos nuevos, NO
+    # con un string "SYM=$>valor". Ese round-trip estaba roto desde v27.31.28:
+    # el patrón "=*>" exige un '>' al FINAL del match, pero el valor va detrás del
+    # separador "$>", así que ${x%%=*>} y ${x#*=>} devolvían el string entero.
+    # Resultado: la clave pasaba a ser "HZ=$>1000", kconfig_symbol_known decía
+    # que no existía y el validador contaba 28 SETVAL + 1 SETSTR como "missing"
+    # con una .config perfectamente correcta.
+    local -A seen2=() nsv=() nss=()
     for o in "${!EFF_SETVAL[@]}"; do
-      cand="${APPLIED_RENAMES[$o]:-$o}"; [ -n "${seen2[$cand]:-}" ] || { seen2[$cand]=1; sv+=("$cand=$>${EFF_SETVAL[$o]}"); }
+      cand="${APPLIED_RENAMES[$o]:-$o}"; [ -n "${seen2[$cand]:-}" ] || { seen2[$cand]=1; nsv["$cand"]="${EFF_SETVAL[$o]}"; }
     done
     seen2=()
     for o in "${!EFF_SETSTR[@]}"; do
-      cand="${APPLIED_RENAMES[$o]:-$o}"; [ -n "${seen2[$cand]:-}" ] || { seen2[$cand]=1; ss+=("$cand=$>${EFF_SETSTR[$o]}"); }
+      cand="${APPLIED_RENAMES[$o]:-$o}"; [ -n "${seen2[$cand]:-}" ] || { seen2[$cand]=1; nss["$cand"]="${EFF_SETSTR[$o]}"; }
     done
     EFF_ENABLE=("${e[@]}"); EFF_DISABLE=("${d[@]}"); EFF_CRITICAL=("${c[@]}")
     EFF_SETVAL=(); EFF_SETSTR=()
-    local x
-    for x in "${sv[@]}"; do EFF_SETVAL["${x%%=*>}"]="${x#*=>}"; done
-    for x in "${ss[@]}"; do EFF_SETSTR["${x%%=*>}"]="${x#*=>}"; done
+    local k
+    for k in "${!nsv[@]}"; do EFF_SETVAL["$k"]="${nsv[$k]}"; done
+    for k in "${!nss[@]}"; do EFF_SETSTR["$k"]="${nss[$k]}"; done
   fi
 }
 
@@ -6700,7 +6739,7 @@ validate_config() {
       warn "[ENABLE]   ${#ENABLE_FAIL[@]} activación(es) sin satisfacer:"
       for x in "${ENABLE_FAIL[@]}"; do warn "              $x"; done
     fi
-    if [ "${#PATCH_VALUE_SYMBOLS[@]:-}" -gt 0 ]; then
+    if [ "${#PATCH_VALUE_SYMBOLS[@]}" -gt 0 ]; then
       info "Símbolos de valor que aportan los parches (no booleanos: se deja su default, no se fuerzan a =y): ${PATCH_VALUE_SYMBOLS[*]}"
     fi
   else

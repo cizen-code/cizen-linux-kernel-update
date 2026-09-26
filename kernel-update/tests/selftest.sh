@@ -1441,6 +1441,10 @@ config FOO_BAR_A
 	bool
 config FOO_BAR_B
 	bool
+config FOO_BAR_BAZ
+	bool
+config ZZZ_TEST_ALPHA
+	bool
 KCFG
   cat > "$ROOT/src/kernel/Kconfig.hz" <<'KCFG'
 config HZ
@@ -1462,6 +1466,11 @@ EXTRACT
   done
   cat > "$ROOT/kprobe.sh" <<'PROBE'
 set -u
+# v27.31.29: el motor trabaja con IFS=$'\n\t'. Sin reproducirlo aquí, un
+# "read -r sym tipo" parte por el espacio en el arnés y no en el motor, y los
+# bugs de parseo del índice de tipos pasan desapercibidos (pasó en v27.31.28:
+# las claves acababan siendo "SIMBOLO int" y ningún tipo se encontraba).
+printf 'IFS=%q\n' $'\n\t'
 SRC="$ROOT/src"
 declare -A KCONFIG_SYMBOL_KNOWN=() KCONFIG_SYMBOL_TYPE=()
 KCONFIG_TYPE_INDEX_BUILT=false
@@ -1470,17 +1479,26 @@ KCONFIG_SYMBOL_INDEX_BUILT=false
 source "$ROOT/kfn.sh"
 build_kconfig_symbol_index >/dev/null 2>&1
 build_kconfig_type_index  >/dev/null 2>&1
+printf 'CLAVE_SIMP %s\n' "$(kconfig_symbol_type HZ >/dev/null; echo HZ)"
 printf 'TIPOS %s %s %s %s\n' \
   "$(kconfig_symbol_type SCHED_BORE)" "$(kconfig_symbol_type HZ)" \
   "$(kconfig_symbol_type MIN_BASE_SLICE_NS)" "$(kconfig_symbol_type FOO_BAR_A)"
 printf 'NUEVO %s\n' "$(kconfig_symbol_known NUEVO_DE_PATCH && echo sí || echo no)"
-printf 'CAND_BORE %s\n' "$(kconfig_auto_candidate SCHED_BORE_MITIGATION)"
+printf 'CAND_SIMILAR %s\n' "$(kconfig_auto_candidate ZZZ_TEST_BETA)"
+printf 'CAND_SPLIT %s\n' "$(kconfig_auto_candidate SCHED_BORE_MITIGATION)"
 printf 'CAND_NSA %s\n' "$(kconfig_auto_candidate MIN_BASE_SLICE_NZ)"
 printf 'CAND_TIE %s\n' "$(kconfig_auto_candidate FOO_BAR_C)"
 printf 'CAND_FAR %s\n' "$(kconfig_auto_candidate X86_X2APIC_PRESERVE)"
 PROBE
   if [ -s "$ROOT/kfn.sh" ]; then
     p1="$(bash "$ROOT/kprobe.sh" 2>&1)"
+    # El síntoma exacto del bug: el tipo se busca por el nombre del símbolo, y
+    # con el IFS del motor la clave se guardaba con el tipo pegado ("HZ int").
+    if [ "$(printf '%s\n' "$p1" | grep '^CLAVE_SIMP ')" = "CLAVE_SIMP HZ" ]; then
+      rec ok "kconfig: con el IFS del motor las claves del índice de tipos son el nombre pelado"
+    else
+      rec fail "kconfig: las claves del índice de tipos llevan el tipo pegado ('$(printf '%s\n' "$p1" | grep '^CLAVE_SIMP ')')"
+    fi
     if [ "$(printf '%s\n' "$p1" | grep '^TIPOS ')" = "TIPOS bool int int bool" ]; then
       rec ok "kconfig: el índice distingue bool de int (un int no se fuerza a =y)"
     else
@@ -1491,11 +1509,19 @@ PROBE
     else
       rec fail "kconfig: símbolo inexistente dado por bueno"
     fi
-    if [ "$(printf '%s\n' "$p1" | grep '^CAND_BORE ')" = "CAND_BORE SCHED_BORE" ] &&
+    if [ "$(printf '%s\n' "$p1" | grep '^CAND_SIMILAR ')" = "CAND_SIMILAR ZZZ_TEST_ALPHA" ] &&
        [ "$(printf '%s\n' "$p1" | grep '^CAND_NSA ')" = "CAND_NSA MIN_BASE_SLICE_NS" ]; then
       rec ok "kconfig: el renombrado automático encuentra el candidato único"
     else
       rec fail "kconfig: el renombrado automático no encuentra lo evidente ('$p1')"
+    fi
+    # v27.31.29: dos casos que PARECEN renombres y no lo son. Con la regla laxa se
+    # "renombraban" y activaban un símbolo que el perfil no pidió nunca
+    # (PREEMPT_DYNAMIC_KSYMS -> PREEMPT_DYNAMIC, PERF_GUEST_EVENTS -> PERF_EVENTS).
+    if [ "$(printf '%s\n' "$p1" | grep '^CAND_SPLIT ')" = "CAND_SPLIT " ]; then
+      rec ok "kconfig: una división de feature no se confunde con un renombrado"
+    else
+      rec fail "kconfig: se renombra un símbolo que solo es parte de otro ('$p1')"
     fi
     if [ "$(printf '%s\n' "$p1" | grep '^CAND_TIE ')" = "CAND_TIE " ]; then
       rec ok "kconfig: con dos candidatos parecidos no se inventa ninguno"
@@ -1542,6 +1568,51 @@ PROBE
     rec ok "kconfig: los renombres automáticos se aplican y se pueden guardar con --save-auto-renames"
   else
     rec fail "kconfig: los renombres automáticos no se aplican ni se pueden persistir"
+  fi
+
+  # v27.31.29 (regresión de v27.31.28): al reconstruir los arrays por un
+  # renombre automático, SETVAL/SETSTR se codificaban como "SYM=$>valor" y se
+  # recuperaban con ${x%%=*>}/${x#*=>}. Ese patrón exige un '>' al FINAL del
+  # match, pero el valor va detrás del separador, así que NUNCA casaba: la clave
+  # quedaba siendo el string entero ("HZ=$>1000") y el validador contaba 28
+  # SETVAL + 1 SETSTR como inexistentes con una .config correcta. Se fertilizers
+  # scripts/config writing basura real a .config (CONFIG_DRM_I915_FORCE_PROBE).
+  : > "$ROOT/arn.sh"
+  sed -n '/^auto_resolve_effective_symbols() {/,/^}/p' "$MOTOR" >> "$ROOT/arn.sh"
+  if [ -s "$ROOT/arn.sh" ]; then
+    cat > "$ROOT/arn_probe.sh" <<'ARNPROBE'
+set -u
+declare -A EFF_SETVAL=() EFF_SETSTR=() APPLIED_RENAMES=() AUTO_RENAMES=()
+declare -a EFF_ENABLE=() EFF_DISABLE=() EFF_CRITICAL=()
+build_kconfig_symbol_index() { :; }
+kconfig_symbol_known() { [ "$1" = VIEJO ] && return 1 || return 0; }
+kconfig_auto_candidate() { [ "$1" = VIEJO ] && printf 'NUEVO'; }
+EFF_ENABLE=(NO_HZ_IDLE VIEJO); EFF_DISABLE=(); EFF_CRITICAL=()
+EFF_SETVAL=( [HZ]=1000 [VIEJO]=y [KVM_MAX_NR_VCPUS]=1024 )
+EFF_SETSTR=( [DRM_PANIC_SCREEN]=user [DRM_I915_FORCE_PROBE]= )
+SRC=/tmp
+# shellcheck disable=SC1090
+source "$1"
+auto_resolve_effective_symbols
+for k in "${!EFF_SETVAL[@]}"; do printf 'SV %s=%s\n' "$k" "${EFF_SETVAL[$k]}"; done
+for k in "${!EFF_SETSTR[@]}"; do printf 'SS %s=%s\n' "$k" "${EFF_SETSTR[$k]}"; done
+ARNPROBE
+    p2="$(bash "$ROOT/arn_probe.sh" "$ROOT/arn.sh" 2>&1)"
+    if printf '%s\n' "$p2" | grep -q '\$>' &&
+       printf '%s\n' "$p2" | grep -q 'SV HZ=HZ=\$>1000'; then
+      rec fail "kconfig: el renombrado corrompe las claves SETVAL ('$p2')"
+    else
+      rec ok "kconfig: el renombrado automático conserva intactas las claves y valores SETVAL/SETSTR"
+    fi
+    if [ "$(printf '%s\n' "$p2" | grep -c '^SV ')" = "3" ] &&
+       printf '%s\n' "$p2" | grep -q '^SV NUEVO=y$' &&
+       printf '%s\n' "$p2" | grep -q '^SS DRM_PANIC_SCREEN=user$'; then
+      rec ok "kconfig: el renombrado también se propaga a SETVAL y conserva los valores"
+    else
+      rec fail "kconfig: el renombrado perdió o duplicó entradas de SETVAL ('$p2')"
+    fi
+  else
+    rec fail "kconfig: no se pudo extraer auto_resolve_effective_symbols"
   fi
 
   # ── sudo: fallar pronto y con explicación, no con una línea de código ──
