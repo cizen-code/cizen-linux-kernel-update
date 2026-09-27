@@ -8014,37 +8014,43 @@ build_cizen_uki() {
         # UKI; si no existe el archivo, la UKI queda sin initrd (kernel
         # autosuficiente). Mismo comportamiento que cizen-uki-sync/build_uki.
         local initrd="/boot/initramfs-${CIZEN_PKGBASE}.img"
+        local have_initrd=0
         if [ -s "$initrd" ]; then
             args+=(--initrd="$initrd")
             ok "Incluyendo initramfs: $initrd"
+            have_initrd=1
         fi
-        # Microcódigo Intel temprano (early microcode CPIO) embebido en la UKI.
-        # Sin esto ukify no incluye la actualización y el kernel arranca con la
-        # revisión de la BIOS, dejando expuestas vulnerabilidades especulativas.
-        local ucode_tmp="" ucode_dir="" cpuid_hex="" ucode_bin="" ucode_rev=""
-        cpuid_hex="$(awk -F': ' '\
-            /vendor_id/   { vend=$2 }\
-            /cpu family/  { fam=sprintf("%02x",$2+0) }\
-            /^model[[:space:]]*:/ { mod=sprintf("%02x",$2+0) }\
-            /stepping/    { step=sprintf("%02x",$2+0) }\
-            END { if (vend~/Intel/) printf "%s-%s-%s",fam,mod,step }\
-        ' /proc/cpuinfo)"
-        ucode_bin="/usr/lib/firmware/intel-ucode/${cpuid_hex}"
-        if [ -f "$ucode_bin" ]; then
-            ucode_dir="$(mktemp -d /tmp/cizen-ucode-dir.XXXXXX)" && \
-            ucode_tmp="$(mktemp /tmp/cizen-ucode.XXXXXX)" && {
-                mkdir -p "$ucode_dir/kernel/x86/microcode"
-                cp "$ucode_bin" "$ucode_dir/kernel/x86/microcode/GenuineIntel.bin"
-                (cd "$ucode_dir" && find . -mindepth 1 | sort | \
-                  cpio -o -H newc --reproducible 2>/dev/null) > "$ucode_tmp"
-                rm -rf "$ucode_dir"
-                args+=(--microcode="$ucode_tmp")
-                ucode_rev="$(od -An -tx4 -j4 -N4 "$ucode_bin" | tr -d ' \n')"
-                ok "Microcodigo Intel: CPUID=${cpuid_hex} rev=0x${ucode_rev}"
-            } || {
-                warn "No pude generar CPIO de microcodigo; continuando sin el."
-                rm -rf "$ucode_dir" 2>/dev/null; ucode_tmp=""
-            }
+        # Microcódigo Intel temprano: solo se inyecta vía --microcode si NO hay
+        # initrd (kernel standalone). Con initrd, el hook 'microcode' de
+        # mkinitcpio (intel-ucode) ya lo incluye en el CPIO del initramfs.
+        if [ "$have_initrd" -eq 0 ]; then
+            local ucode_tmp="" ucode_dir="" cpuid_hex="" ucode_bin="" ucode_rev=""
+            cpuid_hex="$(awk -F': ' '\
+                /vendor_id/   { vend=$2 }\
+                /cpu family/  { fam=sprintf("%02x",$2+0) }\
+                /^model[[:space:]]*:/ { mod=sprintf("%02x",$2+0) }\
+                /stepping/    { step=sprintf("%02x",$2+0) }\
+                END { if (vend~/Intel/) printf "%s-%s-%s",fam,mod,step }\
+            ' /proc/cpuinfo)"
+            ucode_bin="/usr/lib/firmware/intel-ucode/${cpuid_hex}"
+            if [ -f "$ucode_bin" ]; then
+                ucode_dir="$(mktemp -d /tmp/cizen-ucode-dir.XXXXXX)" && \
+                ucode_tmp="$(mktemp /tmp/cizen-ucode.XXXXXX)" && {
+                    mkdir -p "$ucode_dir/kernel/x86/microcode"
+                    cp "$ucode_bin" "$ucode_dir/kernel/x86/microcode/GenuineIntel.bin"
+                    (cd "$ucode_dir" && find . -mindepth 1 | sort | \
+                      cpio -o -H newc --reproducible 2>/dev/null) > "$ucode_tmp"
+                    rm -rf "$ucode_dir"
+                    args+=(--microcode="$ucode_tmp")
+                    ucode_rev="$(od -An -tx4 -j4 -N4 "$ucode_bin" | tr -d ' \n')"
+                    ok "Microcodigo Intel (standalone): CPUID=${cpuid_hex} rev=0x${ucode_rev}"
+                } || {
+                    warn "No pude generar CPIO de microcodigo; continuando sin el."
+                    rm -rf "$ucode_dir" 2>/dev/null; ucode_tmp=""
+                }
+            fi
+        else
+            ok "Microcodigo Intel: ya va en el initramfs (hook microcode de mkinitcpio)"
         fi
         if "${args[@]}"; then
             rm -f "$osrel_file"
