@@ -68,27 +68,38 @@ Ahora el motor copia a `$ROLLBACK_DIR` el **paquete que acaba de instalar** (y
 solo ese: "actual + previo"), junto a un manifiesto `rollback.info` con
 pkgbase, pkgver, release y scheduler:
 
-Todas las opciones que compilan (1, 2, 3, 4, 5, 7, 8, 14, 15, 16) preguntan la
-**variante** y después el **compilador**, antes de arrancar (desde v27.31.28; antes
-el compilador se preguntaba al principio pero la variante al final, después de
-descargar y validar):
+Todas las opciones que compilan (1, 2, 3, 4, 5, 7, 8, 14, 15, 16) **dejan de preguntar**
+> variante y compilador en el menú (desde v27.31.37). Ahora el motor expone
+> `ask_build_prefs()` y se invoca **una sola vez** dentro del `then` de
+> `confirm_build_after_check` —es decir, **tras validar la config, firmas y
+> que el usuario responda "SÍ" a "¿Desea continuar con la compilación?"**.
+> Orden fijo: **variante → compilador**. La opción 14 (custom scheduler) mantiene
+> su prompt propio (incluye `inherit`) y pasa `--no-ask-variant` al motor.
+> Flags respetados: `NO_ASK_VARIANT`, `NO_ASK_CC`, `CC_EXPLICIT`.
+> Antes (≤ v27.31.36) el menú preguntaba antes de validar/descargar.
 
-```
-  Variante (Enter usa el default):
-    1  Vanilla (EEVDF)      4  BMQ (prjc)
-    2  BORE                 5  LFBMQ (prjc)
-    3  PDS (prjc)           6  MuQSS
-  Variante [Enter=1]:
-
-  CC (Enter usa el default):
-    auto  elige según el sistema (clang si LTO/toolchain LLVM viable; si no gcc) (default)
-    gcc   compilador GCC
-    clang Clang/LLVM (necesario para el LTO)
-    otro  teclea TU compilador (p. ej. gcc-14, clang-17 o una ruta). Se exigirá como dependencia si falta.
-  CC [Enter=auto]:
-```
-
-### Símbolos Kconfig que cambian de nombre
+> La interacción de variante/compilador vive en el motor (`ask_build_prefs`),
+> no en el menú. El prompt que se ve al confirmar build/check es:
+>
+> ```
+>   Variante (Enter usa el default):
+>     1  Vanilla (EEVDF)
+>     2  BORE
+>     3  PDS (prjc)
+>     4  BMQ (prjc)
+>     5  LFBMQ (prjc)
+>     6  MuQSS
+>   Variante [Enter=1]:
+>
+>   CC (Enter usa el default):
+>     auto  elige según el sistema (clang si LTO/toolchain LLVM viable; si no gcc) (default)
+>     gcc   compilador GCC
+>     clang Clang/LLVM (necesario para el LTO)
+>     otro  teclea TU compilador (p. ej. gcc-14, clang-17 o una ruta). Se exigirá como dependencia si falta.
+>   CC [Enter=auto]:
+> ```
+>
+> ### Símbolos Kconfig que cambian de nombre
 
 Un perfil pide símbolos por nombre, y el kernel los va renombrando. Desde
 v27.31.28 el motor no se limita a avisar: si un símbolo que pide el perfil no
@@ -314,6 +325,24 @@ el verificador informaría "SB desconocido" en un equipo con el SB
 perfectamente activo. La batería ejecuta `secureboot_check` contra un `bootctl`
 de prueba con la salida real (`enabled (user)` / `disabled` / vacío) para que no
 vuelva a colarse.
+
+### Construcción de la UKI y microcódigo (v27.31.38)
+
+Tanto `build_uki()` en `kernel-update.sh` como `cizen-uki-sync` construyen la UKI
+con `ukify build`. El comportamiento es:
+
+- **Si existe initramfs** (`/boot/initramfs-${PKGBASE}.img`): se integra con
+  `--initrd`. El hook `microcode` de `mkinitcpio` (requiere paquete
+  `intel-ucode`) ya embebe el microcódigo Intel en el CPIO del initramfs, así
+  que **no se inyecta `--microcode`** (evita duplicado). El script loguea:
+  "Microcodigo Intel: ya va en el initramfs (hook microcode de mkinitcpio)".
+
+- **Si NO hay initramfs** (kernel standalone): se genera un CPIO mínimo con el
+  blob específico para el CPUID de la CPU y se inyecta con `--microcode`. Log:
+  "Microcodigo Intel (standalone): CPUID=... rev=0x...".
+
+Esto evita que la UKI lleve dos copias del microcódigo cuando se usa el flujo
+estándar de Arch (mkinitcpio + intel-ucode + hook microcode).
 
 ### Anclaje SHA256 de los parches
 
