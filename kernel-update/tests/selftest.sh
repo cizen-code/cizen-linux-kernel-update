@@ -3071,6 +3071,65 @@ else
   printf '  (sin %s: se omiten los tests de la UKI)\n' "$UKISYNC"
 fi
 
+# --- v27.31.41: build_uki con initramfs no puede reventar con "unbound variable"
+# El camino NORMAL de la UKI (CON initramfs) moría con
+#   "cizen-uki-sync: line 744: ucode_tmp: unbound variable"
+# justo después de que ukify escribiera el UKI en /tmp: el script se llevaba por
+# delante el firma, la copia al ESP y la limpieza. Causa: `ucode_tmp` se
+# declaraba con `local` DENTRO de la rama `if have_initrd -eq 0` (el microcode
+# standalone), pero la limpieza `[ -n "$ucode_tmp" ] && rm -f ...` está FUERA, y
+# con `set -u` usarla sin declarar es error fatal. O sea que solo moría en el
+# camino que se usa siempre.
+#
+# El test de arriba no podía verlo: su stub hace `cizen_initramfs_prepare(){ return 1; }`,
+# o sea que ejercita justo la rama donde la variable SÍ se declara. Este la
+# invierte: prepare devuelve initramfs y se comprueba que build_uki llega al
+# ukify con --initrd, sin --microcode (el microcode ya va en el initramfs) y sin
+# morir. Es además el primer test que fija el comportamiento de v27.31.38 en el
+# camino que realmente corre.
+if [ -r "$UKISYNC" ] && [ -s "$ROOT/ukibuild/build_uki.sh" ]; then
+  printf 'initramfs-de-prueba\n' > "$ROOT/ukibuild/initrd.img"
+  cat > "$ROOT/ukibuild/probe-initrd.sh" <<'PROBEINITRD'
+# LC_ALL=C como en los scripts reales: el mensaje de variable sin asignar sale
+# en el idioma del entorno, y una aserción atada a "unbound variable" no
+# detectaría nada en una sesión en español.
+set -u
+export LC_ALL=C
+CIZEN_UKI_SUFFIX="-cizen-v3"
+CIZEN_UKI_PKGBASE="linux-cizen-test"
+CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK=0
+export UKIFY_ARGS="$ROOT/ukibuild/args-initrd"
+PATH="$ROOT/ukifake:$PATH"
+ok() { :; }
+warn() { :; }
+info() { :; }
+err() { :; }
+cizen_initramfs_prepare() { INITRAMFS_PATH="$ROOT/ukibuild/initrd.img"; return 0; }
+# shellcheck disable=SC1090
+source "$ROOT/ukibuild/build_uki.sh"
+build_uki "$ROOT/ukibuild/usr/lib/modules/$UKIREL/vmlinuz" \
+          "$ROOT/ukibuild/cmdline" "$ROOT/ukibuild/out-initrd.efi"
+echo "RC=$?"
+PROBEINITRD
+  out_initrd="$(bash "$ROOT/ukibuild/probe-initrd.sh" 2>&1)"
+  # Se aceptan las dos grafías del mensaje por si el locale se colara.
+  if printf '%s' "$out_initrd" | grep -qE 'ucode_tmp: (unbound variable|variable sin asignar)'; then
+    rec fail "uki: build_uki con initramfs muere por una variable sin declarar: $(printf '%s' "$out_initrd" | grep -E 'ucode_tmp: ' | head -1)"
+  else
+    rec ok "uki: build_uki con initramfs no muere por variables sin declarar (el camino normal)"
+  fi
+  if grep -qx -- "--initrd=$ROOT/ukibuild/initrd.img" "$ROOT/ukibuild/args-initrd" 2>/dev/null; then
+    rec ok "uki: con initramfs, ukify recibe el initrd que validó prepare"
+  else
+    rec fail "uki: con initramfs, ukify NO recibe el initrd (args: $(tr '\n' ' ' < "$ROOT/ukibuild/args-initrd" 2>/dev/null))"
+  fi
+  if grep -q -- '--microcode' "$ROOT/ukibuild/args-initrd" 2>/dev/null; then
+    rec fail "uki: con initramfs se inyecta --microcode además (el microcode ya va en el initramfs)"
+  else
+    rec ok "uki: con initramfs NO se inyecta --microcode (el microcode ya va dentro, sin duplicar)"
+  fi
+fi
+
 # --- v27.31.32: el nombre +N del boot counting rompía cada 'pacman -Syu' ---
 # El UKI se escribía como arch-linux-cizen-v3+3.efi, se firmaba con
 # 'sbctl sign --save' (que registra ESE nombre en /var/lib/sbctl/files.json) y

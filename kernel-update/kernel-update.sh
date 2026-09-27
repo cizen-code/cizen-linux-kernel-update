@@ -136,7 +136,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.40"
+SCRIPT_VERSION="27.31.41"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -8460,6 +8460,11 @@ build_cizen_uki() {
         # puerta por la que pasa todo initrd que acabe en una UKI de este
         # motor. Antes se embebía el fichero que hubiera en /boot sin mirarlo.
         local initrd="" have_initrd=0
+        # v27.31.41: declaradas aquí, no dentro de la rama que las rellena. La
+        # limpieza de ucode_tmp va fuera del if, y con `set -u` declararla solo
+        # dentro de la rama del microcode revienta con "unbound variable" en el
+        # camino normal (CON initramfs), que es el que se usa siempre.
+        local ucode_tmp="" ucode_dir="" cpuid_hex="" ucode_bin="" ucode_rev=""
         if cizen_initramfs_prepare; then
             initrd="$CIZEN_INITRAMFS_PATH"
             have_initrd=1
@@ -8479,7 +8484,6 @@ build_cizen_uki() {
         # initrd (kernel standalone). Con initrd, el hook 'microcode' de
         # mkinitcpio (intel-ucode) ya lo incluye en el CPIO del initramfs.
         if [ "$have_initrd" -eq 0 ]; then
-            local ucode_tmp="" ucode_dir="" cpuid_hex="" ucode_bin="" ucode_rev=""
             cpuid_hex="$(awk -F': ' '\
                 /vendor_id/   { vend=$2 }\
                 /cpu family/  { fam=sprintf("%02x",$2+0) }\

@@ -1,3 +1,53 @@
+## [27.31.41] - 2026-09-27
+
+`build_uki` con initramfs moría con `ucode_tmp: unbound variable` — el camino normal, el que se usa siempre.
+
+Fix de 27.31.40, encontrado al desplegarlo: en el primer `sudo cizen-uki-sync
+--sign` de este release, el script llegó a `ukify build`, escribió el UKI
+unsigned en `/tmp`, y se llevó por delante **la firma, la copia al ESP y la
+limpieza**:
+
+```
+Wrote unsigned /tmp/cizen-uki.8qwIGN
+/usr/local/bin/cizen-uki-sync: line 744: ucode_tmp: unbound variable
+```
+
+`ucode_tmp` se declaraba con `local` **dentro** de la rama
+`if [ "$have_initrd" -eq 0 ]` (el microcode standalone, de 27.31.38), pero la
+limpieza `[ -n "$ucode_tmp" ] && rm -f ...` está **fuera** de ese `if`, porque
+tiene que correr con y sin initramfs. Con `set -u`, usarla sin declarar es
+error fatal. O sea que solo moría en la rama donde la variable **no** se
+declara: la normal.
+
+Ni `bash -n` ni shellcheck lo ven (es perfectly valid code), y el selftest
+tampoco, porque su test de la UKI hace
+`cizen_initramfs_prepare(){ INITRAMFS_PATH=""; return 1; }`: ejercita justo la
+rama donde `ucode_tmp` sí se declara. El defecto era invisible **por la
+misma razón** que el bug original de §33 — la prueba estaba construida sobre
+la suposición equivocada, no sobre el camino real.
+
+- Las cinco variables (`ucode_tmp`, `ucode_dir`, `cpuid_hex`, `ucode_bin`,
+  `ucode_rev`) se declaran junto al resto de `local` de la función, **antes**
+  del `if`, en el motor y en `cizen-uki-sync`.
+- Tres tests nuevos, y el primero invierte el stub del test viejo: ahora
+  `cizen_initramfs_prepare` **devuelve initramfs**, que es el camino que se
+  ejecuta siempre. Comprueba que `build_uki` no muere, que `ukify` recibe
+  `--initrd=` con el fichero validado, y que **no** se inyecta `--microcode`
+  (el microcode ya va dentro del initramfs) — lo segundo fija en el camino real
+  el comportamiento de 27.31.38, que hasta ahora solo se comprobaba en el
+  standalone.
+- Trampa al escribir ese test: la aserción buscaba `unbound variable`, y el
+  mensaje de bash sale en el idioma del entorno (`variable sin asignar` en una
+  sesión en español). Con el `grep` atado al inglés, **el test pasaba con el bug
+  presente**. La sonda exporta ahora `LC_ALL=C` como los scripts reales, y el
+  `grep` acepta las dos grafías.
+
+Selftest: 384 -> 387. Los tres en rojo contra 27.31.40 (comprobado revirtiendo
+el arreglo en una copia: `FAIL … line 120: ucode_tmp: unbound variable`).
+
+Lo bueno: la UKI del ESP **no se tocó**. El fallo fue después de `ukify` y
+antes de firmar, así que la UKI sana de §33 siguió en su sitio.
+
 ## [27.31.40] - 2026-09-27
 
 Una sola fuente de la verdad para initramfs y UKI, y el bug que de verdad tumbaba el arranque.

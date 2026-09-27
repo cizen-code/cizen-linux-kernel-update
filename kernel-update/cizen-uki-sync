@@ -630,6 +630,12 @@ cizen_uki_verify_image() {
 build_uki() {
   local kernel="$1" cmdline_file="$2" out="$3"
   local cmdline_text ukify_bin stub s initrd used_initrd="" osrel_file="" rel=""
+  # v27.31.41: estas se declaran AQUÍ y no dentro del bloque que las usa. La
+  # limpieza de ucode_tmp va FUERA del if (se ejecuta con y sin initrd), así que
+  # con `set -u` declararlas solo dentro de la rama del microcode hacia reventar
+  # con "ucode_tmp: unbound variable" en el camino NORMAL (con initramfs), que es
+  # justo el que no probaba el test de la UKI: el suyo forzaba prepare a fallar.
+  local ucode_tmp="" ucode_dir="" cpuid_hex="" ucode_bin="" ucode_rev=""
 
   cmdline_text="$(<"$cmdline_file")"
 
@@ -710,9 +716,8 @@ build_uki() {
       # Sin esto ukify no incluye la actualización de microcódigo y el kernel
       # arranca con la revisión de la BIOS (más antigua), dejando expuestas
       # vulnerabilidades de ejecución especulativa (Downfall/GDS, MDS, etc.).
-      # Se genera un CPIO mínimo con el blob específico para el CPUID de la CPU.
-      local ucode_tmp="" ucode_dir="" cpuid_hex="" ucode_bin="" ucode_rev=""
-      cpuid_hex="$(awk -F': ' '\
+    # Se genera un CPIO mínimo con el blob específico para el CPUID de la CPU.
+    cpuid_hex="$(awk -F': ' '\
         /vendor_id/   { vend=$2 }\
         /cpu family/  { fam=sprintf("%02x",$2+0) }\
         /^model[[:space:]]*:/ { mod=sprintf("%02x",$2+0) }\
