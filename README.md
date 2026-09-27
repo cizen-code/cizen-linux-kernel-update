@@ -290,6 +290,71 @@ actualización de paquetes: el error es del hook de firma).
 El guard de `kernel-update-verify.sh` (check GUARD) avisa en el login siguiente si
 el kernel arrancado no es el último Cizen instalado.
 
+### Initramfs y UKI: quién construye qué (v27.31.40)
+
+El reparto es explícito, porque antes no lo era y por eso la UKI que arrancaba
+no era la que crees:
+
+| Qué | Quién lo construye |
+|---|---|
+| `/boot/initramfs-linux-cizen-v3.img` | el **preset de mkinitcpio** (hook `90-mkinitcpio-install` de pacman, y `mkinitcpio -p linux-cizen-v3`) |
+| `/boot/EFI/Linux/arch-linux-cizen-v3.efi` (la UKI) | **este proyecto** |
+
+`cizen_uki_claim_preset()` deja el preset en modo solo-initramfs: comenta su
+`default_uki=` con un marcador `#CIZEN-UKI-OWNED` y asegura un `default_image=`
+para que el preset siga produciendo algo. El original queda en
+`<preset>.cizen-orig`. Antes, el hook de pacman reconstruía la UKI por su cuenta
+con el `os-release` del sistema y con el initramfs que encontrara, y como este
+proyecto **nunca** llamaba a `mkinitcpio`, ese fichero era el único initramfs que
+existía y se embebía sin comprobar nada. Con `CIZEN_UKI_ALLOW_MKINITCPIO_UKI=1`
+se revierte a que el preset también pueda escribir la UKI.
+
+Antes de embeber el initramfs, `cizen_initramfs_prepare()` lo **regenera**
+(`mkinitcpio -p <pkgbase>`, salvo `CIZEN_INITRAMFS_REBUILD=0`) y lo **valida**
+recorriendo la imagen **como lo hace el kernel** (`unpack_to_rootfs()` en
+`init/initramfs.c`: segmentos cpio sin comprimir, relleno NUL, y un segmento
+comprimido). Lo que decide es si el kernel encuentra `/init` en algún segmento.
+Así cae sin falsos positivos:
+
+- **cpio concatenado** (un CPIO temprano con los `.ko.zst`, el firmware y el
+  microcode, y detrás el cpio comprimido): es lo que produce `mkinitcpio` con
+  compresión, porque no quiere comprimir dos veces lo ya comprimido, y es
+  **un initramfs válido** siempre que el segundo segmento caiga alineado a 4
+  bytes. Pasa, y tiene que pasar.
+- el mismo pero **sin alinear** a 4: el kernel se come el NUL y se para en el
+  cambio de segmento. Se rechaza.
+- **microcode Intel crudo** delante: no es un initramfs, es un blob de
+  firmware. El kernel aborta en el primer byte con
+  `Initramfs unpacking failed: invalid magic at start of compressed archive`
+  y **no desempaqueta nada**, así que el equipo arranca degradado y en
+  silencio (btrfs y el resto van built-in a propósito, ver
+  `verify_build_tree()`). Se rechaza y se dice de dónde viene.
+- imagen **truncada** o **corrupta**, o cabecera que no es ni cpio ni una
+  compresión conocida.
+
+Ojo con un diagnóstico que ya costó caro: el síntoma `invalid magic` **no**
+significa "initramfs concatenado". Venía de la sección `.ucode` de la UKI, que
+llevaba el microcode en crudo en vez de un cpio, y el arreglo que se aplicó
+(`COMPRESSION="cat"` y quitar el hook `microcode`) no arreglaba nada. Para
+detectar ese caso está la comprobación de `.ucode` de abajo, que mira la UKI
+construida y no el fichero de initramfs.
+
+Después, `cizen_uki_verify_image()` comprueba la UKI ya construida antes de
+escribirla en el ESP: como `ukify` copia el fichero tal cual, la sección `.initrd`
+tiene que medir exactamente lo que mide el initramfs validado, y la sección
+`.ucode`, si existe, tiene que **empezar por un cpio newc**. Si algo de eso no
+cuadra **no se escribe nada** y se conserva la UKI anterior. Sin initramfs no
+se aborta (el equipo arranca igual), pero se dice en voz alta que el arranque
+será degradado; para tratarlo como error, `CIZEN_INITRAMFS_REQUIRED=1`.
+
+| Variable | Default | Para qué |
+|---|---|---|
+| `CIZEN_UKI_ALLOW_MKINITCPIO_UKI` | `0` | que el preset de mkinitcpio también escriba la UKI |
+| `CIZEN_INITRAMFS_REBUILD` | `1` | `0` no regenera el initramfs antes de embeberlo |
+| `CIZEN_INITRAMFS_REQUIRED` | `0` | `1` aborta si no hay initramfs válido |
+| `CIZEN_UKI_INITRAMFS` | `/boot/initramfs-<pkgbase>.img` | ruta del initramfs |
+| `CIZEN_UKI_PRESET_DIR` | `/etc/mkinitcpio.d` | directorio de presets |
+
 ### Firma de la UKI (Secure Boot)
 
 Al confirmar la solicitud de compilación (build o recompilación), el motor
@@ -343,6 +408,18 @@ con `ukify build`. El comportamiento es:
 
 Esto evita que la UKI lleve dos copias del microcódigo cuando se usa el flujo
 estándar de Arch (mkinitcpio + intel-ucode + hook microcode).
+
+> **`/etc/kernel/uki.conf` es una trampa, no una ayuda.** Su `Microcode=` espera
+> un **CPIO**, y apuntarlo al fichero crudo de `/usr/lib/firmware/intel-ucode/`
+> (`06-9e-09` y compañía) produce una sección `.ucode` con un blob de firmware
+> delante del initramfs. systemd-boot pasa `.ucode` + `.initrd` concatenados, el
+> kernel abre el primer segmento, ve `0x01`, y aborta con `invalid magic at
+> start of compressed archive` **sin desempaquetar nada** (ver §33.2 de
+> `Agente.md`). Fue lo que dejó este equipo arrancando degradado y en silencio,
+> en los dos kernels. **Con initramfs, deja esa línea comentada**: el microcode
+> lo pone el hook `microcode` dentro del CPIO temprano. Y si algún día hace
+> falta un `.ucode` en la UKI, tiene que ser un cpio, jamás el blob suelto:
+> `cizen_uki_verify_image()` lo comprueba y no escribe la UKI si no lo es.
 
 ### Anclaje SHA256 de los parches
 

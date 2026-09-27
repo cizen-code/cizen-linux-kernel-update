@@ -257,9 +257,9 @@ opt 5 "force"       "recompilar con (--force)"
 opt 7 "buildbore"   "compilar con BORE · baja"
 opt 8 "buildborefast" "compilar con BORE · alta"
 if [ "$FORK_MISSING" = 1 ]; then
-  opt 14 "variant"    "scheduler/tuning (interactivo) ⚠"
+  opt 14 "variant"    "compilar con scheduler interactivo ⚠"
 else
-  opt 14 "variant"    "scheduler/tuning (interactivo)"
+  opt 14 "variant"    "compilar con scheduler interactivo"
 fi
 opt 15 "ntsync"     "compilar con NTSync"
 opt 16 "cachy"      "compilar con misc CachyOS"
@@ -302,37 +302,15 @@ while true; do
     12) exec "$SCRIPT" --changelog ;;
     13) exec "$SCRIPT" --hardened ;;
     14)
-       if [ "$FORK_MISSING" = 1 ]; then
+        if [ "$FORK_MISSING" = 1 ]; then
          printf '\n  %bAviso:%b la stable %s no está en el fork CachyOS' "$Y2" "$N" "$REMOTE"
          [ -n "$FORK_FALLBACK" ] && printf ' (su última %s es %s)' "$FORK_MINOR" "$FORK_FALLBACK"
          printf '.\n'
        fi
-       printf '\n  %bScheduler%b (Enter usa el default; los valores de tercera parte avisan si no aplican a la rama):\n' "$W" "$N"
-       printf '    %binherit%b mantener el del perfil/último build (default → EEVDF salvo perfil)\n' "$W" "$N"
-       printf '    %beevdf%b   scheduler vanilla de mainline\n' "$W" "$N"
-       printf '    %bbore%b    BORE (el que usa este sistema; burst + interactividad)\n' "$W" "$N"
-       printf '    %bpds%b     Project C (PDS) · tercero\n' "$W" "$N"
-       printf '    %bbmq%b     BMQ · tercero\n' "$W" "$N"
-       printf '    %blfbmq%b   LF-BMQ · tercero\n' "$W" "$N"
-       printf '    %bmuqss%b   MuQSS · tercero\n' "$W" "$N"
-        printf '  %bScheduler%b [Enter=%blinherit%b]: ' "$W" "$N" "$Y" "$N"
-        read -r sched
-        # v27.31.16: si el scheduler elegido solo existe en el fork y la versión
-        # no está publicada allí, se ofrece la última del fork de esa línea en
-        # lugar de dejar que el build aborte. Sin TTY (o sin fallback) se sigue
-        # con la versión pedida: el motor explica la causa con claridad.
-         fork_fallback_for "$sched"
-         use_version="$FORK_CHOICE"
-         [ -n "$use_version" ] \
-           && printf '  %bOK: %s + %s.%b\n' "$W" "$use_version" "$sched" "$N"
-         args="--absorb-rebels"
-         [ -n "$use_version" ] && args="$use_version $args"
-         [ -n "$sched" ] && args="$args --sched $sched"
-        # v27.31.37: la 14 ya preguntó el scheduler (su prompt propio, con
-        # «inherit»), así que el motor no vuelve a preguntar la variante; el
-        # COMPILADOR sí lo pregunta él, después de validar la configuración y
-        # solo si la respuesta a «¿Desea continuar?» es SÍ.
-        args="$args --no-ask-variant"
+       # v27.31.37+: la opción 14 solo lanza el motor; el scheduler y el compilador
+       # se preguntan en el motor (ask_build_prefs) tras confirmar "¿Desea continuar?".
+       # No se pasa --no-ask-variant: si el usuario no elige nada, el motor pregunta.
+       args="--absorb-rebels"
        # shellcheck disable=SC2086
        exec "$SCRIPT" $args ;;
     15) build_and_exec baja ask --absorb-rebels --ntsync ;;

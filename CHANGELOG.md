@@ -1,3 +1,88 @@
+## [27.31.40] - 2026-09-27
+
+Una sola fuente de la verdad para initramfs y UKI, y el bug que de verdad tumbaba el arranque.
+
+Existían **dos productores de la misma UKI**: este flujo (`ukify build`) y el
+preset de mkinitcpio (`default_uki=`), que dispara el hook `90-mkinitcpio-install`
+al instalar el kernel y con `mkinitcpio -P`. Gana el último que corra, y como
+este motor nunca llama a mkinitcpio, aquel era además el único que generaba el
+initramfs: la UKI se construía **embebiendo a ciegas** el fichero que hubiera en
+`/boot`. Si no había ninguno, la UKI salía sin initrd sin decir nada; si había
+uno corrupto o de otra versión, se embebía igual.
+
+- `cizen_uki_claim_preset()` deja el preset en su sitio: se le comenta el
+  `*_uki=` con un marcador `#CIZEN-UKI-OWNED` y se le reactiva el `*_image=`, de
+  modo que mkinitcpio sigue haciendo su parte y la UKI es de este flujo y de
+  nadie más. Original a mano en `<preset>.cizen-orig`;
+  `CIZEN_UKI_ALLOW_MKINITCPIO_UKI=1` lo deja como estaba.
+- `cizen_initramfs_prepare()` regenera el initramfs y lo **valida** antes de
+  embeberlo. `build_uki()` es la única puerta por la que pasa todo initrd que
+  acabe en una UKI, así que la comprobación va ahí y no antes.
+- `cizen_uki_verify_image()` revisa la UKI ya construida: la sección `.initrd`
+  tiene que medir exactamente lo que mide el initramfs validado (`ukify` la
+  copia tal cual), y **la sección `.ucode`, si existe, tiene que empezar por un
+  cpio newc**. Sin initramfs no se aborta —el equipo arranca igual porque btrfs y
+  el resto van built-in— pero se dice en voz alta que el arranque va degradado;
+  `CIZEN_INITRAMFS_REQUIRED=1` lo convierte en error.
+
+La validación del initramfs recorre la imagen **como lo hace el kernel**
+(`unpack_to_rootfs()`): segmentos cpio sin comprimir, relleno NUL, un segmento
+comprimido, y el requisito de alineación a 4 bytes para el salto de segmento.
+Importa porque el veto anterior era **un diagnóstico equivocado**: exigía que
+el *primer* cpio trajera `init`, rechazaba el cpio concatenado que `mkinitcpio`
+produce con `zstd` (CPIO temprano con los `.ko.zst` y el microcode + cpio
+comprimido detrás) y recetaba `COMPRESSION="cat"` como arreglo — que además no
+arreglaba nada, porque con `cat` el CPIO temprano sigue ahí, sin comprimir. Como
+el concatenado es el diseño normal de mkinitcpio y el kernel lo recorre sin
+problema, ese "arreglo" solo quitaba el microcode del initramfs y desactivaba la
+compresión, y luego se daba por bueno con el mismo validador equivocado.
+
+Lo que sí tumbaba el arranque era la sección `.ucode`: llevaba el microcode
+Intel **en crudo** (el fichero `/usr/lib/firmware/intel-ucode/06-9e-09` tal
+cual) en vez de un cpio. systemd-boot le pasa al kernel `.ucode` + `.initrd`
+concatenados, el primer byte del microcode no es ni NUL ni `'0'` ni una magic de
+compresión, y el kernel aborta en el primer segmento con `Initramfs unpacking
+failed: invalid magic at start of compressed archive` **sin desempaquetar
+nada**: ni `/init`, ni udev, ni el microcode que sí venía dentro del `.initrd`.
+Como btrfs va built-in, el equipo arrancaba igual y solo se notaba en una línea
+del log. Pasó en los **dos** kernels, y ninguna comprobación sobre el fichero de
+initramfs podía verlo, porque el `.ucode` es otra sección. De ahí el guard de
+`.ucode` en `cizen_uki_verify_image()`: es el que faltaba.
+
+`CIZEN_INITRAMFS_ALLOW_CONCAT` desaparece: con la validación correcta el
+concatenado se acepta, así que el opt-in ya no significa nada.
+
+Lo que también entra aquí y venía sin registrar (el `CHANGELOG` se había
+quedado en `[27.31.36]`, así que esto cubre el trabajo de 37, 38 y 39):
+
+- **Confirmación previa en todos los builds**: `confirm_build_after_check()` se
+  invoca también en la rama de build directo, no solo en `--check`. Antes, un
+  build sin `--check` preguntaba variante y compilador y se ponía a compilar sin
+  haber confirmado nada con el usuario; con la pregunta previa, cancela limpio y
+  sin estrenar la promoción de la config.
+- **Opción 14 del menú sin UI propia**: ya no tiene su prompt de scheduler (ni
+  el `inherit` que se añadió en 37.31.16) ni pasa `--no-ask-variant`; solo lanza
+  el motor con `--absorb-rebels` y deja que pregunte `ask_build_prefs` tras la
+  confirmación. El fallback de versión del fork lo lleva `fork_release_guard` en
+  el motor. Un solo sitio donde preguntar, y el motor es el que sabe qué versión
+  del fork hay.
+- **Scheduler y compilador al motor** (37.31.37): `build_and_exec()` ya no
+  pregunta nada; el motor expone `ask_build_prefs()`, una sola vez, en orden
+  fijo variante → compilador, respetando `NO_ASK_VARIANT`, `NO_ASK_CC` y
+  `CC_EXPLICIT`. La razón de fondo es que el menú preguntaba **antes** de
+  validar la config y descargar fuentes: si el usuario cancelaba, se perdían
+  nueve minutos de descarga.
+- **`--microcode` solo en UKI standalone** (37.31.38): con initramfs, el hook
+  `microcode` de mkinitcpio ya lleva el microcode dentro del CPIO, así que
+  inyectarlo otra vez por `--microcode` era duplicarlo. Sin initramfs se genera
+  un CPIO mínimo con el blob del CPUID de la CPU (un cpio, no el blob suelto).
+
+Selftest: 380 -> 384. Los cuatro nuevos, todos en rojo contra 27.31.39: el
+cpio concatenado **se acepta**, el concatenado con un byte de relleno en vez de
+alineación a 4 **se rechaza**, el microcode crudo se rechaza, y una `.ucode` con
+microcode crudo **bloquea** la escritura de la UKI. Los que fijaban la premisa
+equivada (rechazar el concatenado, el opt-in) se han invertido o fuera.
+
 ## [27.31.36] - 2026-09-26
 
 Los submenús del menú a stdout: se perdían enteros si stderr no era la terminal.

@@ -1363,22 +1363,25 @@ cachyos-7.2.80-1" fork_tagrel 7.2.8)" ]; then
   else
     rec fail "menú: build_and_exec silencia o adelanta una pregunta que debe hacer el motor"
   fi
-  # La 14 es la excepción: su Scheduler SÍ es definitivo (incluye «inherit»,
-  # que el motor no ofrece), así que --no-ask-variant es correcto ahí. Lo que no
-  # puede es volver a preguntar el compilador.
-  if grep -q 'args="\$args --no-ask-variant"' "$MENU" \
-     && grep -q 'Scheduler%b \[Enter=%blinherit%b\]' "$MENU"; then
-    rec ok "menú: la 14 mantiene su prompt de Scheduler y marca la variante como ya elegida"
+  # La 14 ya NO es excepción: desde v27.31.37 el menú no pregunta nada de
+  # variante/compilador; la 14 simplemente lanza el motor (como las demás
+  # opciones de build) y el motor pregunta tras confirmar "¿Desea continuar?".
+  # El fallback del fork lo gestiona el motor (fork_release_guard).
+  if grep -q '^ *14)' "$MENU" \
+     && grep -A 15 '^ *14)' "$MENU" | grep -q 'exec "\$SCRIPT"' \
+     && ! grep -q 'args="\$args --no-ask-variant"' "$MENU" \
+     && ! grep -q 'Scheduler%b \[Enter=%blinherit%b\]' "$MENU"; then
+    rec ok "menú: la 14 lanza el motor sin preguntar (el motor gestiona variante/CC y fork fallback)"
   else
-    rec fail "menú: la 14 perdió su prompt de Scheduler o volvió a preguntar la variante"
+    rec fail "menú: la 14 no sigue el nuevo diseño (lanza motor sin UI propia)"
   fi
   # El fallback del fork (ofrecer la última release del CachyOS) lo decide el
-  # menú antes de lanzar, cuando ya sabe que la versión pedida no está allí.
-  if [ "$(grep -c 'fork_fallback_for' "$MENU")" -ge 2 ] \
-     && grep -q 'fork_fallback_for "\$sched"' "$MENU"; then
-    rec ok "menú: el fallback del fork se sigue ofreciendo al elegir scheduler de solo-fork (14)"
+  # motor en fork_release_guard, no el menú. El menú ya no llama a
+  # fork_fallback_for para la opción 14.
+  if grep -q 'fork_release_guard' "$MOTOR"; then
+    rec ok "motor: fork_release_guard gestiona el fallback del fork para schedulers solo-fork"
   else
-    rec fail "menú: el fallback del fork se ha perdido"
+    rec fail "motor: falta fork_release_guard para gestionar fallback del fork"
   fi
 
   # Funcional: build_and_exec solo compone la llamada. Sin preguntas, la fila del
@@ -1428,20 +1431,22 @@ RUNNER
   fi
 
   # ── Motor: las dos preguntas, y solo con la respuesta SÍ ──
-  # Estructura: ask_build_prefs se llama exactamente una vez dentro del then de
-  # «if confirm_build_after_check» y ninguna vez en su else (la rama «no»).
-  blk="$(awk '/^  if confirm_build_after_check; then/{f=1} f&&/^  else$/{print "---ELSE---"; f=0} f{print}' "$MOTOR")"
-  then_part="$(printf '%s\n' "$blk" | sed '/^---ELSE---$/q')"
-  else_part="$(printf '%s\n' "$blk" | sed -n '/^---ELSE---$/,$p')"
-  if [ "$(printf '%s\n' "$then_part" | grep -c '^ *ask_build_prefs$')" = 1 ]; then
-    rec ok "motor: ask_build_prefs se invoca dentro de la rama SÍ de «¿Desea continuar?»"
+  # Estructura: # Motor: las dos preguntas, y solo con la respuesta SÍ.
+  # Hay DOS bloques con confirm_build_after_check: uno en CHECK_ONLY (L9768)
+  # y otro en build directo (L9787). En AMBOS, ask_build_prefs debe estar solo
+  # en la rama then. Verificamos cada bloque por separado.
+  ok_count=0
+  for block_start in $(grep -n '^  if confirm_build_after_check; then' "$MOTOR" | cut -d: -f1); do
+    then_has=$(awk -v start="$block_start" 'NR>=start && /^  if confirm_build_after_check; then/ && ++c>1 {exit} NR>=start {print}' "$MOTOR" | awk '/^  if confirm_build_after_check; then/{f=1} f&&/^  else$/{f=0} f{print}' | grep -c 'ask_build_prefs')
+    else_has=$(awk -v start="$block_start" 'NR>=start && /^  if confirm_build_after_check; then/ && ++c>1 {exit} NR>=start {print}' "$MOTOR" | awk '/^  if confirm_build_after_check; then/{f=1} f&&/^  else$/{f=2} f==2{print}' | grep -cE 'ask_build_prefs|ask_build_variant|ask_build_cc')
+    if [ "$then_has" -ge 1 ] && [ "$else_has" -eq 0 ]; then
+      ok_count=$((ok_count+1))
+    fi
+  done
+  if [ "$ok_count" -eq 2 ]; then
+    rec ok "motor: ask_build_prefs solo en rama SÍ de ambos confirm_build_after_check"
   else
-    rec fail "motor: ask_build_prefs no está (o está repetida) en la rama SÍ"
-  fi
-  if ! printf '%s\n' "$else_part" | grep -qE 'ask_build_prefs|ask_build_variant|ask_build_cc'; then
-    rec ok "motor: con la respuesta N no se pregunta ni la variante ni el compilador"
-  else
-    rec fail "motor: se pregunta variante/compilador aunque el usuario haya dicho que no"
+    rec fail "motor: ask_build_prefs mal ubicado (ok_count=$ok_count, esperado 2)"
   fi
   # El prompt al que se responde SÍ tiene que ser el de siempre: es el ancla de
   # todo este comportamiento.
@@ -3020,7 +3025,7 @@ fi
 # construir nada, o sea: UKI vacía "con éxito").
 UKISYNC="$(dirname "$MOTOR")/cizen-uki-sync"
 if [ -r "$UKISYNC" ]; then
-  UKIREL="7.9.9-cizen-v3"
+  export UKIREL="7.9.9-cizen-v3"   # el probe de abajo lo lee (heredoc entrecomillado)
   mkdir -p "$ROOT/ukibuild/usr/lib/modules/$UKIREL" "$ROOT/ukifake"
   : > "$ROOT/ukibuild/usr/lib/modules/$UKIREL/vmlinuz"
   printf 'root=UUID=cizen-test rw\n' > "$ROOT/ukibuild/cmdline"
@@ -3030,16 +3035,22 @@ printf '%s\n' "$@" > "$UKIFY_ARGS"
 UKIFY
   chmod +x "$ROOT/ukifake/ukify"
   sed -n '/^build_uki() {/,/^}/p' "$UKISYNC" > "$ROOT/ukibuild/build_uki.sh"
-  cat > "$ROOT/ukibuild/probe.sh" <<PROBE
+  cat > "$ROOT/ukibuild/probe.sh" <<'PROBE'
 set -u
 CIZEN_UKI_SUFFIX="-cizen-v3"
 CIZEN_UKI_PKGBASE="linux-cizen-test"
 CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK=0
 export UKIFY_ARGS="$ROOT/ukibuild/args"
-PATH="$ROOT/ukifake:\$PATH"
+PATH="$ROOT/ukifake:$PATH"
 ok() { :; }
 warn() { :; }
 info() { :; }
+# v27.31.39: build_uki ya no embebe /boot/initramfs-*.img a ciegas, pide el
+# initramfs a cizen_initramfs_prepare (que lo regenera y lo valida). Aquí se
+# sustituye por un stub que dice "no hay ninguno" para no meter un /boot de
+# verdad en el test; el comportamiento del prepare+validate tiene sus propios
+# tests más abajo.
+cizen_initramfs_prepare() { INITRAMFS_PATH=""; return 1; }
 # shellcheck disable=SC1090
 source "$ROOT/ukibuild/build_uki.sh"
 build_uki "$ROOT/ukibuild/usr/lib/modules/$UKIREL/vmlinuz" \
@@ -3285,6 +3296,300 @@ FAKE
   fi
 else
   printf '  (sin %s: se omiten los tests del nombre de UKI)\n' "$UKISYNC"
+fi
+
+# --- v27.31.39: el UKI que arrancaba no era el que creíamos ---
+# El preset de mkinitcpio (default_uki=) es un SEGUNDO productor de la misma
+# UKI: lo dispara el hook 90-mkinitcpio-install al instalar el kernel y
+# `mkinitcpio -P` con cualquier actualización de /usr/lib/initcpio/*. Como este
+# proyecto nunca llama a mkinitcpio, ese hook era además el único que generaba
+# el initramfs, y la UKI se construía embebiendo a ciegas el fichero que
+# hubiera en /boot.
+#
+# El arranque degraded venía de la sección .ucode, que llevaba el microcode
+# Intel en crudo en vez de un cpio: el kernel recibe .ucode + .initrd
+# concatenados, el primer byte no es ninguna magic y aborta el desempaquetado
+# entero con "invalid magic at start of compressed archive". Como btrfs va
+# built-in el equipo arrancaba igual, sin /init, sin udev y sin microcode, y
+# solo se veía en una línea del log.
+#
+# Aquí se comprueba, contra funciones extraídas de los dos scripts:
+#   1. el preset deja de construir la UKI y se queda con el initramfs;
+#   2. el initramfs se valida antes de embeberlo, recorriendo los segmentos
+#      como el kernel: el cpio concatenado de mkinitcpio PASA (es legítimo), y
+#      se rechazan la corrupción, el truncamiento, el concatenado sin alinear y
+#      un microcode crudo por delante;
+#   3. la UKI construida se verifica: la sección .initrd tiene que medir lo
+#      que el initramfs validado, la .ucode tiene que ser un cpio, y sin
+#      initramfs se avisa del arranque degradado en vez de dejarlo pasar.
+if [ -r "$UKISYNC" ]; then
+  mkdir -p "$ROOT/initrd/raiz"
+  : > "$ROOT/initrd/raiz/init"          # el /init que el kernel busca
+  (cd "$ROOT/initrd/raiz" && find . | cpio -o -H newc --quiet) > "$ROOT/initrd/ok.img"
+  mkdir -p "$ROOT/initrd/vacio"
+  (cd "$ROOT/initrd/vacio" && find . | cpio -o -H newc --quiet) > "$ROOT/initrd/early.img"
+  # CPIO temprano + cpio comprimido, que es lo que produce mkinitcpio con zstd.
+  # El kernel solo pasa al segundo segmento si el offset cae alineado a 4, así
+  # que el relleno de NUL no es decorativo: es parte del formato.
+  early_len="$(stat -c '%s' "$ROOT/initrd/early.img")"
+  cat "$ROOT/initrd/early.img" > "$ROOT/initrd/concat.img"
+  head -c "$(( (4 - early_len % 4) % 4 ))" /dev/zero >> "$ROOT/initrd/concat.img"
+  cat "$ROOT/initrd/ok.img" >> "$ROOT/initrd/concat.img"
+  # El mismo concatenado con UN byte de relleno en vez de alinear a 4: el
+  # kernel se come el NUL, pero el segundo cpio sigue sin caer alineado y ahí
+  # se para. Es lo que separa "relleno de alineación" de "relleno de mentira".
+  cat "$ROOT/initrd/early.img" > "$ROOT/initrd/desalineado.img"
+  head -c 1 /dev/zero >> "$ROOT/initrd/desalineado.img"
+  cat "$ROOT/initrd/ok.img" >> "$ROOT/initrd/desalineado.img"
+  head -c 4096 /dev/urandom > "$ROOT/initrd/basura.img"
+  head -c 200 "$ROOT/initrd/ok.img" > "$ROOT/initrd/truncada.img"
+  # Blob de microcode Intel crudo: version=1 (LE) en 0x00 y tamano total en
+  # 0x1C. Es exactamente lo que ukify metía en la sección .ucode.
+  {
+    printf '\001\000\000\000'
+    head -c 28 /dev/zero
+    printf '\000\002\000\000'
+    head -c 564 /dev/zero
+  } > "$ROOT/initrd/microcode.img"
+
+  sed -n '/^cizen_uki_claim_preset() {/,/^}/p' \
+      "$UKISYNC" > "$ROOT/initrd/claim.sh"
+  sed -n '/^cizen_initramfs_path() {/,/^}/p;/^cizen_initramfs_walk() {/,/^}/p;/^cizen_initramfs_validate() {/,/^}/p' \
+      "$UKISYNC" >> "$ROOT/initrd/claim.sh"
+  cat > "$ROOT/initrd/probe_claim.sh" <<'PROBE'
+set -u
+SUDO=()
+CIZEN_UKI_PKGBASE="linux-cizen-test"
+CIZEN_UKI_NAME="arch-linux-cizen-test.efi"
+CIZEN_UKI_PRESET_DIR="$ROOT/initrd/preds"
+ok(){ :; }; warn(){ :; }; info(){ :; }; err(){ :; }; log(){ :; }
+# shellcheck disable=SC1090
+source "$ROOT/initrd/claim.sh"
+cizen_uki_claim_preset >/dev/null 2>&1
+PROBE
+  mkdir -p "$ROOT/initrd/preds"
+  cat > "$ROOT/initrd/preds/linux-cizen-test.preset" <<'PRESET'
+ALL_kver="/boot/vmlinuz-linux-cizen-test"
+PRESETS=('default')
+#default_config="/etc/mkinitcpio.conf"
+#default_image="/boot/initramfs-linux-cizen-test.img"
+default_uki="/boot/EFI/Linux/arch-linux-cizen-test.efi"
+PRESET
+  bash "$ROOT/initrd/probe_claim.sh"
+  claimed="$ROOT/initrd/preds/linux-cizen-test.preset"
+  if grep -q '^#CIZEN-UKI-OWNED default_uki=' "$claimed"; then
+    rec ok "initramfs: el preset de mkinitcpio deja de construir la UKI (ya no hay dos productores)"
+  else
+    rec fail "initramfs: el preset sigue construyendo la UKI en paralelo"
+  fi
+  if grep -qE '^[[:space:]]*default_image="/boot/initramfs-linux-cizen-test.img"' "$claimed"; then
+    rec ok "initramfs: el preset conserva la producción del initramfs (el hook de pacman no se queda sin hacer nada)"
+  else
+    rec fail "initramfs: el preset se quedó sin salida; mkinitcpio avisaría 'No image or UKI specified'"
+  fi
+  if [ -f "$claimed.cizen-orig" ] && grep -q '^default_uki=' "$claimed.cizen-orig"; then
+    rec ok "initramfs: el preset original se conserva en .cizen-orig (se puede revertir a mano)"
+  else
+    rec fail "initramfs: no se guardó copia del preset original"
+  fi
+  # Idempotencia: la segunda pasada no debe comentarlo dos veces ni duplicar
+  # la línea de salida.
+  bash "$ROOT/initrd/probe_claim.sh"
+  if [ "$(grep -c 'CIZEN-UKI-OWNED' "$claimed")" = 1 ] \
+     && [ "$(grep -cE '^[[:space:]]*default_image=' "$claimed")" = 1 ]; then
+    rec ok "initramfs: reclamar el preset es idempotente (no se acumula ni en la 2ª pasada ni en la 3ª)"
+  else
+    rec fail "initramfs: reclamar el preset no es idempotente"
+  fi
+  # Con el override no se toca nada: preset nuevo, con la UKI activa, y el
+  # override puesto tiene que dejarlo byte a byte como estaba.
+  mkdir -p "$ROOT/initrd/preds2"
+  cp "$ROOT/initrd/preds/linux-cizen-test.preset.cizen-orig" \
+     "$ROOT/initrd/preds2/linux-cizen-test.preset"
+  sed -n '/^cizen_uki_claim_preset() {/,/^}/p' "$UKISYNC" > "$ROOT/initrd/claim_one.sh"
+  cat > "$ROOT/initrd/probe_allow.sh" <<'PROBE2'
+set -u
+SUDO=()
+CIZEN_UKI_PKGBASE="linux-cizen-test"
+CIZEN_UKI_NAME="arch-linux-cizen-test.efi"
+CIZEN_UKI_PRESET_DIR="$ROOT/initrd/preds2"
+CIZEN_UKI_ALLOW_MKINITCPIO_UKI=1
+ok(){ :; }; warn(){ :; }; info(){ :; }; err(){ :; }; log(){ :; }
+# shellcheck disable=SC1090
+source "$ROOT/initrd/claim_one.sh"
+cizen_uki_claim_preset >/dev/null 2>&1
+PROBE2
+  bash "$ROOT/initrd/probe_allow.sh"
+  if diff -q "$ROOT/initrd/preds/linux-cizen-test.preset.cizen-orig" \
+             "$ROOT/initrd/preds2/linux-cizen-test.preset" >/dev/null 2>&1; then
+    rec ok "initramfs: CIZEN_UKI_ALLOW_MKINITCPIO_UKI=1 deja el preset como estaba (opt-in explícito)"
+  else
+    rec fail "initramfs: el override no se respetó; el preset se modificó igual"
+  fi
+
+  cat > "$ROOT/initrd/probe_val.sh" <<'PROBE3'
+set -u
+ok(){ :; }; warn(){ :; }; err(){ :; }; info(){ :; }; log(){ :; }
+# shellcheck disable=SC1090
+source "$ROOT/initrd/claim.sh"
+for f in ok concat desalineado basura truncada microcode; do
+  if cizen_initramfs_validate "$ROOT/initrd/$f.img" >/dev/null 2>&1; then echo "$f OK"; else echo "$f NO"; fi
+done
+PROBE3
+  vals="$(bash "$ROOT/initrd/probe_val.sh" 2>/dev/null || true)"
+  if printf '%s\n' "$vals" | grep -qx 'ok OK'; then
+    rec ok "initramfs: se acepta un cpio único que trae init"
+  else
+    rec fail "initramfs: un initramfs correcto se rechaza (vals: $(printf '%s' "$vals" | tr '\n' ' '))"
+  fi
+  # El diseño real de mkinitcpio con zstd: CPIO temprano (los .ko.zst, el
+  # firmware, el microcode) + cpio comprimido detrás. El kernel recorre
+  # segmentos, así que esto es un initramfs BUENO. Una versión anterior de
+  # esta comprobación lo rechazaba y recetaba COMPRESSION="cat", que además
+  # no arreglaba nada: con 'cat' el CPIO temprano sigue ahí, sin comprimir.
+  if printf '%s\n' "$vals" | grep -qx 'concat OK'; then
+    rec ok "initramfs: se ACEPTA el cpio concatenado de mkinitcpio (temprano + comprimido)"
+  else
+    rec fail "initramfs: el cpio concatenado de mkinitcpio se rechaza (vals: $(printf '%s' "$vals" | tr '\n' ' '))"
+  fi
+  if printf '%s\n' "$vals" | grep -qx 'desalineado NO'; then
+    rec ok "initramfs: el concatenado sin alinear a 4 bytes se rechaza, como hace el kernel"
+  else
+    rec fail "initramfs: un concatenado sin alinear pasa la validación (vals: $(printf '%s' "$vals" | tr '\n' ' '))"
+  fi
+  # El fallo de verdad: microcode Intel crudo delante. Es lo que se colaba en
+  # la sección .ucode de la UKI y tumbaba el arranque de los dos kernels.
+  if printf '%s\n' "$vals" | grep -qx 'microcode NO'; then
+    rec ok "initramfs: se rechaza el microcode Intel crudo (el bug de la sección .ucode)"
+  else
+    rec fail "initramfs: el microcode crudo pasa la validación (vals: $(printf '%s' "$vals" | tr '\n' ' '))"
+  fi
+  if printf '%s\n' "$vals" | grep -qx 'basura NO' \
+     && printf '%s\n' "$vals" | grep -qx 'truncada NO'; then
+    rec ok "initramfs: se rechazan también la imagen corrupta y la truncada"
+  else
+    rec fail "initramfs: corrupta/truncada no se rechazan (vals: $(printf '%s' "$vals" | tr '\n' ' '))"
+  fi
+
+  # La UKI construida se verifica contra el initramfs validado: ukify lo mete
+  # tal cual, así que los tamaños tienen que coincidir. Para no depender de
+  # tener ukify/objcopy de verdad, el objdump es un stub que anuncia el tamaño
+  # de .initrd que le pidamos; lo que se comprueba es el parsing y la
+  # comparación, que es donde se decidiría escribir un UKI equivocado.
+  sed -n '/^cizen_uki_verify_image() {/,/^}/p' "$UKISYNC" > "$ROOT/initrd/verify.sh"
+  mkdir -p "$ROOT/initrd/bin"
+  cat > "$ROOT/initrd/bin/objdump" <<'OBJDUMP'
+#!/bin/bash
+# Stub: imprime las cabeceras de seccion que le pidan por FAKE_INITRD_HEX y
+# FAKE_UCODE_HEX. Lo que se comprueba es el parsing y la comparacion.
+if [ -n "${FAKE_INITRD_HEX:-}" ]; then
+  printf ' 10 .initrd       %s  000000014ef42000  000000014ef42000  00faaa00  2**2\n' "$FAKE_INITRD_HEX"
+fi
+if [ -n "${FAKE_UCODE_HEX:-}" ]; then
+  printf ' 11 .ucode        %s  0000000151bd9000  0000000151bd9000  03c40600  2**2\n' "$FAKE_UCODE_HEX"
+fi
+exit 0
+OBJDUMP
+  cat > "$ROOT/initrd/bin/objcopy" <<'OBJCOPY'
+#!/bin/bash
+# Stub: solo sabe --dump-section .ucode=FICHERO, y pone ahi lo que diga
+# FAKE_UCODE_SRC. Es lo que hace el ukify/objcopy de verdad con la seccion.
+dest=""
+for a in "$@"; do
+  case "$a" in
+    .ucode=*) dest="${a#.ucode=}" ;;
+  esac
+done
+[ -n "$dest" ] || exit 1
+cp -- "${FAKE_UCODE_SRC:?}" "$dest"
+OBJCOPY
+  chmod +x "$ROOT/initrd/bin/objdump" "$ROOT/initrd/bin/objcopy"
+  : > "$ROOT/initrd/uki.efi"
+  ok_bytes="$(stat -c '%s' "$ROOT/initrd/ok.img")"
+  ok_hex="$(printf '%x' "$ok_bytes")"
+  other_bytes="$(stat -c '%s' "$ROOT/initrd/concat.img")"
+  other_hex="$(printf '%x' "$other_bytes")"
+  ucode_bytes="$(stat -c '%s' "$ROOT/initrd/ok.img")"
+  ucode_hex="$(printf '%x' "$ucode_bytes")"
+  cat > "$ROOT/initrd/probe_ver.sh" <<'PROBE4'
+set -u
+SUDO=()
+PATH="$ROOT/initrd/bin:$PATH"
+ok(){ :; }; warn(){ :; }; err(){ :; }; info(){ :; }; log(){ :; }
+# shellcheck disable=SC1090
+source "$ROOT/initrd/verify.sh"
+# .initrd del mismo tamaño que ok.img -> la UKI es la que se ha validado
+FAKE_INITRD_HEX="$OK_HEX" cizen_uki_verify_image "$ROOT/initrd/uki.efi" "$ROOT/initrd/ok.img" >/dev/null 2>&1 \
+  && echo "coincide OK" || echo "coincide NO"
+# .initrd del tamaño de OTRA imagen -> no es lo que se validó: no se escribe
+FAKE_INITRD_HEX="$OTHER_HEX" cizen_uki_verify_image "$ROOT/initrd/uki.efi" "$ROOT/initrd/ok.img" >/dev/null 2>&1 \
+  && echo "descuadre NO" || echo "descuadre OK"
+# UKI sin .initrd cuando sí se iba a embeber un initramfs -> tampoco se escribe
+FAKE_INITRD_HEX="" cizen_uki_verify_image "$ROOT/initrd/uki.efi" "$ROOT/initrd/ok.img" >/dev/null 2>&1 \
+  && echo "sin-seccion NO" || echo "sin-seccion OK"
+# sin initramfs (arranque degradado): avisa, no aborta
+FAKE_INITRD_HEX="" cizen_uki_verify_image "$ROOT/initrd/uki.efi" "" >/dev/null 2>&1 \
+  && echo "sin-initrd OK" || echo "sin-initrd NO"
+# .ucode que SÍ es un cpio: el kernel lo desempaqueta y sigue con el .initrd
+FAKE_INITRD_HEX="$OK_HEX" FAKE_UCODE_HEX="$UCODE_HEX" \
+  cizen_uki_verify_image "$ROOT/initrd/uki.efi" "$ROOT/initrd/ok.img" >/dev/null 2>&1 \
+  && echo "ucode-cpio OK" || echo "ucode-cpio NO"
+# .ucode con el microcode Intel crudo: el kernel concatena .ucode + .initrd,
+# el primer byte no es ninguna magic y aborta TODO el desempaquetado. Esto es
+# lo que dejo los dos kernels arrancando sin initramfs y sin que se notara.
+FAKE_INITRD_HEX="$OK_HEX" FAKE_UCODE_HEX="$UCODE_HEX" FAKE_UCODE_SRC="$ROOT/initrd/microcode.img" \
+  cizen_uki_verify_image "$ROOT/initrd/uki.efi" "$ROOT/initrd/ok.img" >/dev/null 2>&1 \
+  && echo "ucode-crudo NO" || echo "ucode-crudo OK"
+PROBE4
+  vals_v="$(OK_HEX="$ok_hex" OTHER_HEX="$other_hex" UCODE_HEX="$ucode_hex" \
+             bash "$ROOT/initrd/probe_ver.sh" 2>/dev/null || true)"
+  if printf '%s\n' "$vals_v" | grep -qx 'coincide OK'; then
+    rec ok "uki: .initrd del tamaño del initramfs validado pasa la verificación"
+  else
+    rec fail "uki: la verificación rechaza una UKI correcta (vals: $(printf '%s' "$vals_v" | tr '\n' ' '))"
+  fi
+  if printf '%s\n' "$vals_v" | grep -qx 'descuadre OK' \
+     && printf '%s\n' "$vals_v" | grep -qx 'sin-seccion OK'; then
+    rec ok "uki: .initrd que no cuadra (o que no está) bloquea la escritura del UKI"
+  else
+    rec fail "uki: la verificación deja pasar un .initrd que no es el initramfs validado (vals: $(printf '%s' "$vals_v" | tr '\n' ' '))"
+  fi
+  if printf '%s\n' "$vals_v" | grep -qx 'sin-initrd OK'; then
+    rec ok "uki: sin initramfs la verificación avisa del arranque degradado y no aborta"
+  else
+    rec fail "uki: sin initramfs la verificación se traga el caso y no avisa"
+  fi
+  if printf '%s\n' "$vals_v" | grep -qx 'ucode-cpio OK'; then
+    rec ok "uki: una .ucode que es un cpio pasa la verificación"
+  else
+    rec fail "uki: la verificación rechaza una .ucode que sí es un cpio (vals: $(printf '%s' "$vals_v" | tr '\n' ' '))"
+  fi
+  if printf '%s\n' "$vals_v" | grep -qx 'ucode-crudo OK'; then
+    rec ok "uki: una .ucode con microcode crudo BLOQUEA la UKI (el bug que tumbó los dos kernels)"
+  else
+    rec fail "uki: la verificación deja pasar una .ucode con microcode crudo (vals: $(printf '%s' "$vals_v" | tr '\n' ' '))"
+  fi
+
+  # Los dos scripts tienen que seguir haciendo lo mismo: la UKI se genera en
+  # ambos, y si uno se queda sin initramfs validado, el otro también.
+  for fn in cizen_uki_claim_preset cizen_initramfs_path cizen_initramfs_walk \
+            cizen_initramfs_validate cizen_initramfs_prepare cizen_uki_verify_image; do
+    if sed -n "/^$fn() {/,/^}/p" "$UKISYNC" | grep -q . \
+       && sed -n "/^$fn() {/,/^}/p" "$MOTOR" | grep -q .; then
+      rec ok "initramfs: $fn está en el motor y en cizen-uki-sync (réplica, no dos versiones distintas)"
+    else
+      rec fail "initramfs: $fn falta en el motor o en cizen-uki-sync"
+    fi
+  done
+  # Y lo importante: que ninguno embeba ya el fichero a ciegas.
+  if sed -n '/^build_uki() {/,/^}/p' "$UKISYNC" | grep -q 'cizen_initramfs_prepare' \
+     && sed -n '/^build_cizen_uki() {/,/^}/p' "$MOTOR" | grep -q 'cizen_initramfs_prepare'; then
+    rec ok "initramfs: la UKI solo se construye con el initramfs pasado por prepare+validate"
+  else
+    rec fail "initramfs: algún constructor de UKI sigue embebiendo /boot/initramfs-*.img sin validar"
+  fi
+else
+  printf '  (sin %s: se omiten los tests de initramfs/UKI)\n' "$UKISYNC"
 fi
 
 # --- resumen ---

@@ -136,7 +136,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.37"
+SCRIPT_VERSION="27.31.40"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -1661,6 +1661,11 @@ declare -A TOOL_PKG=(
   [ld.lld]=lld
   [mokutil]=mokutil      [openssl]=openssl  [dpkg]=dpkg
   [objcopy]=binutils     [readelf]=binutils
+  # Validación del initramfs antes de embeberlo en la UKI (v27.31.39):
+  # cpio para listar el archivo, objdump para comprobar la sección .initrd
+  # de la UKI, od para leer la cabecera de la imagen, dd para el salto.
+  [cpio]=cpio           [objdump]=binutils     [od]=coreutils
+  [dd]=coreutils
 )
 
 # Prompt sí/no interactivo siguiendo el patrón del script (leer de /dev/tty;
@@ -1752,7 +1757,7 @@ require_cc_toolchain() {
 
 check_prerequisites() {
   local cmd pkg rc
-  local -a tools=(awk bash bc bison cat ccache cmp cp date df du find findmnt flex flock fuser grep gcc gpg head id ls make mktemp mount nproc pacman pahole perl rm sbctl sed sleep sort stat tar tr umount wget xargs xz timeout cizen-uki-sync)
+  local -a tools=(awk bash bc bison cat ccache cmp cp cpio date dd df du find findmnt flex flock fuser grep gcc gpg head id ls make mktemp mount nproc objdump pacman pahole perl rm sbctl sed sleep sort stat tar tr umount wget xargs xz timeout cizen-uki-sync)
   local -a missing_cmds=() missing_pkgs=()
 
   # Compilador de preferencia: su toolchain va a la MISMA lista que el resto de
@@ -1886,7 +1891,8 @@ check_sudo_capabilities() {
 # se usa de verdad aquí; si añades una operación privilegiada al camino normal,
 # añádela también (hay un test que lo vigila).
 SUDO_OPS_REQUERIDOS=(mount umount install pacman chown mkdir rm)
-SUDO_OPS_OPCIONALES=(swapon swapoff mv cp find stat test sync cat tee od tar
+SUDO_OPS_OPCIONALES=(swapon swapoff mv cp find stat test sync cat tee od tar sed grep
+                     mkinitcpio
                      du openssl make sbctl mokutil fuser cizen-uki-sync)
 
 # Comandos que el allowlist NOPASSWD cubre, uno por línea y solo el basename.
@@ -6494,6 +6500,18 @@ inject_build_overlay() {
     info "Overlay: firma de módulos del kernel (MODULE_SIG=yes)."
   fi
 
+  # Scheduler: si NO se aplicó ningún parche de scheduler (EEVDF/Vanilla),
+  # desactivar TODOS los schedulers alternativos para evitar que una config
+  # base previa deje uno activo. Cuando se aplicó un parche (bore, pds, etc.)
+  # los símbolos del parche ya están en EFF_ENABLE y no se tocan.
+  if [ -z "${PATCHES_APPLIED[*]:-}" ]; then
+    for o in SCHED_BORE SCHED_PDS SCHED_BMQ SCHED_LFBMQ SCHED_MUQSS SCHED_ALT; do
+      add_unique disable "$o"
+      EXPECTED_REBEL_SET["$o"]=1
+    done
+    info "Overlay: scheduler EEVDF (vanilla) — schedulers alternativos desactivados."
+  fi
+
   unset o
 }
 
@@ -7791,6 +7809,19 @@ CIZEN_UKI_NAME="${CIZEN_UKI_NAME:-arch-${CIZEN_PKGBASE}.efi}"
 CIZEN_UKI_REQUIRED="${CIZEN_UKI_REQUIRED:-0}"
 CIZEN_UKI_FORCE_DIRECT="${CIZEN_UKI_FORCE_DIRECT:-0}"
 CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK="${CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK:-0}"
+# Reparto de responsabilidades con mkinitcpio (v27.31.39), igual que en
+# cizen-uki-sync:
+#   CIZEN_UKI_ALLOW_MKINITCPIO_UKI=1  deja que el preset de mkinitcpio pueda
+#                                      escribir la UKI (default 0: es nuestra)
+#   CIZEN_UKI_INITRAMFS                ruta del initramfs
+#   CIZEN_UKI_PRESET_DIR               directorio de presets de mkinitcpio
+#   CIZEN_INITRAMFS_REBUILD=0          no regenerar el initramfs (default 1)
+#   CIZEN_INITRAMFS_REQUIRED=1         abortar si no hay initramfs válido
+CIZEN_UKI_ALLOW_MKINITCPIO_UKI="${CIZEN_UKI_ALLOW_MKINITCPIO_UKI:-0}"
+CIZEN_UKI_INITRAMFS="${CIZEN_UKI_INITRAMFS:-}"
+CIZEN_UKI_PRESET_DIR="${CIZEN_UKI_PRESET_DIR:-/etc/mkinitcpio.d}"
+CIZEN_INITRAMFS_REBUILD="${CIZEN_INITRAMFS_REBUILD:-1}"
+CIZEN_INITRAMFS_REQUIRED="${CIZEN_INITRAMFS_REQUIRED:-0}"
 # Boot counting de systemd-boot: si CIZEN_BOOT_TRIES>0 la UKI se escribe con un
 # contador de intentos (arch-linux-cizen-v3+N.efi). Cada boot SIN completar
 # boot-complete.target resta 1; al llegar a 0 la entrada pasa a "bad" y
@@ -7966,6 +7997,421 @@ done < <(find_cizen_uki_targets "$(cizen_uki_efi_name)" || true)
 [ "$any" = true ]
 }
 
+# ============================================================
+# INITRAMFS Y UKI: UNA SOLA FUENTE DE LA VERDAD (v27.31.39)
+# ============================================================
+# Replica de las mismas funciones de cizen-uki-sync, para la ruta directa
+# (CIZEN_UKI_FORCE_DIRECT=1 o UKI no actualizada) de este motor. Los dos
+# scripts generan UKIs para el mismo ESP y han de comportarse igual.
+#
+# El problema que las motiva: el preset de mkinitcpio (default_uki=...) es un
+# SEGUNDO productor de la misma UKI —lo dispara el hook 90-mkinitcpio-install
+# al instalar el kernel y `mkinitcpio -P` con cualquier actualización de
+# /usr/lib/initcpio/*— y era además el único que generaba el initramfs, porque
+# este motor nunca llama a mkinitcpio. Se embebía a ciegas el fichero que
+# hubiera en /boot. La UKI, en cambio, salía con la sección .ucode ENVENENADA:
+# el microcode Intel en crudo (el fichero /usr/lib/firmware/intel-ucode/06-9e-09
+# tal cual) en vez de un cpio. systemd-boot le pasa al kernel .ucode + .initrd
+# concatenados, el primer byte del microcode no es ni NUL ni '0' ni una magic
+# de compresión, y unpack_to_rootfs() aborta sin desempaquetar nada:
+#     Initramfs unpacking failed: invalid magic at start of compressed archive
+# y el equipo arranca sin initramfs y sin que se notara (btrfs y el resto van
+# built-in a propósito: ver verify_build_tree()).
+#
+# El initramfs "concatenado" al que se culpó al principio (CPIO temprano sin
+# comprimir con los .ko.zst + cpio comprimido) NO era el problema: es el diseño
+# normal de mkinitcpio con zstd y el kernel lo recorre sin problema, así que la
+# validación se hace ahora con ese mismo bucle de segmentos. Aquí se cierra el
+# flujo: el preset deja de construir la UKI, el initramfs se regenera y se
+# valida antes de embeberlo, y la UKI construida se verifica antes de
+# escribirla —incluida la sección .ucode, que es donde estaba el fallo.
+
+# El preset de mkinitcpio deja de construir la UKI y se queda con el
+# initramfs. CIZEN_UKI_ALLOW_MKINITCPIO_UKI=1 lo deja como estaba.
+cizen_uki_claim_preset() {
+    local preset image
+
+    if [ "${CIZEN_UKI_ALLOW_MKINITCPIO_UKI:-0}" = "1" ]; then
+        info "CIZEN_UKI_ALLOW_MKINITCPIO_UKI=1: el preset de mkinitcpio puede volver a escribir ${CIZEN_UKI_NAME}."
+        return 0
+    fi
+
+    preset="${CIZEN_UKI_PRESET_DIR:-/etc/mkinitcpio.d}/${CIZEN_PKGBASE}.preset"
+    image="$(cizen_initramfs_path)"
+
+    if ! sudo test -f "$preset"; then
+        info "Sin preset de mkinitcpio para ${CIZEN_PKGBASE}: nada que reclamar."
+        return 0
+    fi
+
+    if ! sudo grep -qE '^[[:space:]]*[A-Za-z0-9_]+_uki=' "$preset"; then
+        return 0
+    fi
+
+    sudo test -f "$preset.cizen-orig" || sudo cp -a -- "$preset" "$preset.cizen-orig" || true
+    sudo sed -i -E \
+        's|^([[:space:]]*)([A-Za-z0-9_]+_uki=)|\1#CIZEN-UKI-OWNED \2|' "$preset"
+
+    # El preset tiene que seguir produciendo algo, o mkinitcpio avisa de que
+    # no hay image ni UKI y el hook de pacman deja de hacer su parte.
+    if ! sudo grep -qE '^[[:space:]]*[A-Za-z0-9_]+_image=' "$preset"; then
+        if sudo grep -qE '^[[:space:]]*#[[:space:]]*[A-Za-z0-9_]+_image=' "$preset"; then
+            sudo sed -i -E \
+                's|^([[:space:]]*)#[[:space:]]*([A-Za-z0-9_]+_image=)|\1\2|' "$preset"
+        else
+            printf 'default_image="%s"\n' "$image" | sudo tee -a "$preset" >/dev/null
+        fi
+    fi
+
+    ok "Preset de mkinitcpio recortado a initramfs: ya no construye la UKI (la escribe ${CIZEN_UKI_NAME})."
+    info "  Original en $preset.cizen-orig · initramfs en $image"
+    return 0
+}
+
+# Ruta del initramfs que produce el preset de mkinitcpio. Overridable para
+# poder ejercitar la validacion sin /boot (y para quien lo tenga en otro sitio).
+cizen_initramfs_path() {
+    printf '%s\n' "${CIZEN_UKI_INITRAMFS:-/boot/initramfs-${CIZEN_PKGBASE}.img}"
+}
+
+# Recorre una imagen initrd como lo hace el kernel y dice si encuentra /init.
+#
+# POR QUE NO BASTABA CON MIRAR EL PRIMER cpio
+#
+# init/initramfs.c:unpack_to_rootfs() (7.2.8) no espera un unico archivo: va
+# recorriendo la imagen en segmentos mientras queden bytes, y en cada vuelta
+#   - si el byte es NUL, lo salta (el relleno de alineacion que pone mkinitcpio)
+#   - si empieza por '0' y el offset cae alineado a 4, lo desempaqueta como cpio
+#   - si no, busca una magic de compresion conocida y lo descomprime
+#   - si no hay ninguna de las dos: "invalid magic at start of compressed
+#     archive" y PARA, dejando lo ya desempaquetado como estaba
+#
+# O sea que el diseno normal de mkinitcpio con zstd --meter en un CPIO temprano
+# sin comprimir lo que no quiere comprimir dos veces (los .ko.zst, el firmware y
+# el microcode del hook 'microcode') y concatenar detras el cpio comprimido-- es
+# un initramfs perfectamente valido, con el kernel encontrando /init en el
+# segundo segmento. Una version anterior de este script exigia que el PRIMER
+# cpio trajera 'init', rechazaba ese layout legitimo y recetaba
+# COMPRESSION="cat" como arreglo. Ese diagnostico era FALSO, y el arreglo era
+# ademas inutil: con 'cat' el CPIO temprano sigue ahi, solo que sin comprimir.
+# Peor: con el mismo validador se "verifico" un arreglo que no tocaba la causa
+# real, y el equipo siguio arrancando sin initramfs durante dias.
+#
+# Lo que si tumbaba el arranque era otra cosa, y esta funcion tambien lo pilla
+# porque es el mismo bucle: un blob de microcode Intel CRUDO delante. Va en la
+# seccion .ucode de la UKI, y lo comprueba cizen_uki_verify_image().
+#
+# python3 porque es lo que necesita ukify igual, asi que no es una dependencia
+# nueva. Si no esta, se avisa y se sigue: seria un fallo de este script, no del
+# arranque.
+cizen_initramfs_walk() {
+    python3 - "$1" <<'CIZEN_INITRD_WALK_PY'
+import bz2, gzip, lzma, subprocess, sys
+
+CPIO = (b"070701", b"070702")
+# Ojo: ningun '}' puede quedar en la columna 0 de este bloque, porque el
+# selftest extrae las funciones con sed -n '/^fn() {/,/^}/p' y un cierre de
+# dict o lista ahi le cortaria la funcion por la mitad.
+DEC = {"gzip": ["gzip", "-dc"], "bzip2": ["bzip2", "-dc"],
+   "xz": ["xz", "-dc"], "lzma": ["xz", "-dc"],
+   "lz4": ["lz4", "-dcq"], "lzo": ["lzop", "-dc"],
+   "zstd": ["zstd", "-dcq"]}
+MAGIC = [
+(b"\x1f\x8b", "gzip"), (b"BZh", "bzip2"), (b"\x5d\x00\x00\x80", "lzma"),
+(b"\xfd7zXZ\x00", "xz"), (b"\x89LZO\x00", "lzo"),
+(b"\x02\x21\x4c\x18", "lz4"), (b"\x28\xb5\x2f\xfd", "zstd"),
+]
+
+
+def entries(buf, off):
+"""Nombres del cpio newc que empieza en off, y su longitud en bytes."""
+names, pos = [], off
+while pos + 110 <= len(buf):
+    try:
+        nsz = int(buf[pos + 94:pos + 102], 16)
+        fsz = int(buf[pos + 54:pos + 62], 16)
+    except ValueError:
+        break
+    hdr = 110 + nsz
+    hdr += (-hdr) % 4
+    name = buf[pos + 110:pos + 110 + nsz].rstrip(b"\x00").decode("utf-8", "replace")
+    if name == "TRAILER!!!":
+        return names, pos + hdr - off
+    names.append(name)
+    pos += hdr + fsz + ((-fsz) % 4)
+return names, None
+
+
+def microcode(buf, off):
+"""Longitud de un blob de microcode Intel crudo en off, o None.
+
+Cabecera de Intel: 0x00 version (LE, =1), 0x1C tamano total (LE). El 0x04
+NO es el tamano, es la fecha en BCD, asi que no se puede usar para esto.
+"""
+if off + 0x20 > len(buf):
+    return None
+ver = int.from_bytes(buf[off:off + 4], "little")
+total = int.from_bytes(buf[off + 0x1C:off + 0x20], "little")
+if ver == 1 and 0x100 <= total <= len(buf) - off:
+    return total
+return None
+
+
+def inflate(kind, data):
+try:
+    if kind == "gzip":
+        return gzip.decompress(data)
+    if kind == "bzip2":
+        return bz2.decompress(data)
+    if kind in ("xz", "lzma"):
+        return lzma.decompress(data)
+except Exception as exc:
+    print("  %s: %s" % (kind, exc))
+    return None
+if kind not in DEC:
+    return None
+p = subprocess.run(DEC[kind], input=data, stdout=subprocess.PIPE,
+                   stderr=subprocess.PIPE)
+if p.returncode:
+    print("  %s: %s" % (kind, p.stderr.decode("utf-8", "replace").strip()))
+    return None
+return p.stdout
+
+
+def main():
+try:
+    with open(sys.argv[1], "rb") as fh:
+        buf = fh.read()
+except OSError as exc:
+    print("no-leo: %s" % exc)
+    return 2
+if not buf:
+    print("la imagen no tiene bytes")
+    return 1
+
+off, segs, nuls, stop, found = 0, [], 0, None, False
+while off < len(buf):
+    if buf[off] == 0:
+        off += 1
+        nuls += 1
+        continue
+    if buf[off:off + 6] in CPIO and off % 4 == 0:
+        names, length = entries(buf, off)
+        if length is None:
+            stop = (off, "cpio truncado: no aparece TRAILER!!!")
+            break
+        segs.append("cpio @%d: %d B, %d entradas%s"
+                    % (off, length, len(names),
+                       ", trae /init" if "init" in names else ""))
+        if "init" in names:
+            found = True
+        off += length
+        continue
+    kind = next((k for m, k in MAGIC if buf[off:off + len(m)] == m), None)
+    if kind is None:
+        stop = (off, "invalid magic at start of compressed archive")
+        break
+    raw = inflate(kind, buf[off:])
+    if raw is None:
+        stop = (off, "no se pudo descomprimir")
+        break
+    names, _ = entries(raw, 0)
+    segs.append("%s @%d: %d B -> %d B, %d entradas%s"
+                % (kind, off, len(buf) - off, len(raw), len(names),
+                   ", trae /init" if "init" in names else ""))
+    if "init" in names:
+        found = True
+    off = len(buf)
+
+for s in segs:
+    print("segmento: %s" % s)
+if nuls:
+    print("relleno NUL entre segmentos: %d B (el kernel los salta uno a uno)" % nuls)
+if stop:
+    print("el kernel PARA en @%d: %s" % stop)
+    print("bytes ahi: %s" % buf[stop[0]:stop[0] + 16].hex(" "))
+    mc = microcode(buf, stop[0])
+    if mc:
+        print("diagnostico: esto no es un initramfs, es un blob de microcode Intel")
+        print("crudo de %d bytes. El kernel recibe .ucode + .initrd concatenados y" % mc)
+        print("aborta antes de desempaquetar NADA. Va en la seccion .ucode de la UKI,")
+        print("no aqui: mira cizen_uki_verify_image().")
+if found and not stop:
+    print("veredicto: el kernel encuentra /init")
+    return 0
+if found:
+    print("veredicto: /init esta en la imagen pero el kernel se detiene antes")
+    return 1
+print("veredicto: el kernel se queda SIN /init")
+return 1
+
+
+sys.exit(main())
+CIZEN_INITRD_WALK_PY
+}
+
+# Valida que la imagen sea un initramfs que este kernel sabe desempaquetar.
+# El test decisivo es el del kernel: recorrer los segmentos y encontrar /init en
+# alguno. Asi cae, sin falsos positivos ni falsos negativos:
+#   - cpio unico con 'init'                               -> vale;
+#   - CPIO temprano + cpio comprimido (lo normal con zstd) -> vale;
+#   - lo mismo sin alinear el segundo a 4 bytes           -> no vale, y avisa,
+#     porque el alineamiento a 4 es justo lo que el kernel exige para el salto
+#     de segmento;
+#   - microcode crudo delante, imagen corrupta o truncada -> no vale.
+cizen_initramfs_validate() {
+    local img="$1" out rc
+    
+    if [ ! -s "$img" ]; then
+        err "El initramfs '$img' no existe o esta vacio."
+        return 1
+    fi
+    
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "python3 no esta instalado: no puedo comprobar el contenido de '$img'."
+        return 0
+    fi
+    
+    out="$(cizen_initramfs_walk "$img" 2>&1)"
+    rc=$?
+    printf '%s\n' "$out" | sed 's/^/    /'
+    
+    if [ "$rc" -eq 0 ]; then
+        ok "Initramfs validado: $img (el kernel encuentra /init)"
+        return 0
+    fi
+    if [ "$rc" -eq 2 ]; then
+        warn "No pude recorrer '$img': lo doy por bueno sin comprobarlo."
+        return 0
+    fi
+    
+    err "El initramfs '$img' NO sirve: el kernel no llegaria a /init (detalle arriba)."
+    err "  El equipo arrancaria igual (btrfs va built-in) pero SIN initramfs: sin"
+    err "  /init, sin udev, sin microcode temprano y sin keymap, y en silencio."
+    err "  Si el detalle dice 'microcode Intel crudo', el problema no esta aqui sino"
+    err "  en la seccion .ucode de la UKI: mira cizen_uki_verify_image()."
+    err "  Arreglo: regenera con 'mkinitcpio -p ${CIZEN_PKGBASE:-<pkgbase>}' y vuelve a validar."
+    return 1
+}
+
+# Regenera el initramfs y lo valida. Deja la ruta utilizable en
+# CIZEN_INITRAMFS_PATH (vacía si no hay ninguna) y devuelve 1 si no se pudo
+# tener un initramfs válido. No se imprime la ruta por stdout porque las
+# funciones de log de este motor escriben ahí y se mezclarían con el valor.
+CIZEN_INITRAMFS_PATH=""
+cizen_initramfs_prepare() {
+    local path
+    path="$(cizen_initramfs_path)"
+
+    if [ "${CIZEN_INITRAMFS_REBUILD:-1}" = "0" ]; then
+        info "CIZEN_INITRAMFS_REBUILD=0: no regenero el initramfs."
+    elif ! command -v mkinitcpio >/dev/null 2>&1; then
+        warn "mkinitcpio no está instalado: no puedo regenerar el initramfs."
+    elif ! sudo test -f "${CIZEN_UKI_PRESET_DIR:-/etc/mkinitcpio.d}/${CIZEN_PKGBASE}.preset"; then
+        warn "No hay preset de mkinitcpio para ${CIZEN_PKGBASE}: no regenero el initramfs."
+    else
+        log "Regenerando el initramfs (mkinitcpio -p ${CIZEN_PKGBASE})"
+        if sudo mkinitcpio -p "$CIZEN_PKGBASE"; then
+            ok "Initramfs regenerado: $path"
+        else
+            err "mkinitcpio -p ${CIZEN_PKGBASE} falló."
+        fi
+    fi
+
+    if [ ! -s "$path" ]; then
+        err "No hay initramfs en $path."
+        return 1
+    fi
+
+    if cizen_initramfs_validate "$path"; then
+        CIZEN_INITRAMFS_PATH="$path"
+        return 0
+    fi
+    return 1
+}
+
+# ukify mete el initramfs tal cual en la sección .initrd, así que el tamaño de
+# la sección tiene que coincidir con el del fichero validado: si no, lo que va
+# a leer el kernel no es lo que se ha comprobado. Sin initramfs, avisa de que
+# el arranque será degradado en vez de dejarlo pasar en silencio.
+cizen_uki_verify_image() {
+    local uki="$1" initrd="${2:-}" hex size isize
+
+    if ! command -v objdump >/dev/null 2>&1; then
+        warn "objdump no está instalado: no puedo comprobar la sección .initrd de la UKI."
+        return 0
+    fi
+
+    hex="$(objdump -h -- "$uki" 2>/dev/null | awk '$2 == ".initrd" { print $3; exit }')" || hex=""
+    if [ -n "$hex" ]; then
+        size=$((16#$hex))
+    else
+        size=""
+    fi
+
+    # .ucode, si lo hay, TIENE que ser un cpio. ukify y objcopy meten el fichero
+    # tal cual en la seccion, y el kernel concatena .ucode + .initrd antes de
+    # desempaquetar: si lo que va delante no es un cpio --un blob de microcode
+    # crudo, tipicamente-- el primer byte no es ni NUL ni '0' ni una magic de
+    # compresion, el kernel aborta con "invalid magic at start of compressed
+    # archive" y NO desempaqueta nada: ni /init, ni udev, ni el microcode que si
+    # venia dentro del .initrd. Ese fallo silencioso tumbo los dos kernels de
+    # este equipo durante dias, y ninguna comprobacion sobre el fichero de
+    # initramfs podia verlo, porque el .ucode es otra seccion de la UKI.
+    ucode_hex="$(objdump -h -- "$uki" 2>/dev/null | awk '$2 == ".ucode" { print $3; exit }')" || ucode_hex=""
+    if [ -n "$ucode_hex" ]; then
+        ucode_tmp="$(mktemp "${TMPDIR:-/tmp}/cizen-ucode.XXXXXX")"
+        if objcopy --dump-section ".ucode=$ucode_tmp" -- "$uki" 2>/dev/null && [ -s "$ucode_tmp" ]; then
+            if head -c 6 -- "$ucode_tmp" | grep -qE '^(070701|070702)$'; then
+                ok "UKI verificada: .ucode de $((16#$ucode_hex)) bytes, es un cpio"
+            else
+                err "La seccion .ucode de la UKI no es un cpio newc (empieza en $(head -c 8 -- "$ucode_tmp" | od -An -tx1 | tr -d ' \n'))."
+                err "  Es casi siempre el microcode Intel en crudo. El kernel recibe .ucode +"
+                err "  .initrd concatenados, aborta el desempaquetado entero con 'invalid magic"
+                err "  at start of compressed archive' y se queda sin /init, sin udev y sin"
+                err "  microcode. Viene de Microcode= en /etc/kernel/uki.conf apuntando a un"
+                err "  fichero de /usr/lib/firmware/intel-ucode/ en vez de a un cpio: ukify"
+                err "  lo mete tal cual. Con initrd no hace falta, el microcode ya va en el"
+                err "  CPIO temprano del initramfs. No escribo la UKI."
+                rm -f -- "$ucode_tmp"
+                return 1
+            fi
+        else
+            warn "No pude extraer la seccion .ucode de la UKI: no la compruebo."
+        fi
+        rm -f -- "$ucode_tmp"
+    fi
+    
+    if [ -z "$initrd" ]; then
+        if [ -n "$size" ]; then
+            warn "La UKI lleva un .initrd de $size bytes sin haber validado ningún initramfs."
+        else
+            warn "La UKI no lleva .initrd: el equipo arrancará SIN initramfs (sin /init, sin udev,"
+            warn "  sin microcode temprano y sin keymap). Sigue siendo un arranque válido porque"
+            warn "  btrfs y el resto van built-in, pero es un arranque degradado."
+        fi
+        return 0
+    fi
+
+    isize="$(sudo stat -c '%s' -- "$initrd" 2>/dev/null || echo 0)"
+    if [ "$isize" -eq 0 ] 2>/dev/null; then
+        err "No pude leer el tamaño de $initrd: no puedo verificar la UKI."
+        return 1
+    fi
+    if [ -z "$size" ]; then
+        err "La UKI no tiene sección .initrd pero se iba a embeber $initrd: no la escribo."
+        return 1
+    fi
+    if [ "$size" -ne "$isize" ]; then
+        err "La sección .initrd de la UKI mide $size bytes y el initramfs validado $isize."
+        err "  Lo que arranque el kernel no es la imagen que se ha validado: no la escribo."
+        return 1
+    fi
+
+    ok "UKI verificada: .initrd de $size bytes = $initrd"
+    return 0
+}
+
 build_cizen_uki() {
     local kernel="$1" cmdline_file="$2" out="$3"
     local cmdline_text ukify_bin="" stub s osrel_file rel
@@ -8010,15 +8456,24 @@ build_cizen_uki() {
         if [ -n "$rel" ]; then
             args+=(--uname="$rel")
         fi
-        # Si el kernel Cizen usa initramfs (preset mkinitcpio) se integra en la
-        # UKI; si no existe el archivo, la UKI queda sin initrd (kernel
-        # autosuficiente). Mismo comportamiento que cizen-uki-sync/build_uki.
-        local initrd="/boot/initramfs-${CIZEN_PKGBASE}.img"
-        local have_initrd=0
-        if [ -s "$initrd" ]; then
+        # El initramfs se regenera y valida AQUÍ: build_cizen_uki es la única
+        # puerta por la que pasa todo initrd que acabe en una UKI de este
+        # motor. Antes se embebía el fichero que hubiera en /boot sin mirarlo.
+        local initrd="" have_initrd=0
+        if cizen_initramfs_prepare; then
+            initrd="$CIZEN_INITRAMFS_PATH"
+            have_initrd=1
+        elif [ "${CIZEN_INITRAMFS_REQUIRED:-0}" = "1" ]; then
+            err "No hay initramfs válido y CIZEN_INITRAMFS_REQUIRED=1: no construyo la UKI."
+            return 1
+        else
+            # El diseño es que el equipo arranca igual sin initramfs (btrfs y
+            # el resto built-in; ver verify_build_tree()), pero nunca en silencio.
+            warn "Sin initramfs válido: la UKI saldrá sin initrd y el arranque será degradado."
+        fi
+        if [ "$have_initrd" -eq 1 ]; then
             args+=(--initrd="$initrd")
             ok "Incluyendo initramfs: $initrd"
-            have_initrd=1
         fi
         # Microcódigo Intel temprano: solo se inyecta vía --microcode si NO hay
         # initrd (kernel standalone). Con initrd, el hook 'microcode' de
@@ -8101,6 +8556,10 @@ sync_cizen_efi() {
         return 0
     fi
 
+    # Antes de escribir nada: el preset de mkinitcpio es el otro productor de
+    # esta UKI y no puede volver a pisarla en la próxima transacción de pacman.
+    cizen_uki_claim_preset
+
     cmdline_file="$(prepare_cizen_cmdline_file)" || {
         cizen_uki_fail "No pude preparar la línea de comandos para la UKI."
         return 0
@@ -8131,6 +8590,15 @@ sync_cizen_efi() {
     if ! build_cizen_uki "$kernel" "$cmdline_file" "$tmp"; then
         rm -f "$tmp" "$cmdline_file"
         cizen_uki_fail "No pude generar la UKI ($(cizen_uki_efi_name)). Instala ukify (systemd) o binutils y verifica /usr/lib/systemd/boot/efi/linuxx64.efi.stub."
+        return 0
+    fi
+
+    # Lo que se va a escribir tiene que ser lo que se ha validado: la sección
+    # .initrd debe medir lo mismo que el initramfs. Con un .initrd que no
+    # cuadra no se escribe nada; es mejor quedarse con la UKI anterior.
+    if ! cizen_uki_verify_image "$tmp" "$CIZEN_INITRAMFS_PATH"; then
+        rm -f "$tmp" "$cmdline_file"
+        cizen_uki_fail "La UKI generada no supera la verificación de la sección .initrd: no la escribo en el ESP."
         return 0
     fi
 
@@ -9781,12 +10249,20 @@ if [ "$CHECK_ONLY" = true ]; then
     exit 0
   fi
 else
-  # v27.31.37: build directo (sin --check): no hay un "¿Desea continuar?" detrás
-  # —no lo hay porque no se haValidado nada todavía—, pero sí un momento
-  # equivalente: la config está lista y aún no se ha compilado ni un objeto. Se
-  # pregunta aquí y no en el menú por lo mismo: elegir scheduler/compilador
-  # tiene sentido cuando ya se sabe que la build va a empezar.
-  ask_build_prefs
+  # Build directo (sin --check): la config está validada y aún no se ha
+  # compilado nada. Se pregunta "¿Desea continuar?" igual que en --check,
+  # y solo si la respuesta es SÍ se pregunta variante y compilador.
+  if confirm_build_after_check; then
+    ask_build_prefs
+  else
+    FINAL_CONFIG="$CONFIG_DIR/linux-$VERSION-cizen-v3.config"
+    promote_base_config .config "$FINAL_CONFIG"
+    ok "CHECK EXITOSO: configuración promovida a $FINAL_CONFIG"
+    echo
+    ok "Todo listo para compilar cuando lo desees; la configuración quedó validada y las fuentes esperan en su sitio."
+    cleanup_success
+    exit 0
+  fi
 fi
 
 # Firma de la UKI (Secure Boot): nueva opción sugerida en la solicitud de
