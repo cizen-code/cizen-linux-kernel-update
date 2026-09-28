@@ -261,6 +261,14 @@ vuelve al comportamiento anterior (solo archive de ficheros).
   `intel_idle.max_cstate=4` (despierta antes desde los estados profundos;
   reversible). Se aplica al regenerar la UKI (`sudo cizen-uki-sync`) y reboot.
   DMC i915 Kaby Lake ya estaba en `linux-firmware`.
+- **Nota (v27.31.46)**: el overlay de LTO se contradecía a sí mismo y toda
+  build con `--lto-thin`/`--lto-full` moría en validación con
+  `[ENABLE] CONFIG_LTO_CLANG_THIN quedó n` (el símbolo se activaba y se
+  desactivaba en la misma pasada, y el `--disable` ganaba). Corregido: la
+  opción elegida solo se activa, y `add_unique` mantiene `EFF_ENABLE` y
+  `EFF_DISABLE` disjuntos para que el fallo no pueda reaparecer. Si viste ese
+  aviso, actualiza a v27.31.46 y repite la build; no hace falta tocar el
+  perfil.
 
 ### Prioridad de compilación y cgroups
 

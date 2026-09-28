@@ -4008,6 +4008,75 @@ else
   rec fail "LTO: el default del motor no es thin o falta --no-lto (revisar CIZEN_LLVM_LTO)"
 fi
 
+# v27.31.46: el overlay de LTO no puede pasar la opción ELEGIDA por disable. El
+# disable se aplica después del enable, así que el mismo símbolo en ambos arrays
+# salía con CONFIG_LTO_CLANG_THIN=n y la build moría en validación ("[ENABLE]
+# CONFIG_LTO_CLANG_THIN quedó n") con el perfil y la toolchain correctos.
+# Se evalúa el bloque REAL del motor (no una copia) con stubs mínimos.
+_lto_case="$(sed -n '/^inject_build_overlay() {/,/^}/p' "$MOTOR" \
+            | sed -n '/case "$CIZEN_LLVM_LTO" in/,/^  esac/p')"
+_lto_bad=""
+if [ -z "$_lto_case" ]; then
+  rec fail "LTO: no se encuentra el bloque 'case CIZEN_LLVM_LTO' en inject_build_overlay"
+else
+  for _v in thin full 0; do
+    _lto_out="$(MOTOR="$MOTOR" LCASE="$_lto_case" CIZEN_LLVM_LTO="$_v" bash -c '
+      eval "$(sed -n "/^eff_remove() {/,/^}/p"  "$MOTOR")"
+      eval "$(sed -n "/^add_unique() {/,/^}/p"  "$MOTOR")"
+      info() { :; }
+      declare -a EFF_ENABLE=() EFF_DISABLE=()
+      declare -A SEEN_ENABLE=() SEEN_DISABLE=()
+      declare -A EXPECTED_REBEL_SET=() PATCH_KCONFIG_FILTER=()
+      eval "$LCASE"
+      printf "%s|%s" "${EFF_ENABLE[*]}" "${EFF_DISABLE[*]}"
+    ' 2>/dev/null)"
+    _lto_e="${_lto_out%%|*}"; _lto_d="${_lto_out##*|}"
+    # 1) ningún símbolo puede estar en las dos listas a la vez
+    for _s in $_lto_e; do
+      case " $_lto_d " in *" $_s "*) _lto_bad="$_v:en Ambas listas($_s)" ;; esac
+    done
+    # 2) la elegida tiene que quedar habilitada, y solo ella
+    case "$_v" in
+      thin) [ "$_lto_e" = "LTO_CLANG_THIN" ] || _lto_bad="$_v:enable='$_lto_e'" ;;
+      full) [ "$_lto_e" = "LTO_CLANG_FULL" ] || _lto_bad="$_v:enable='$_lto_e'" ;;
+      0)    [ "$_lto_e" = "LTO_NONE" ]       || _lto_bad="$_v:enable='$_lto_e'" ;;
+    esac
+    # 3) las alternativas tienen que quedar desactivadas (una por una: un unico
+    # glob con dos literales exigiria dos espacios entre medias y nunca cuela)
+    case "$_v" in
+      thin) _lto_want_d="LTO_CLANG_FULL LTO_NONE" ;;
+      full) _lto_want_d="LTO_CLANG_THIN LTO_NONE" ;;
+      0)    _lto_want_d="LTO_CLANG_THIN LTO_CLANG_FULL" ;;
+    esac
+    for _s in $_lto_want_d; do
+      case " $_lto_d " in *" $_s "*) ;; *) _lto_bad="$_v:falta disable $_s ('$_lto_d')" ;; esac
+    done
+  done
+  if [ -z "$_lto_bad" ]; then
+    rec ok "LTO: el overlay habilita la opción elegida y NO la vuelve a deshabilitar (thin/full/0)"
+  else
+    rec fail "LTO: el overlay de LTO se contradice ($_lto_bad) -> '[ENABLE] CONFIG_LTO_CLANG_THIN quedó n'"
+  fi
+fi
+
+# v27.31.46: add_unique mantiene EFF_ENABLE y EFF_DISABLE disjuntas (última
+# intención gana). Antes un enable+disable del mismo símbolo convivían y el
+# disable pisaba al enable sin dejar rastro.
+_au_bad="$(bash -c '
+  eval "$(sed -n "/^eff_remove() {/,/^}/p" "$0")"
+  eval "$(sed -n "/^add_unique() {/,/^}/p"   "$0")"
+  declare -a EFF_ENABLE=() EFF_DISABLE=()
+  declare -A SEEN_ENABLE=() SEEN_DISABLE=()
+  add_unique enable FOO; add_unique disable BAR
+  add_unique disable FOO; add_unique enable BAZ
+  printf "%s|%s" "${EFF_ENABLE[*]}" "${EFF_DISABLE[*]}"
+' "$MOTOR" 2>/dev/null)"
+if [ "$_au_bad" = "BAZ|BAR FOO" ]; then
+  rec ok "add_unique: un símbolo no queda a la vez en ENABLE y DISABLE (gana la última intención)"
+else
+  rec fail "add_unique: EFF_ENABLE/EFF_DISABLE se solapan ($_au_bad)"
+fi
+
 # Übersicht del barrido en cizen-uki-sync: el fallback objcopy tiene que embeber
 # .initrd (antes producía una UKI sin initrd que la verificación descartaba).
 if sed -n '/^build_uki() {/,/^}/p' "$UKISYNC" | grep -q -- '--add-section .initrd="\$initrd"'; then

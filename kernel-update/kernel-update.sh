@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.31.36 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.31.46 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / XFS / systemd / KVM-libvirt / QEMU-OVMF
 #
@@ -136,7 +136,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.45"
+SCRIPT_VERSION="27.31.46"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -1527,10 +1527,21 @@ declare -A SEEN_ENABLE=() SEEN_DISABLE=() SEEN_CRITICAL=()
 
 add_unique() {
   local arr_name="$1" sym="$2"
+  # Un símbolo NO puede quedar a la vez en EFF_ENABLE y EFF_DISABLE: la pasada
+  # de scripts/config aplica primero las activaciones y después las
+  # desactivaciones, de modo que el disable pisaba en silencio al enable y solo
+  # se entraba en cuenta en la validación ("[ENABLE] CONFIG_X quedó n"). Gana la
+  # última intención explícita y la opuesta se retira del array y de su SEEN_*.
   case "$arr_name" in
     enable)
+      if [ -n "${SEEN_DISABLE[$sym]:-}" ]; then
+        eff_remove EFF_DISABLE "$sym"; unset 'SEEN_DISABLE[$sym]'
+      fi
       if [ -z "${SEEN_ENABLE[$sym]:-}" ]; then EFF_ENABLE+=("$sym"); SEEN_ENABLE[$sym]=1; fi ;;
     disable)
+      if [ -n "${SEEN_ENABLE[$sym]:-}" ]; then
+        eff_remove EFF_ENABLE "$sym"; unset 'SEEN_ENABLE[$sym]'
+      fi
       if [ -z "${SEEN_DISABLE[$sym]:-}" ]; then EFF_DISABLE+=("$sym"); SEEN_DISABLE[$sym]=1; fi ;;
     critical)
       if [ -z "${SEEN_CRITICAL[$sym]:-}" ]; then EFF_CRITICAL+=("$sym"); SEEN_CRITICAL[$sym]=1; fi ;;
@@ -6505,13 +6516,17 @@ inject_build_overlay() {
     thin|full)
       o="LTO_CLANG_${CIZEN_LLVM_LTO^^}"
       add_unique enable "$o"
-      add_unique disable "LTO_CLANG_FULL"
-      add_unique disable "LTO_CLANG_THIN"
-      add_unique disable "LTO_NONE"
+      # v27.31.46: solo se desactivan las opciones ALTERNATIVAS. Antes se pasaban
+      # las tres (THIN/FULL/NONE) por disable, así que la elegida acababa
+      # también en EFF_DISABLE; como la pasada de scripts/config aplica primero
+      # enable y después disable, el disable pisaba al enable y la build moría en
+      # validación con "[ENABLE] CONFIG_LTO_CLANG_THIN quedó n".
+      for _lto in LTO_CLANG_THIN LTO_CLANG_FULL LTO_NONE; do
+        [ "$_lto" = "$o" ] && continue
+        add_unique disable "$_lto"
+        EXPECTED_REBEL_SET["$_lto"]=1
+      done
       EXPECTED_REBEL_SET["$o"]=1
-      EXPECTED_REBEL_SET[LTO_CLANG_FULL]=1
-      EXPECTED_REBEL_SET[LTO_CLANG_THIN]=1
-      EXPECTED_REBEL_SET[LTO_NONE]=1
       PATCH_KCONFIG_FILTER["$o"]=1
       info "Overlay: LTO de Clang ${CIZEN_LLVM_LTO^^}."
       ;;

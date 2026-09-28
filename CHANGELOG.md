@@ -1,3 +1,72 @@
+## [27.31.46] - 2026-09-28
+
+Fix del overlay de LTO introducido en v27.31.45: el motor se contradecía a sí
+mismo y toda build con Thin/Full-LTO moría en validación. Estado: **417 ok,
+0 fail** en el selftest instalado (415 + 2 tests nuevos) y **418 ok** en el
+árbol del repo, verificado en rojo contra v27.31.45.
+
+- **Causa raíz.** En `inject_build_overlay`, la rama `thin|full` del `case
+  "$CIZEN_LLVM_LTO"` hacía:
+  ```bash
+  o="LTO_CLANG_${CIZEN_LLVM_LTO^^}"   # con CIZEN_LLVM_LTO=thin -> LTO_CLANG_THIN
+  add_unique enable "$o"
+  add_unique disable "LTO_CLANG_FULL"
+  add_unique disable "LTO_CLANG_THIN"   # <-- la elegida, otra vez
+  add_unique disable "LTO_NONE"
+  ```
+  `add_unique` deduplica **por array**, no entre arrays, así que el símbolo
+  elegido acababa en `EFF_ENABLE` **y** en `EFF_DISABLE`. La fase de config
+  (`apply_config_requests`) recorre primero las activaciones y después las
+  desactivaciones, así que el `--disable` pisaba al `--enable` y la `.config`
+  quedaba con `CONFIG_LTO_CLANG_THIN=n`. La validación lo detectaba
+  correctamente (`[ENABLE] CONFIG_LTO_CLANG_THIN quedó n`, FATAL) y `--force` se
+  negaba a continuar: la config estaba mal de verdad, el motor hacía bien en
+  parar. Todo lo demás estaba bien (perfil, toolchain, BORE, PGP), por eso el
+  fallo se leía como "de repente el motor se rompió".
+- **Arreglo 1 (`inject_build_overlay`).** Solo se desactivan las opciones
+  *alternativas*, saltando explícitamente la elegida:
+  ```bash
+  for _lto in LTO_CLANG_THIN LTO_CLANG_FULL LTO_NONE; do
+    [ "$_lto" = "$o" ] && continue
+    add_unique disable "$_lto"
+    EXPECTED_REBEL_SET["$_lto"]=1
+  done
+  ```
+  `EXPECTED_REBEL_SET` queda solo para los símbolos que se pide desactivar (los
+  que Kconfig pueda conservar); el elegido se valida por la vía normal de
+  `EFF_ENABLE`.
+- **Arreglo 2 (`add_unique`, guarda estructural).** `EFF_ENABLE` y
+  `EFF_DISABLE` pasan a ser **disjuntos**: al pedir `enable` de un símbolo que ya
+  estaba en disable (y viceversa) se retira de la lista opuesta y de su índice
+  `SEEN_*`; gana la última intención explícita. Así la contradicción se
+  deshace en el punto donde se crea, en vez de producir una `.config` rota que
+  solo se detecta treinta segundos y un `olddefconfig` después. Con esto el
+  resto del overlay (OLEVEL, HZ, NTSYNC, schedulers) queda protegido por
+  construcción, y `build_effective_arrays` sigue reseteando `SEEN_*` junto a
+  `EFF_*`.
+- **Regresión en selftest (2 tests).** Uno evalúa el bloque `case
+  "$CIZEN_LLVM_LTO"` **real** del motor (extraído con `sed`, no copiado a mano)
+  para `thin`, `full` y `0`, con stubs de `info`: exige que el símbolo elegido
+  quede solo en `EFF_ENABLE`, que ninguna opción esté en las dos listas, y que
+  la alternativa no elegida esté en `EFF_DISABLE`. El otro comprueba el
+  invariante de `add_unique` (enable+disable del mismo símbolo → solo
+  sobrevive el último). Comprobado que **fallan** contra el motor de v27.31.45
+  y pasan con el de v27.31.46.
+- **Verificación en el sistema.** Desplegado a
+  `/usr/local/bin/kernel-update/{kernel-update.sh,tests/selftest.sh}` con
+  `sudo install` (allowlist §3). Recompilación real de 7.2.8 con BORE +
+  Thin-LTO: `✓ [ENABLE] 38/38`, `✓ [CRITICAL] 13/13`, `✓ [DISABLE] 250/250
+  (0 rebeldes)`, y el diff frente al kernel en ejecución muestra
+  `CONFIG_LTO_NONE y → n` + `CONFIG_LTO_CLANG_THIN n → y`.
+- **Flake conocido al medir en caliente**: `banco: la medición degenerada se
+  anota igual` falla si el selftest corre con la CPU saturada (p. ej. con una
+  build de kernel a full tilt). `sched-bench.sh` pone suelo de 0,25 ms/MB a la
+  escritura de 20 MB y sale por debajo si el `sha256sum` no llega a 5 ms. Es
+  sensible a la carga **por diseño** (el propio script avisa: *"si la carga del
+  equipo lo ha interrumpido, no es un fallo del banco"*) y no tiene relación con
+  este cambio: comprobado que da idéntico `rc=0, 1 fichero` contra el árbol de
+  v27.31.45. Con la máquina tranquila sale verde.
+
 ## [27.31.45] - 2026-09-27
 
 Mejoras de velocidad/alto rendimiento del kernel Cizen (perfil v5.13.0 + motor).
