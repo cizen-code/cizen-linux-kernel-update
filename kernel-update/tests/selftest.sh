@@ -3999,6 +3999,15 @@ else
   rec fail "rollback: manifiesto obsoleto = archive ignorado pese a existir"
 fi
 
+# v27.31.45: el default del motor es Thin-LTO (clang). Si vuelve a 0, 'auto'
+# resuelve a gcc y la build pierde LTO en silencio.
+if grep -q 'CIZEN_LLVM_LTO="\${CIZEN_LLVM_LTO:-thin}"' "$MOTOR" \
+   && grep -q -- '--no-lto' "$MOTOR"; then
+  rec ok "LTO: default thin en el motor con escape --no-lto (no se vuelve a gcc en silencio)"
+else
+  rec fail "LTO: el default del motor no es thin o falta --no-lto (revisar CIZEN_LLVM_LTO)"
+fi
+
 # Übersicht del barrido en cizen-uki-sync: el fallback objcopy tiene que embeber
 # .initrd (antes producía una UKI sin initrd que la verificación descartaba).
 if sed -n '/^build_uki() {/,/^}/p' "$UKISYNC" | grep -q -- '--add-section .initrd="\$initrd"'; then
@@ -4019,6 +4028,37 @@ else
   printf '  (sin scripts auxiliares en el árbol: se omiten las regresiones de v27.31.44)\n'
 fi
 unset PODAR_ VERIFYSRC_ NOTIFY_ MANAGER_
+
+# --- v27.31.45: rendimiento (perfil v5.13.0, Thin-LTO default, PGO plumbing) ---
+PROFILE_="$(dirname "$MOTOR")/profiles/cizen-optiplex7050.conf"
+PGO_="$(dirname "$MOTOR")/pgo-collect.sh"
+if [ -f "$PROFILE_" ] && [ -f "$PGO_" ]; then
+  if bash -n "$PROFILE_" && bash -n "$PGO_" && bash -n "$MOTOR"; then
+    rec ok "v27.31.45: sintaxis OK (motor, perfil v5.13.0 y pgo-collect.sh)"
+  else
+    rec fail "v27.31.45: error de sintaxis (motor/perfil/pgo-collect.sh)"
+  fi
+  MO_="$(awk 'BEGIN{b=0;n=0} /^declare -a OPTS_ENABLE=\($/ {b=1;next} /^\)$/ {b=0} b && index($0,"\"SCHED_CLASS_EXT\"") {n++} END{print n}' "$PROFILE_")"
+  MD_="$(awk 'BEGIN{b=0;n=0} /^declare -a OPTS_DISABLE=\($/ {b=1;next} /^\)$/ {b=0} b && index($0,"\"SCHED_CLASS_EXT\"") {n++} END{print n}' "$PROFILE_")"
+  MK_="$(awk 'BEGIN{b=0;n=0} /^declare -a OPTS_DISABLE=\($/ {b=1;next} /^\)$/ {b=0} b && index($0,"\"KALLSYMS_ALL\"") {n++} END{print n}' "$PROFILE_")"
+  MS_="$(awk 'BEGIN{b=0;n=0} /^declare -a OPTS_DISABLE=\($/ {b=1;next} /^\)$/ {b=0} b && index($0,"\"SLAB_MERGE_DEFAULT\"") {n++} END{print n}' "$PROFILE_")"
+  if [ "$MO_" -eq 1 ] && [ "$MD_" -eq 0 ] && [ "$MK_" -eq 1 ] && [ "$MS_" -eq 1 ]; then
+    rec ok "perfil v5.13.0: sched_ext reactivado y KALLSYMS_ALL/SLAB_MERGE_DEFAULT en DISABLE"
+  else
+    rec fail "perfil v5.13.0: bloques sched_ext/KALLSYMS/SLAB_MERGE incorrectos (ENABLE=$MO_ DISABLE_scx=$MD_ KA=$MK_ SM=$MS_)"
+  fi
+  if grep -q 'CIZEN_PGO_PROFILE' "$MOTOR" \
+     && grep -q 'CLANG_AUTOFDO_PROFILE=$CIZEN_PGO_PROFILE' "$MOTOR" \
+     && grep -q 'AUTOFDO_CLANG' "$MOTOR" \
+     && grep -q 'llvm-profgen' "$PGO_"; then
+    rec ok "PGO: plumbing CIZEN_PGO_PROFILE→CLANG_AUTOFDO_PROFILE + AUTOFDO_CLANG + helper llvm-profgen"
+  else
+    rec fail "PGO: falta plumbing CIZEN_PGO_PROFILE / CLANG_AUTOFDO_PROFILE / AUTOFDO_CLANG / llvm-profgen"
+  fi
+else
+  printf '  (sin perfiles/pgo-collect.sh en el árbol: se omiten las regresiones de v27.31.45)\n'
+fi
+unset PROFILE_ PGO_ MO_ MD_ MK_ MS_
 
 # --- resumen ---
 echo

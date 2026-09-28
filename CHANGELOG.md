@@ -1,3 +1,39 @@
+## [27.31.45] - 2026-09-27
+
+Mejoras de velocidad/alto rendimiento del kernel Cizen (perfil v5.13.0 + motor).
+Estado: **416 ok, 0 fail** en selftest y `shellcheck` sin deltas contra v27.31.44
+(precedente de la auditoría: por diff, no por número de avisos).
+
+- **Thin-LTO por defecto.** `CIZEN_LLVM_LTO` default pasa de `0` a `thin`:
+  `auto` resuelve a clang/LLVM y el overlay inyecta `CONFIG_LTO_CLANG_THIN=y`
+  (los símbolos `LTO_*` positivos van a EXPECTED_REBEL_SET). Escape explícito:
+  `--no-lto` / `CIZEN_LLVM_LTO=0`. Concluye el comentario de la v27.31.x que
+  dejaba el LTO "solo viable con clang": ahora es el camino por defecto.
+- **sched_ext reactivado (perfil v5.13.0).** `SCHED_CLASS_EXT` sale de
+  `OPTS_DISABLE` (v5.3) y entra en `OPTS_ENABLE`: schedulers Linux-eBPF
+  (scx_bpfland/rusty/lavd) para cambiar de scheduler en caliente sin reboot.
+  Requiere BTF/BPF, ya presentes.
+- **Quick wins de dieta/aislamiento (perfil v5.13.0).** `KALLSYMS_ALL=n` y
+  `SLAB_MERGE_DEFAULT=n` en `OPTS_DISABLE`: menos RAM en kallsyms y caches
+  slab sin fusionar (rendimiento aislado).
+- **PGO/AutoFDO (opt-in, nuevo).** Motor: `CIZEN_PGO_PROFILE` → valida que el
+  perfil exista antes de config, fuerza `CONFIG_AUTOFDO_CLANG` en el overlay y
+  entrega el perfil al make como `CLANG_AUTOFDO_PROFILE` (fases config y build,
+  incl. la reconstrucción de KCONFIG_CC_OPTS tras reevaluar LTO). Nuevo helper
+  `kernel-update/pgo-collect.sh`: `perf record -F 999 -a -g` de N segundos +
+  conversión con `llvm-profgen` a `.afdo`. La build PGO real (2 builds, recogida
+  de perfil entre medias) se deja documentada para el usuario, no se construyó
+  aquí.
+- **Regresión en selftest**: default LTO-thin (no volver a gcc en silencio),
+  perfil v5.13.0 (sched_ext en ENABLE, KALLSYMS/SLAB en DISABLE), plumbing PGO
+  y sintaxis de motor/perfil/helper. 416 ok / 0 fail (era 412+2 nuevos
+  bloques).
+- **Sistema (no repo)**: `/etc/kernel/cmdline` + `intel_idle.max_cstate=4`
+  (reduce latencia de wake desde los estados de reposo profundos; reversible).
+  DMC i915 Kaby Lake (`kbl_dmc_ver1_04.bin`) ya estaba en el sistema: sin
+  cambios de firmware. Requiere regenerar la UKI (`sudo cizen-uki-sync`) y
+  reboot para aplicarse.
+
 ## [27.31.44] - 2026-09-27
 
 Auditoría exhaustiva del flujo completo: un conjunto grande y dispar de

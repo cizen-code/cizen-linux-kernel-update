@@ -136,7 +136,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.44"
+SCRIPT_VERSION="27.31.45"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -399,9 +399,15 @@ fi
 CIZEN_CC="${CIZEN_CC:-auto}"
 CC_FAMILY=gcc
 CC_LAUNCHER=gcc
-# LTO únicamente con clang: 0=off (default), 1|thin=CONFIG_LTO_CLANG_THIN,
-# full=CONFIG_LTO_CLANG_FULL.
-CIZEN_LLVM_LTO="${CIZEN_LLVM_LTO:-0}"
+# LTO únicamente con clang: 0=off, 1|thin=CONFIG_LTO_CLANG_THIN,
+# full=CONFIG_LTO_CLANG_FULL. v27.31.45: default=thin (rendimiento, plan
+# v27.31.45 en README). Escape: --no-lto / CIZEN_LLVM_LTO=0.
+CIZEN_LLVM_LTO="${CIZEN_LLVM_LTO:-thin}"
+# v27.31.45 PGO/AutoFDO (opt-in): ruta a un perfil AutoFDO del kernel
+# (llvm-profgen, ver kernel-update/pgo-collect.sh). Con ella se fija
+# CLANG_AUTOFDO_PROFILE y se fuerza CONFIG_AUTOFDO_CLANG en el overlay. En
+# vacío la build es normal (sin PGO).
+CIZEN_PGO_PROFILE="${CIZEN_PGO_PROFILE:-}"
 # Nivel de optimización de los archivos C: inherit (respetar perfil) | 2 | 3.
 # Se materializa en el par de CONFIG CC_OPTIMIZE_FOR_PERFORMANCE/O3 (choice).
 CIZEN_CFLAGS_OLEVEL="${CIZEN_CFLAGS_OLEVEL:-inherit}"
@@ -820,6 +826,15 @@ if [ "$CIZEN_LLVM_LTO" != "0" ] && [ "$CC_FAMILY" = "gcc" ]; then
   warn "LTO (${CIZEN_LLVM_LTO}) exige clang; el compilador elegido es GCC (${CC_LAUNCHER}); se ignora el LTO."
   CIZEN_LLVM_LTO=0
 fi
+# v27.31.45 PGO: el perfil debe existir y ser legible ANTES de la fase de config
+# (CONFIG_AUTOFDO_CLANG solo existe con CC_IS_CLANG; con gcc se aborta).
+if [ -n "${CIZEN_PGO_PROFILE:-}" ]; then
+  [ -f "$CIZEN_PGO_PROFILE" ] && [ -r "$CIZEN_PGO_PROFILE" ] \
+    || fatal "CIZEN_PGO_PROFILE debe ser un fichero legible (perfil AutoFDO de llvm-profgen): $CIZEN_PGO_PROFILE"
+  if [ "$CC_FAMILY" = "gcc" ]; then
+    fatal "PGO AutoFDO exige clang (CC_IS_CLANG): el compilador elegido es GCC (${CC_LAUNCHER})."
+  fi
+fi
 # v27.31.7: las fases de preparación de config (listnewconfig/olddefconfig/
 # localmodconfig) deben ver el MISMO compilador que la build real. Si se
 # preparan con gcc y se compila con LLVM=1 (clang), los símbolos que solo
@@ -829,6 +844,11 @@ fi
 declare -a KCONFIG_CC_OPTS=()
 if [ "$CC_FAMILY" = "clang" ]; then
   KCONFIG_CC_OPTS+=('LLVM=1')
+fi
+# v27.31.45 PGO: el perfil viaja en el entorno de config también (no afecta a
+# syncconfig, que solo ve CC_IS_CLANG), por simetría con la build.
+if [ -n "${CIZEN_PGO_PROFILE:-}" ]; then
+  KCONFIG_CC_OPTS+=("CLANG_AUTOFDO_PROFILE=$CIZEN_PGO_PROFILE")
 fi
 case "$CC_LAUNCHER" in
   gcc|clang) ;;  # genérico: Kbuild resuelve por PATH
@@ -6505,6 +6525,16 @@ inject_build_overlay() {
       ;;
   esac
 
+  # v27.31.45 PGO/AutoFDO: con perfil se fuerza CONFIG_AUTOFDO_CLANG (solo
+  # existe con CC_IS_CLANG; la sanidad temprana ya abortó si el compilador es
+  # gcc). El fichero solo se entrega a la fase BUILD (KCFLAGS), no a la config.
+  if [ -n "${CIZEN_PGO_PROFILE:-}" ]; then
+    add_unique enable "AUTOFDO_CLANG"
+    EXPECTED_REBEL_SET[AUTOFDO_CLANG]=1
+    PATCH_KCONFIG_FILTER[AUTOFDO_CLANG]=1
+    info "Overlay: PGO AutoFDO con $CIZEN_PGO_PROFILE."
+  fi
+
   # NTSYNC: en mainline >= 6.10 es un CONFIG nativo (drivers/misc/ntsync.c).
   # Para kernels más viejos se pide el parche (patch_desc_ntsync) y aquí no se
   # fuerza símbolo alguno (el parche lo aporta).
@@ -10265,6 +10295,9 @@ apply_cc_choice() {
   if [ "$CC_FAMILY" = "clang" ]; then
     KCONFIG_CC_OPTS+=('LLVM=1')
   fi
+  if [ -n "${CIZEN_PGO_PROFILE:-}" ]; then
+    KCONFIG_CC_OPTS+=("CLANG_AUTOFDO_PROFILE=$CIZEN_PGO_PROFILE")
+  fi
   case "$CC_LAUNCHER" in
     gcc|clang) ;;
     *) KCONFIG_CC_OPTS+=("CC=$CC_LAUNCHER" "HOSTCC=$CC_LAUNCHER") ;;
@@ -10422,6 +10455,12 @@ declare -a MAKE_CC_OPTS=()
 if [ "$CC_FAMILY" = "clang" ]; then
   MAKE_CC_OPTS+=('LLVM=1')
   export LLVM=1
+fi
+# v27.31.45 PGO/AutoFDO: entregar el perfil al make DEL BUILD (Kbuild monta
+# -fprofile-sample-use) solo cuando el usuario lo pidió (CIZEN_PGO_PROFILE).
+if [ -n "${CIZEN_PGO_PROFILE:-}" ]; then
+  MAKE_CC_OPTS+=("CLANG_AUTOFDO_PROFILE=$CIZEN_PGO_PROFILE")
+  info "PGO AutoFDO activo: con $CIZEN_PGO_PROFILE (la build incluirá -fprofile-sample-use)."
 fi
 if command -v ccache >/dev/null 2>&1; then
   export CCACHE_DIR="${CCACHE_DIR:-$HOME/.cache/ccache}"

@@ -93,7 +93,8 @@ Todas las opciones que compilan (1, 2, 3, 4, 5, 7, 8, 14, 15, 16) **dejan de pre
 >
 >   CC (Enter usa el default):
 >     auto  elige según el sistema (clang si LTO/toolchain LLVM viable; si no gcc) (default)
->     gcc   compilador GCC
+>           Desde v27.31.45 el default de LTO es thin → 'auto' resuelve a clang/LLVM.
+>     gcc   compilador GCC (requiere --no-lto si no quieres que el motor lo descarte)
 >     clang Clang/LLVM (necesario para el LTO)
 >     otro  teclea TU compilador (p. ej. gcc-14, clang-17 o una ruta). Se exigirá como dependencia si falta.
 >   CC [Enter=auto]:
@@ -220,7 +221,8 @@ vuelve al comportamiento anterior (solo archive de ficheros).
 | hardened | `kernel-update.sh --hardened` | Auditoría de endurecimiento del kernel EN EJECUCIÓN (símbolos de /proc/config.gz + knobs sysctl vivos); sin efectos laterales |
 | sched | `kernel-update.sh --sched pds` | Compila con el scheduler elegido: `eevdf`, `bore`, `pds`, `bmq`, `lfbmq`, `muqss` (los de parche descargan PRJC/CachyOS con fallback upstream). También interactivo al confirmar build/check (variante Vanilla/BORE/PDS/BMQ/LFBMQ/MuQSS) |
 | cc | `kernel-update.sh --cc clang` | Toolchain LLVM/Clang (`clang`+`lld`, requiere ambos); `gcc` o `auto` |
-| lto | `kernel-update.sh --lto-thin` | LTO thin/full con clang (`--no-lto` fuerza GCC) |
+| lto | `kernel-update.sh --lto-thin` | LTO thin/full con clang; **default thin desde v27.31.45**. `--no-lto` / `CIZEN_LLVM_LTO=0` vuelve a sin-LTO (GCC) |
+| pgo | `CIZEN_PGO_PROFILE=/ruta/.afdo` | PGO/AutoFDO opt-in: fuerza `CONFIG_AUTOFDO_CLANG` y entrega el perfil como `CLANG_AUTOFDO_PROFILE`. Helper: `pgo-collect.sh` |
 | o3 | `kernel-update.sh --o3` | `-O3` (Kbuild) + `CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE` |
 | native | `kernel-update.sh --native` | `-march=native`; `--march=<env>` para un valor explícito (`.config` siempre envejece: se re-aplica en cada build) |
 | timer-freq | `kernel-update.sh --timer-freq 1000` | `CONFIG_HZ` |
@@ -235,6 +237,30 @@ vuelve al comportamiento anterior (solo archive de ficheros).
 | uki-backup | `kernel-update.sh --uki-backup` | Respalda el UKI previo antes de sobrescribirlo (`CIZEN_UKI_BACKUP_DIR`) |
 | luks-audit | `kernel-update.sh --luks-audit` | Avisa si la raíz LUKS no tiene parámetros de desbloqueo en el cmdline antes de regenerar el UKI |
 | manager | `kernel-update-manager.sh list` | Gestor de kernels instalados: `list`, `info`, `flip`, `backup`, `remove`, `guide` |
+
+### Plan de rendimiento (v27.31.45, perfil v5.13.0)
+
+- **Thin-LTO por defecto**: `CIZEN_LLVM_LTO=thin` (clang/LLVM). Escape:
+  `--no-lto`. Enlaza módulo-con-módulo en la fase de enlazado → IPC más alto.
+- **sched_ext reactivado**: `SCHED_CLASS_EXT=y` (perfil v5.13.0) para los
+  schedulers Linux-eBPF (`scx_bpfland`, `scx_rusty`, `scx_lavd` en AUR), que se
+  activan/desactivan en caliente. El scheduler de arranque sigue siendo el del
+  perfil/parche (p. ej. BORE).
+- **Dieta**: `KALLSYMS_ALL=n` (menos RAM en la tabla de símbolos) y
+  `SLAB_MERGE_DEFAULT=n` (caches slab no fusionadas; aislamiento de
+  rendimiento).
+- **PGO/AutoFDO (opt-in)**: recoge un perfil del sistema en ejecución y
+  recompila el kernel optimizado para esa carga:
+  1. `sudo kernel-update/pgo-collect.sh --duration 900` (captura `perf record
+     -F 999 -a -g` durante tu carga real y convierte con `llvm-profgen`; sale en
+     `~/kernel-pgo/<kver>.afdo`).
+  2. `CIZEN_PGO_PROFILE=~/kernel-pgo/<kver>.afdo kernel-update.sh <build>`
+     (motor fuerza `CONFIG_AUTOFDO_CLANG` y entrega `CLANG_AUTOFDO_PROFILE`).
+     Se puede comparar con una build `--no-lto` sin `CIZEN_PGO_PROFILE`.
+- **Cmdline (sistema)**: `/etc/kernel/cmdline` incluye ahora
+  `intel_idle.max_cstate=4` (despierta antes desde los estados profundos;
+  reversible). Se aplica al regenerar la UKI (`sudo cizen-uki-sync`) y reboot.
+  DMC i915 Kaby Lake ya estaba en `linux-firmware`.
 
 ### Prioridad de compilación y cgroups
 
