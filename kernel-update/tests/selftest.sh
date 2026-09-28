@@ -2488,8 +2488,22 @@ else
 fi
 unset -f findmnt sudo unmount_tmpfs_build
 
-printf '%s\n' "== kernel-update-verify.sh: todos los schedulers =="
-VERIFY_SRC="$(cd "$(dirname "$0")/.." && pwd)/kernel-update-verify.sh"
+# El verificador se busca en los DOS layouts —el del repo (kernel-update/) y el
+# instalado junto al harness— en vez de asumir ../. La copia plana del harness
+# en /usr/local/bin/kernel-update/selftest.sh no cumple ese supuesto: los 31
+# tests de este bloque fallaban todos, sin que hubiera un solo defecto detrás
+# (VERIFY_SRC apuntaba a /usr/local/bin/kernel-update-verify.sh, que no existe).
+# Un test que solo puede pasar en uno de los dos layouts no mide nada: entrena a
+# ignorar los que fallan. Y si de verdad no está el verificador, se OMITE el
+# bloque diciendo por qué, en vez de producir 31 rojos sin explicación.
+_here="$(cd "$(dirname "$0")" && pwd)"
+VERIFY_SRC=""
+for _c in "$_here/../kernel-update-verify.sh" "$_here/kernel-update-verify.sh"; do
+  [ -f "$_c" ] && { VERIFY_SRC="$_c"; break; }
+done
+if [ -z "$VERIFY_SRC" ]; then
+  printf '  -- omitidos los tests del verificador: no hay kernel-update-verify.sh en %s/ ni en %s/\n' "$_here" "$_here/.."
+else
 _sx() { # extrae una función del verificador
   sed -n "/^$1() {/,/^}/p" "$VERIFY_SRC"
 }
@@ -2854,6 +2868,8 @@ fi
 # Con CleanMethod=KeepCurrent, además, pacman borra de su caché el paquete
 # anterior al instalar el siguiente, y la build vive en un tmpfs que se desmonta
 # al terminar: el kernel anterior no quedaba en ninguna parte del host.
+fi
+
 printf '%s\n' "== rollback: manifiesto y paquete preservado =="
 
 RB="$ROOT/rollback"
@@ -3147,8 +3163,21 @@ if [ -r "$UKISYNC" ]; then
   # falla siempre con el error de la ESP, igual que en este equipo.
   cat > "$ROOT/signfake/sbctl" <<'SBCTLSIGN'
 #!/bin/bash
+# v27.31.43: el destino es el ULTIMO argumento, no el segundo. El motor firma con
+# 'sbctl sign --save <file>' (el flag va primero, como en sbctl), asi que con
+# ${2} este stub se comia el --save como nombre de fichero y sembraba un
+# archivo llamado '--save' en el directorio de trabajo: uno llego a commitearse
+# en el repo. Ademas lo que sbctl sign --save escribe es <file>.sig, y el motor
+# mira justamente esa seccion.
 case "${1:-}" in
-  sign)   : >> "${2:-}"; printf 'firmado\n' >> "${2:-}"; exit 0 ;;
+  sign)
+    f=""
+    for a in "$@"; do case "$a" in -*) ;; *) f="$a" ;; esac; done
+    [ -n "$f" ] || { echo "sign sin fichero" >&2; exit 2; }
+    # .sig con contenido, como la firma real: el motor mira esa seccion, y un
+    # fichero vacio no es una seccion.
+    printf 'EFI_SIGNATURE_LIST-falsa\n' > "$f.sig"; printf 'firmado\n'
+    exit 0 ;;
   verify) echo "failed to find EFI system partition" >&2; exit 1 ;;
   *) exit 0 ;;
 esac
@@ -3174,6 +3203,14 @@ SBCTLSIGN
              uki_prev_restore "$SIGNOBJ" >/dev/null 2>&1; echo "rc_restore=$?"
              echo "contenido=$(cat "$SIGNOBJ")"' \
     "$ROOT/signblk.sh" 2>/dev/null)"
+  # El flag --save va ANTES del fichero: si un consumidor lo toma por el nombre
+  # del destino acaba escribiendo un archivo llamado --save, y deja la seccion
+  # .sig sin crear, que es lo que el motor mira para saber que si se firmo.
+  if [ -s "$ROOT/signobj.efi.sig" ] && [ ! -e "$ROOT/--save" ] && [ ! -e "./--save" ]; then
+    rec ok "firma: 'sbctl sign --save <file>' trata el flag como flag y deja la seccion .sig"
+  else
+    rec fail "firma: el destino de 'sbctl sign --save' no es el fichero (--save tomado por nombre, o .sig sin crear)"
+  fi
   if printf '%s' "$res" | grep -q 'rc_firmado=0'; then
     rec ok "firma: sbctl sign OK + sbctl verify roto NO se lee como UKI sin firmar"
   else
@@ -3731,6 +3768,157 @@ PROBE4
   fi
 else
   printf '  (sin %s: se omiten los tests de initramfs/UKI)\n' "$UKISYNC"
+fi
+
+# --- v27.31.43: el hermano primero, y el staging de una run muerta no sobrevive ---
+# En producción (§33): el motor invocaba 'sudo cizen-uki-sync' por nombre
+# desnudo, así que decidía el PATH. Con la copia plana en /usr/local/bin y la
+# de la suite en kernel-update/, ganaba la que estuviera antes; la copia vieja
+# Metía el microcode Intel en crudo en la sección .ucode y la UKI arrancaba
+# degradada y en silencio. El fichero se borró, pero el despliegue de las 20:07
+# lo volvió a crear: el defecto era de código, no de disco. Aquí se fija que la
+# resolución da prioridad al HERMANO (el que se despliega con el motor) y que
+# ningún script vuelve a invocarlo por nombre desnudo.
+if [ -r "$MOTOR" ]; then
+  # a) Funcional: con un hermano disponible y OTRO cizen-uki-sync antes en el
+  #    PATH, gana el hermano.
+  mkdir -p "$ROOT/hermano" "$ROOT/path"
+  printf '#!/bin/bash\necho hermano\n' > "$ROOT/hermano/cizen-uki-sync"
+  printf '#!/bin/bash\necho path\n'    > "$ROOT/path/cizen-uki-sync"
+  chmod +x "$ROOT/hermano/cizen-uki-sync" "$ROOT/path/cizen-uki-sync"
+  sed -n '/^cizen_uki_sync_bin() {/,/^}/p' "$MOTOR" > "$ROOT/syncbin.sh"
+  if [ -s "$ROOT/syncbin.sh" ]; then
+    got="$(SCRIPT_DIR="$ROOT/hermano" PATH="$ROOT/path:$PATH" \
+           bash -c 'set -u; . "$0"; cizen_uki_sync_bin' "$ROOT/syncbin.sh" 2>/dev/null || true)"
+    if [ "$got" = "$ROOT/hermano/cizen-uki-sync" ]; then
+      rec ok "uki: con dos cizen-uki-sync, gana el HERMANO y no el del PATH"
+    else
+      rec fail "uki: la resolución no da prioridad al hermano (obtenido: '${got:-vacio}')"
+    fi
+    # b) Sin hermano, el PATH es el recurso: no se rompe la instalación a mano.
+    got2="$(SCRIPT_DIR="$ROOT/no-existe" PATH="$ROOT/path:$PATH" \
+            bash -c 'set -u; . "$0"; cizen_uki_sync_bin' "$ROOT/syncbin.sh" 2>/dev/null || true)"
+    if [ "$got2" = "$ROOT/path/cizen-uki-sync" ]; then
+      rec ok "uki: sin hermano, cae al PATH (instalación manual sigue funcionando)"
+    else
+      rec fail "uki: sin hermano no encuentra el del PATH (obtenido: '${got2:-vacio}')"
+    fi
+  else
+    rec fail "uki: el motor no tiene cizen_uki_sync_bin (la resolución por nombre desnudo vuelve)"
+  fi
+
+  # c) Estático: el punto de llamada usa la variable, no el nombre desnudo. Es
+  #    la forma exacta en que §33 se coló en producción.
+  if grep -qE '^[[:space:]]*sudo[[:space:]]+"?\$\{?UKI_SYNC_BIN' "$MOTOR" \
+     && ! grep -qE '^[[:space:]]*sudo[[:space:]]+cizen-uki-sync([[:space:]]|$)' "$MOTOR"; then
+    rec ok "uki: el motor invoca cizen-uki-sync por ruta resuelta, nunca por nombre"
+  else
+    rec fail "uki: el motor vuelve a invocar 'sudo cizen-uki-sync' por nombre (PATH puede elegir una copia vieja)"
+  fi
+
+  # d) Y que no se exija en el PATH como dependencia: si el hermano está, no
+  #    hay nada que instalar (TOOL_PKG no lo tiene, así que sería fatal).
+  if sed -n '/^check_prerequisites() {/,/^}/p' "$MOTOR" \
+       | grep -qE 'tools=\([^)]*cizen-uki-sync' ; then
+    rec fail "prereq: cizen-uki-sync sigue en la lista de tools (exige estar en el PATH)"
+  elif sed -n '/^check_prerequisites() {/,/^}/p' "$MOTOR" \
+       | grep -q 'cizen_uki_sync_bin'; then
+    rec ok "prereq: cizen-uki-sync se comprueba por SCRIPT_DIR, no como comando del PATH"
+  else
+    rec fail "prereq: no se comprueba cizen-uki-sync por SCRIPT_DIR (ni por tools ni por helper)"
+  fi
+fi
+
+if [ -r "$KROLLBACK" ]; then
+  if sed -n '/^cizen_uki_sync_bin() {/,/^}/p' "$KROLLBACK" | grep -q . \
+     && ! grep -qE '^[[:space:]]*sudo[[:space:]]+cizen-uki-sync([[:space:]]|$)' "$KROLLBACK"; then
+    rec ok "rollback: regenera la UKI con el hermano, no con el del PATH"
+  else
+    rec fail "rollback: sigue llamando a cizen-uki-sync por nombre (misma mina que §33)"
+  fi
+fi
+
+if [ -r "$UKISYNC" ]; then
+  # e) cleanup_uki_variants tiene que llevarse también el staging de una run
+  #    muerta (.cizen-prev / .cizen-tmp): son 47 MB por UKI en el ESP y solo
+  #    sirven dentro de la run que los crea (uki_prev_drop los borra al final).
+  mkdir -p "$ROOT/esp/boot/EFI/Linux" "$ROOT/esp/efi"
+  for n in "arch-linux-cizen-v3.efi" "arch-linux-cizen-v3+3.efi" \
+           "arch-linux-cizen-v3.efi.cizen-prev" "arch-linux-cizen-v3.efi.cizen-tmp" \
+           "arch-linux-cizen-v3+3.efi.cizen-prev" "arch-linux-lts.efi"; do
+    : > "$ROOT/esp/boot/EFI/Linux/$n"
+  done
+  sed -n '/^uki_efi_name() {/,/^}/p;/^cleanup_uki_variants() {/,/^}/p' "$UKISYNC" > "$ROOT/cleanup.sh"
+  CIZEN_UKI_ROOT_PREFIX="$ROOT/esp" CIZEN_UKI_NAME="arch-linux-cizen-v3.efi" CIZEN_BOOT_TRIES=0 \
+    bash -c 'set -u; SUDO=(); . "$0"; cleanup_uki_variants' "$ROOT/cleanup.sh" >/dev/null 2>&1
+  if [ -f "$ROOT/esp/boot/EFI/Linux/arch-linux-cizen-v3.efi" ]; then
+    rec ok "esp: cleanup_uki_variants conserva la UKI vigente"
+  else
+    rec fail "esp: cleanup_uki_variants borró la UKI vigente (se arrancaría sin UKI)"
+  fi
+  if [ -f "$ROOT/esp/boot/EFI/Linux/arch-linux-lts.efi" ]; then
+    rec ok "esp: cleanup_uki_variants no toca la UKI de otro kernel"
+  else
+    rec fail "esp: cleanup_uki_variants borró una UKI que no es suya"
+  fi
+  leftovers=""
+  for n in "arch-linux-cizen-v3+3.efi" "arch-linux-cizen-v3.efi.cizen-prev" \
+           "arch-linux-cizen-v3.efi.cizen-tmp" "arch-linux-cizen-v3+3.efi.cizen-prev"; do
+    [ -e "$ROOT/esp/boot/EFI/Linux/$n" ] && leftovers="$leftovers $n"
+  done
+  if [ -z "$leftovers" ]; then
+    rec ok "esp: se lleva la variante +N y el staging (.cizen-prev/.cizen-tmp) de una run muerta"
+  else
+    rec fail "esp: cleanup_uki_variants deja basura en el ESP:$leftovers"
+  fi
+
+  # v27.31.43: los *.efi.bak de la ESP. En produccion eran dos, de dos kernels
+  # distintos, y rompian 'sbctl verify' con panic (go-uefi: bytes.Buffer:
+  # truncation out of range) ademas de que el hook de pacman firmaba cada copia.
+  # El borrado es por patron GLOBAL a proposito: con el patron atado al kernel
+  # actual, el .bak del lts se queda con su panic y su firma indefinidamente.
+  # Y lo que NO se toca son los *.efi a secas, ni los de otros kernels: de ahi
+  # se arranca.
+  mkdir -p "$ROOT/esp/boot/EFI/Linux" "$ROOT/esp/efi"
+  for n in "arch-linux-cizen-v3.efi" "arch-linux-cizen-v3+3.efi" "arch-linux-lts.efi" \
+           "arch-linux-cizen-v3.efi.bak" "arch-linux-cizen-v3+3.efi.bak" \
+           "arch-linux-lts.efi.bak" "grubx64.efi" "BOOTX64.EFI"; do
+    : > "$ROOT/esp/boot/EFI/Linux/$n"
+  done
+  sed -n '/^cleanup_efi_bak_copies() {/,/^}/p' "$UKISYNC" > "$ROOT/bak.sh"
+  _bak_n=0
+  if [ -s "$ROOT/bak.sh" ]; then
+    CIZEN_UKI_ROOT_PREFIX="$ROOT/esp" CIZEN_UKI_NAME="arch-linux-cizen-v3.efi" CIZEN_BOOT_TRIES=0 \
+      bash -c 'set -u; SUDO=(); log(){ :; }; . "$0"; cleanup_efi_bak_copies' "$ROOT/bak.sh" >/dev/null 2>&1
+    _bak_n="$(find "$ROOT/esp" -type f -name '*.efi.bak' | wc -l)"
+  fi
+  # OJO: que la funcion NO exista tiene que ser un fallo explicito. Si el
+  # sed no la encuentra, el bloque no corre, no queda ningun .bak... y el
+  # `find` cuenta 0 igual que cuando barre bien: el test pasaba en vacio y no
+  # media nada. Un test que no puede fallar no es un test.
+  if [ ! -s "$ROOT/bak.sh" ]; then
+    rec fail "esp: cizen-uki-sync no tiene cleanup_efi_bak_copies (los .efi.bak se acumulan en el ESP)"
+  elif [ "$_bak_n" = 0 ] \
+     && [ -f "$ROOT/esp/boot/EFI/Linux/arch-linux-cizen-v3.efi" ] \
+     && [ -f "$ROOT/esp/boot/EFI/Linux/arch-linux-cizen-v3+3.efi" ] \
+     && [ -f "$ROOT/esp/boot/EFI/Linux/arch-linux-lts.efi" ] \
+     && [ -f "$ROOT/esp/boot/EFI/Linux/grubx64.efi" ] \
+     && [ -f "$ROOT/esp/boot/EFI/Linux/BOOTX64.EFI" ]; then
+    rec ok "esp: se lleva los *.efi.bak de CUALQUIER kernel y deja los .efi que se arrancan"
+  else
+    rec fail "esp: cleanup_efi_bak_copies deja .efi.bak ($_bak_n) o se ha comido un .efi de verdad"
+  fi
+
+  # La copia del motor tiene que hacer lo mismo: si divergen, la UKI escrita por
+  # un camino deja basura que el otro no limpia. Antes solo barria los +N.
+  if sed -n '/^cizen_uki_cleanup_efi_bak() {/,/^}/p' "$MOTOR" | grep -q "name '\*.efi.bak'" \
+     && sed -n '/^cizen_uki_cleanup_variants() {/,/^}/p' "$MOTOR" | grep -q 'cizen-prev' \
+     && sed -n '/^cizen_uki_cleanup_variants() {/,/^}/p' "$MOTOR" | grep -q 'cizen-tmp' \
+     && grep -q 'cizen_uki_cleanup_efi_bak' "$MOTOR"; then
+    rec ok "motor: su copia del desbarate barre tambien .efi.bak y el staging"
+  else
+    rec fail "motor: cizen_uki_cleanup_variants/cizen_uki_cleanup_efi_bak divergen de cizen-uki-sync"
+  fi
 fi
 
 # --- resumen ---

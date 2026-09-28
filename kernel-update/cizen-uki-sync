@@ -807,13 +807,26 @@ uki_efi_name() {
 # esto elimina cualquier +N que hubiera quedado de un build con boot counting.
 # Deduplica por inodo como find_uki_targets: /boot/efi y /boot/EFI son el mismo
 # directorio en vfat, así que sin esto cada variante se borraba dos veces.
+#
+# v27.31.43: también barre los ficheros de staging (.cizen-prev / .cizen-tmp) de
+# una run que murió antes de llegar a uki_prev_drop. Son de un uso —solo viven
+# dentro de la run que los crea, para poder restaurar la UKI anterior si la
+# nueva no se firma— y una UKI "prev" son 47 MB en el ESP: sin esto, cada run
+# muerta dejaba una copia huérfana que ni el boot ni el desbarate posterior
+# necesitan, y que un 'sbctl verify' se encuentra al recorrer el ESP. El
+# borrado va aquí, ANTES de uki_prev_stage, que es el que stagea el suyo.
+# CIZEN_UKI_ROOT_PREFIX: prefijo de las raíces, solo para poder ejercitar el
+# desbarate sin /boot (mismo criterio que CIZEN_UKI_PRESET_DIR o SBCTL_DB_FILE).
+# La lista de raíces y su ORDEN se dejan tal cual: el orden decide con qué
+# grafía se firma y /boot —el punto de montaje real— tiene que ir el primero.
 cleanup_uki_variants() {
-  local base current r f key
+  local base current r f key pfx
   local -A seen=()
+  pfx="${CIZEN_UKI_ROOT_PREFIX:-}"
   base="${CIZEN_UKI_NAME%.efi}"
   current="$(uki_efi_name)"
   for r in /boot /efi /boot/efi; do
-    [ -d "$r" ] || continue
+    [ -d "$pfx$r" ] || continue
     while IFS= read -r f; do
       [ -n "$f" ] || continue
       [ "$(basename -- "$f")" = "$current" ] && continue
@@ -823,7 +836,47 @@ cleanup_uki_variants() {
         seen[$key]="$f"
       fi
       "${SUDO[@]}" rm -f -- "$f" 2>/dev/null || true
-    done < <("${SUDO[@]}" find "$r" -maxdepth 5 -type f \( -name "${base}.efi" -o -name "${base}+*.efi" \) 2>/dev/null || true)
+    done < <("${SUDO[@]}" find "$pfx$r" -maxdepth 5 -type f \
+                \( -name "${base}.efi" -o -name "${base}+*.efi" \
+                   -o -name "${base}.efi.cizen-prev" -o -name "${base}.efi.cizen-tmp" \
+                   -o -name "${base}+*.efi.cizen-prev" -o -name "${base}+*.efi.cizen-tmp" \) \
+                2>/dev/null || true)
+  done
+}
+
+# v27.31.43: *.efi.bak del ESP. Este motor NUNCA escribe ese nombre —su copia de
+# seguridad es <uki>.cizen-prev, y el rollback completa se queda en el tarball
+# del ESP—, así que cualquier *.efi.bak es de otro: una copia manual. Y molesta
+# de dos maneras, no de una:
+#   - 'sbctl verify' recorre la ESP entera y go-uefi revienta con *panic* al
+#     parsear una: 'panic: bytes.Buffer: truncation out of range', en
+#     authenticode/checksum.go, que trunca el resto sin validar el tamaño. Medido
+#     aquí: los .efi.bak dan rc=2 (panic) y las UKI de verdad rc=0.
+#   - el hook zzz-sbctl.hook ejecuta 'sbctl sign-all -g' en CADA transacción de
+#     pacman, y sign-all firma lo que encuentra en la ESP: cada copia se
+#     firmaba, y con ella una entrada más en la base de datos de Secure Boot.
+# Se barren por patrón global y no por kernel, porque el daño no es de este
+# kernel: el .bak que hay junto a una UKI puede ser de OTRO. Si solo se
+# barriera el base actual, el .bak de, digamos, arch-linux-lts seguiría ahí, con
+# su panic y su firma, para siempre. Lo que se conserva es lo que se puede
+# arrancar: los *.efi a secas, con y sin contador.
+cleanup_efi_bak_copies() {
+  local r f key pfx
+  local -A seen=()
+  pfx="${CIZEN_UKI_ROOT_PREFIX:-}"
+  for r in /boot /efi /boot/efi; do
+    [ -d "$pfx$r" ] || continue
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      key="$("${SUDO[@]}" stat -c '%d:%i' -- "$f" 2>/dev/null || true)"
+      if [ -n "$key" ]; then
+        [ -n "${seen[$key]:-}" ] && continue
+        seen[$key]="$f"
+      fi
+      log "Borrando copia huérfana del ESP: $f"
+      "${SUDO[@]}" rm -f -- "$f" 2>/dev/null || true
+    done < <("${SUDO[@]}" find "$pfx$r" -maxdepth 5 -type f -name '*.efi.bak' \
+                2>/dev/null || true)
   done
 }
 
@@ -1118,6 +1171,10 @@ if ! cizen_uki_verify_image "$tmp" "$INITRAMFS_PATH"; then
 fi
 
 cleanup_uki_variants
+
+# Las copias *.efi.bak del ESP van aparte: no son de este kernel ni las ha
+# hecho este motor (ver cleanup_efi_bak_copies).
+cleanup_efi_bak_copies
 
 # Respaldo de lo que hay ahora mismo, antes de sobrescribirlo: si la firma
 # falla de verdad, sin esto el ESP se queda con una UKI sin firmar y el equipo no

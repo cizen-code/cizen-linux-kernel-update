@@ -1,3 +1,98 @@
+## [27.31.43] - 2026-09-27
+
+El motor llamaba a `cizen-uki-sync` por nombre desnudo, así que decidía el `PATH` — y una copia vieja en `/usr/local/bin` reenvenenaba la UKI después de cada actualización.
+
+Cuarto defecto de la misma familia (§33), encontrado al auditar por qué `sudo sbctl verify` revienta con `panic: bytes.Buffer: truncation out of range`. En producción:
+
+```
+✓ UKI escrita (atómica): /boot/EFI/Linux/arch-linux-cizen-v3.efi
+✓ Firmada con sbctl: /boot/EFI/Linux/arch-linux-cizen-v3.efi
+✓ Firmas sbctl verificadas (sbctl verify).
+```
+
+El último `✓` no significaba nada. Dos cosas distintas, y las dos importan:
+
+- **La mina de §33 volvía a estar abierta.** Se borró la copia plana de
+  `cizen-uki-sync`, pero el despliegue de las 20:07 la volvió a crear, y el
+  defecto era de código: `sudo cizen-uki-sync` sin ruta deja que el `PATH`
+  elija, así que con dos copias instaladas gana la que esté antes. La que
+  envenenaba la UKI era exactamente la que `PATH` iba a elegir.
+- **`sbctl verify` a secas no puede ser un veredicto ni una alarma.** Recorre
+  todo el ESP, exige descubrir la ESP —que en este host no encuentra
+  (§33.6)— y `go-uefi` revienta con *panic* ante cualquier PE raro que
+  encuentre por el camino: su código de salida no dice nada de esta UKI. Con
+  un `panic` siempre salía el `warn` de «ficheros sin firmar», que es ruido
+  puro, y con `ok` da un falso seguro de que todo está bien.
+
+Cambios:
+
+- **`cizen_uki_sync_bin()`** (motor y `kernel-update-rollback.sh`): resuelve
+  primero el **hermano** —el `cizen-uki-sync` que se despliega junto a cada
+  script— y el `PATH` queda solo como recurso. El mensaje de sincronización
+  dice qué binario se usó, para que no vuelva a ser una caja negra.
+- **`check_prerequisites`** deja de exigir `cizen-uki-sync` en el `PATH`
+  (`tools`) y lo comprueba con el mismo helper: que no esté en el `PATH` ya
+  no es un «falta dependencia», con `fatal` y todo.
+- **El motor se quita el `sbctl verify` global**: el veredicto de la firma lo
+  dio `sbctl sign --save` (que no devuelve 0 si no firmó) más la sección
+  `.sig`, dentro de `cizen-uki-sync`. Se deja una `info` con la orden de
+  revisarlo a mano, sin convertir ruido en alarma.
+- **`cleanup_uki_variants()`** se lleva también el *staging* de una run que
+  murió antes de `uki_prev_drop()`: `<uki>.cizen-prev` y `<uki>.cizen-tmp`
+  (del UKI plano y de las variantes `+N`). Son de un uso —solo viven dentro de
+  la run que los crea, para poder restaurar la UKI anterior si la nueva no se
+  firma— y **47 MB por UKI en el ESP**: cada run muerta dejaba una copia
+  huérfana que ni el boot ni el desbarate posterior necesitan.
+  `CIZEN_UKI_ROOT_PREFIX` (solo para los tests) permite ejercitarlo sin `/boot`
+  sin tocar la lista de raíces ni su orden, que decide con qué grafía se firma.
+- **El harness seaba a sí mismo de rojo**: `VERIFY_SRC` se calculaba como
+  `$(dirname $0)/../kernel-update-verify.sh`, o sea que **asumía que vivía en
+  `tests/`**. En `/usr/local/bin/kernel-update/` hay una copia plana del
+  harness, y desde ahí `..` es `/usr/local/bin`: los **31 tests del verificador**
+  fallaban todos sin un solo defecto detrás. Mismo disease que §33 —una
+  duplicación que decide por ella misma—, y el mismo remedio ya usado aquí:
+  se buscan los dos layouts, y si el verificador no está en ninguno se
+  **omite el bloque diciendo por qué** en vez de sembrar 31 rojos. Un test que
+  solo puede pasar en uno de los dos layouts no mide nada: entrena a ignorar
+  los que fallan.
+- **`*.efi.bak` en el ESP: 72 MB, dos firmados «OK» y dos pánicos.** Al
+  Auditar el panic de `sbctl verify` (§ más abajo) salieron a la luz dos ficheros
+  `*.efi.bak` en `EFI/Linux/`, uno por kernel. No los había puesto el motor —su
+  respaldo es `<uki>.cizen-prev` y el paquete de rollback se queda en el
+  tarball—: eran copias manuales. Hacían daño de dos maneras, no de una:
+  - `sbctl verify` recorre la ESP entera y **go-uefi revienta con `panic`**
+    (`bytes.Buffer: truncation out of range`, `authenticode/checksum.go`, que
+    trunca el resto sin validar el tamaño). Medido: los `.efi.bak` dan **rc=2**,
+    las UKI de verdad **rc=0**. Y `arch-linux-cizen-v3.efi.bak` mide 43
+    caracteres: la ruta exacta de la traza.
+  - el hook `zzz-sbctl.hook` corre **`sbctl sign-all -g` en cada transacción de
+    pacman**, y `sign-all` firma lo que encuentra en la ESP: cada copia firmaba,
+    y con ella una entrada más en la base de datos de Secure Boot.
+
+  `cleanup_efi_bak_copies()` (en `cizen-uki-sync`) y
+  `cizen_uki_cleanup_efi_bak()` (la copia del motor) barren `*.efi.bak` **por
+  patrón global, no por kernel actual**: el `.bak` del lts sufría el mismo
+  panic y la misma firma si solo se barriera el base del kernel que compila. Se
+  conservan los `*.efi` a secas, con y sin contador: son los que se arrancan.
+  Y de paso, la copia del motor **dejaba de barrer su propio staging** —crea
+  `.cizen-prev`/`.cizen-tmp` ella misma y solo limpiaba los `+N`, así que cada
+  run muerta dejaba 47 MB—: ahora barren las dos cosas, con un test que falla si
+  las dos implementaciones divergen.
+- **El harness firmaba en un archivo llamado `--save`.** El `sbctl` de mentira
+  tomaba `${2}` como nombre de fichero, pero el motor firma con
+  `sbctl sign --save <file>`: el flag va **primero**, así que el stub firmaba en
+  `--save` y sembraba ese archivo en el directorio de trabajo. No era teoría: uno
+  de esos archivos entró en el commit `7842a89` con once líneas `firmado`, y
+  `git status` lo enseñaba como `M` porque cada ejecución del selftest lo
+  re-creaba. Ahora el destino es el último argumento no-flag y lo que se
+  escribe es `<file>.sig` —que es justo lo que el motor mira después—, más un
+  test que falla si aparece un `--save` o si la `.sig` no existe.
+
+Tests: 7 nuevos (resolución hermano-primero con dos `cizen-uki-sync` en el
+`PATH`, *fallback* al `PATH`, llamada por ruta resuelta, prerrequisitos,
+rollback, y los tres del desbarate). Selftest **392→399, 0 fail**; en **rojo**
+contra la v27.31.42 instalada: **393 ok, 5 fail**.
+
 ## [27.31.42] - 2026-09-27
 
 Un `sbctl verify` que no encuentra la ESP se estaba tomando por una UKI sin firmar — y el script llegaba a decir «el sistema no arrancaría» sobre una UKI correctamente firmada.

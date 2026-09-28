@@ -136,7 +136,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.42"
+SCRIPT_VERSION="27.31.43"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -146,6 +146,20 @@ LEGACY_PKGBASE="linux-upstream"
 
 RENAME_MAP_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/kernel-update/rename-map.conf"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# Cuál cizen-uki-sync es "el de esta instalación" (v27.31.43).
+# El motor lo invoca por nombre desnudo (sudo cizen-uki-sync) y eso deja que
+# decida el PATH: con la copia plana en /usr/local/bin y la de la suite en
+# kernel-update/, gana la que esté antes, y una copia vieja reenvenenaba la UKI
+# después de cada actualización (§33) — el UKI arrancaba degradado y en
+# silencio. Se resuelve primero el HERMANO, que es el que se despliega junto a
+# este script, y el PATH queda solo como recurso.
+cizen_uki_sync_bin() {
+  if [ -x "$SCRIPT_DIR/cizen-uki-sync" ]; then
+    printf '%s\n' "$SCRIPT_DIR/cizen-uki-sync"
+    return 0
+  fi
+  command -v cizen-uki-sync 2>/dev/null || true
+}
 # Config base persistente (linux-<versión>-cizen-v3.config): por defecto junto
 # a los perfiles, dentro de la propia suite. Debe ser escribible por el usuario
 # que compila (se promueve tras un build/check exitoso).
@@ -1757,7 +1771,7 @@ require_cc_toolchain() {
 
 check_prerequisites() {
   local cmd pkg rc
-  local -a tools=(awk bash bc bison cat ccache cmp cp cpio date dd df du find findmnt flex flock fuser grep gcc gpg head id ls make mktemp mount nproc objdump pacman pahole perl rm sbctl sed sleep sort stat tar tr umount wget xargs xz timeout cizen-uki-sync)
+  local -a tools=(awk bash bc bison cat ccache cmp cp cpio date dd df du find findmnt flex flock fuser grep gcc gpg head id ls make mktemp mount nproc objdump pacman pahole perl rm sbctl sed sleep sort stat tar tr umount wget xargs xz timeout)
   local -a missing_cmds=() missing_pkgs=()
 
   # Compilador de preferencia: su toolchain va a la MISMA lista que el resto de
@@ -1780,6 +1794,14 @@ check_prerequisites() {
       fatal "Falta dependencia sin paquete Arch asociado: $cmd (instálala manualmente y reintenta)."
     fi
   done
+
+  # cizen-uki-sync se busca por SCRIPT_DIR (el hermano que se despliega con
+  # esta suite) y no por el PATH (v27.31.43): que no esté en el PATH ya no es un
+  # problema, así que su ausencia no puede ser un "falta dependencia", y su
+  # presencia en el PATH tampoco puede ser la voz que decide (§33).
+  if [ -z "$(cizen_uki_sync_bin)" ]; then
+    fatal "No encuentro cizen-uki-sync ni en $SCRIPT_DIR ni en el PATH (reinstala la suite, que lo despliega junto al motor)."
+  fi
 
   # sudo no puede autoinstalarse (ni funcionaría sin él): si falta, se aborta
   # con instrucciones, igual que siempre.
@@ -7862,6 +7884,14 @@ cizen_uki_efi_name() {
 # Limpia variantes antiguas de la UKI (nombre plano bendecido por
 # systemd-bless-boot y contadores pendientes de boots previos) para que tras
 # cada build solo quede la del kernel actual.
+#
+# v27.31.43: esta copia del motor barren también el staging (.cizen-prev /
+# .cizen-tmp) que ella misma crea más abajo, y una función aparte para los
+# *.efi.bak. Antes solo barria los +N, y el staging que escribe en 8636/8793 se
+# le quedaba cada vez que una run moría antes de llegar al drop: 47 MB por UKI
+# en el ESP, y son PE que 'sbctl verify' recorre y con los que go-uefi revienta
+# con panic. Es la misma función que hace cizen-uki-sync; si se toca una, se
+# tocan las dos.
 cizen_uki_cleanup_variants() {
     local base current r f key
     local -A seen=()
@@ -7878,7 +7908,36 @@ cizen_uki_cleanup_variants() {
                 seen[$key]="$f"
             fi
             sudo rm -f -- "$f" 2>/dev/null || true
-        done < <(sudo find "$r" -maxdepth 5 -type f \( -name "${base}.efi" -o -name "${base}+*.efi" \) 2>/dev/null || true)
+        done < <(sudo find "$r" -maxdepth 5 -type f \( -name "${base}.efi" -o -name "${base}+*.efi" \
+                   -o -name "${base}.efi.cizen-prev" -o -name "${base}.efi.cizen-tmp" \
+                   -o -name "${base}+*.efi.cizen-prev" -o -name "${base}+*.efi.cizen-tmp" \) 2>/dev/null || true)
+    done
+}
+
+# Las copias *.efi.bak de la ESP. Este motor nunca escribe ese nombre: su
+# respaldo es <uki>.cizen-prev, y el paquete de rollback se queda en el tarball.
+# Asi que un *.efi.bak es siempre de otro, y estorba de dos maneras: 'sbctl
+# verify' recorre la ESP y go-uefi hace panic al parsear una (bytes.Buffer:
+# truncation out of range, authenticode/checksum.go), y el hook zzz-sbctl.hook
+# corre 'sbctl sign-all -g' en cada transaccion de pacman, que firma cada copia
+# y le anade una entrada en la DB de Secure Boot. Por patron global, no solo
+# las del kernel actual: el .bak de otro kernel sufre lo mismo. Se conservan
+# solo los *.efi a secas, que son los que se pueden arrancar.
+cizen_uki_cleanup_efi_bak() {
+    local r f key
+    local -A seen=()
+    for r in /boot /efi /boot/efi; do
+        [ -d "$r" ] || continue
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            key="$(sudo stat -c '%d:%i' -- "$f" 2>/dev/null || true)"
+            if [ -n "$key" ]; then
+                [ -n "${seen[$key]:-}" ] && continue
+                seen[$key]="$f"
+            fi
+            log "Borrando copia huerfana del ESP: $f"
+            sudo rm -f -- "$f" 2>/dev/null || true
+        done < <(sudo find "$r" -maxdepth 5 -type f -name '*.efi.bak' 2>/dev/null || true)
     done
 }
 
@@ -8607,6 +8666,7 @@ sync_cizen_efi() {
     fi
 
     cizen_uki_cleanup_variants
+    cizen_uki_cleanup_efi_bak
 
     # Copia de trabajo de lo que hay ahora, antes de sobrescribirlo. La firma va
     # después de escribir (tiene que inscribir la ruta final en la BD de sbctl),
@@ -10915,15 +10975,24 @@ uki_backup_prev
 # Auditoría de disco cifrado (opción --luks-audit): avisa antes de regenerar el
 # UKI si la raíz LUKS no tiene parámetros de desbloqueo en el cmdline.
 luks_fde_audit
-sudo cizen-uki-sync "${UKI_SYNC_ARGS[@]}"
+UKI_SYNC_BIN="$(cizen_uki_sync_bin)"
+if [ -z "$UKI_SYNC_BIN" ]; then
+  fatal "No encuentro cizen-uki-sync ni en $SCRIPT_DIR ni en el PATH."
+fi
+sudo "$UKI_SYNC_BIN" "${UKI_SYNC_ARGS[@]}"
 ensure_cizen_efi_updated
 ok "UKI sincronizado"
 if [ "$DO_SIGN_UKI" = true ]; then
-  if sudo sbctl verify >/dev/null 2>&1; then
-    ok "Firmas sbctl verificadas (sbctl verify)."
-  else
-    warn "sbctl verify detecta ficheros sin firmar; repásalos antes de habilitar Secure Boot: sudo sbctl verify"
-  fi
+  # El veredicto de la firma ya lo dio cizen-uki-sync: 'sbctl sign --save', que
+  # no devuelve 0 si no firmó, más la comprobación de la sección .sig. Un
+  # 'sbctl verify' a secas NO puede ser un segundo veredicto ni un aviso de
+  # "sin firmar": recorre todo el ESP, exige descubrir la ESP —que en este
+  # equipo no encuentra (§33.6)— y go-uefi revienta con panic ante cualquier PE
+  # raro que encuentre por el camino, así que su fallo no dice nada de esta UKI
+  # (§33.9, y la lección de §31.15: un verificador que juzga la salida de otro
+  # programa tiene que reusar sus mismos criterios). Se deja como referencia
+  # para revisarlo a mano, sin convertir ruido en alarma.
+  info "Firmas: el veredicto lo dio 'sbctl sign' (ver arriba). Revisión manual: sudo sbctl verify"
 fi
 FULL_PIPELINE_OK=true
 

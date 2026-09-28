@@ -36,6 +36,18 @@ ROLLBACK_DIR="${CIZEN_ROLLBACK_DIR:-/var/lib/kernel-update/rollback}"
 MANIFEST="$ROLLBACK_DIR/rollback.info"
 # No hay comando `krollback` en el PATH: los mensajes usan la ruta real.
 SELF="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)"
+# Cuál cizen-uki-sync es el de esta instalación, por el mismo motivo que en el
+# motor (v27.31.43): el hermano primero. Invocado por nombre desnudo, el PATH
+# puede elegir una copia plana vieja en /usr/local/bin, y esa regeneraba la UKI
+# con el microcode en crudo —el UKI arrancaba degradado y en silencio (§33)—.
+cizen_uki_sync_bin() {
+  if [ -x "$SCRIPT_DIR/cizen-uki-sync" ]; then
+    printf '%s\n' "$SCRIPT_DIR/cizen-uki-sync"
+    return 0
+  fi
+  command -v cizen-uki-sync 2>/dev/null || true
+}
 DO_LIST=false
 DO_RESTORE=false
 ASSUME_YES=false
@@ -196,17 +208,18 @@ restore_package() {  # plan A: reinstalar el paquete
 
   # El UKI en el ESP sigue apuntando al kernel que se acaba de sustituir: sin
   # regenerarlo, reiniciar volvería a arrancar el kernel nuevo.
-  if command -v cizen-uki-sync >/dev/null 2>&1; then
+  UKI_SYNC_BIN="$(cizen_uki_sync_bin)"
+  if [ -n "$UKI_SYNC_BIN" ]; then
     ok "Regenerando el UKI para que apunte al kernel restaurado ..."
-    if sudo cizen-uki-sync; then
+    if sudo "$UKI_SYNC_BIN"; then
       ok "UKI regenerada."
     else
       warn "cizen-uki-sync falló. El UKI puede seguir apuntando al kernel nuevo."
-      warn "Repásalo con:  sudo cizen-uki-sync"
+      warn "Repásalo con:  sudo $UKI_SYNC_BIN"
     fi
   else
-    warn "cizen-uki-sync no está en PATH: el UKI puede seguir apuntando al"
-    warn "kernel nuevo. Regenera la UKI antes de reiniciar."
+    warn "cizen-uki-sync no está ni en $SCRIPT_DIR ni en el PATH: el UKI puede"
+    warn "seguir apuntando al kernel nuevo. Regenera la UKI antes de reiniciar."
   fi
 
   echo
