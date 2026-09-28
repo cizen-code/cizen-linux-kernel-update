@@ -1,3 +1,42 @@
+## [27.31.47] - 2026-09-28
+
+Arregla un flake del propio harness (`tests/selftest.sh`), no del motor ni de
+`sched-bench.sh`: el test de la medición degenerada dependía de la carga del
+equipo y salía en rojo durante las builds de kernel. Estado: **418 ok, 0 fail**
+(era 418 ok, 1 fail de forma intermitente).
+
+- **Qué pasaba.** El test simula "no se midió nada" de la única forma que se le
+  ocurrió: meter un `sha256sum` falso en el `PATH` que hace `exit 0` sin leer.
+  Pero lo que el banco cronometra es `bucle()`, que solo invoca a `sha256sum`; al
+  falsearlo, lo único que queda por medir es **la latencia de arranque del
+  proceso**, que aquí es de 3-4 ms. El suelo del guard es
+  `SIZE_MB*ITERS/4` = `20*1/4` = **5 ms**. Es decir, el test comparaba 3-4 ms
+  contra 5 ms: un margen de 1-2 ms, y con una build de kernel a 4 hilos
+  (load 5,5 en 4 núcleos) la medición se pasaba el suelo, el guard no disparaba,
+  el banco escribía la fila y el test se ponía rojo. En vez de una comprobación
+ fallen, era una moneda al aire.
+- **Por qué el suelo estaba mal calibrado para el caso**: el comentario del
+  guard razona que 0,25 ms/MB son ~4 GB/s, "diez veces más rápido que lo
+  físicamente posible" porque `sha256sum` va a ~400 MB/s. Ese razonamiento es
+  correcto para una medición real (20 MB de SHA-256 ≈ 50 ms contra un suelo de
+  5 ms, margen de sobra) y falso para el stub, que no lee nada. El suelo nunca
+  se calibró contra la medición que el test realmente provoca.
+- **Arreglo**: además del `sha256sum` nulo, se congela también el reloj con un
+  `date` falso de salida constante. Así toda medición vale exactamente 0 ms y el
+  "no pasó tiempo" que el propio guard describe en su comentario se reproduce de
+  forma **exacta y determinista**, en vez de por medio de una latencia de proceso
+  que depende de la carga. `date` solo se usa en `ms()` (el reloj) y en la
+  cabecera `fecha` del histórico, que está *después* del guard, así que en esta
+  ruta nunca se llega a la segunda.
+- **La pareja positiva ya existía** y se queda: `una medición diminuta pero real
+  sí se anota` (20 MB de SHA-256 de verdad contra el suelo de 5 ms) sigue
+  comprobando que el guard no se ha vuelto un guard que siempre suena.
+- **Verificado**: con el método viejo, tres ejecuciones seguidas bajo carga dan
+  `rc=0,1` ficheros / `rc=1,1` fichero / `rc=0,1` fichero (indeterminista, que
+  es justo el flake). Con el reloj fijo, las tres dan `rc=1, 0` ficheros. Selftest
+  completo: 418 ok / 0 fail. `shellcheck` sin deltas en el harness (sigue el
+  aviso preexistente SC1072/SC1073 de la línea 3465, documentado en §32.12).
+
 ## [27.31.46] - 2026-09-28
 
 Fix del overlay de LTO introducido en v27.31.45: el motor se contradecía a sí

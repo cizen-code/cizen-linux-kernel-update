@@ -2051,11 +2051,24 @@ if [ -r "$BENCH" ]; then
     rec fail "banco: --resumen no filtra las filas con iteraciones 0 (n/desc/medianas: '$resumen_fila')"
   fi
 
-  # Red de seguridad al escribir: con ITERS>=1 y 20 MB no se puede medir en 2 ms
-  # (el suelo son ~4 GB/s). Tiene que salir con rc=1 SIN dejar fila; si anota, el
-  # histórico se pudre por dentro aunque el --resumen la filtrara después.
+  # Red de seguridad al escribir: si no se midió nada, no se anota. Tiene que salir
+  # con rc=1 SIN dejar fila; si anota, el histórico se pudre por dentro aunque el
+  # --resumen la filtrara después.
+  #
+  # Aquí se congela ALSO el reloj, y es lo que hace el test determinista. Con solo
+  # el sha256sum nulo, lo que se mide es la latencia de arranque del proceso: aquí
+  # 3-4 ms contra un suelo de 5 ms (20 MB x 1 vuelta / 4). Un margen de 1-2 ms, así
+  # que basta con que haya una build de kernel corriendo para que la medición se
+  # pase el suelo, el guard no dispare y el test se ponga rojo. El suelo está
+  # calibrado para el caso REAL (sha256sum leyendo 20 MB a ~400 MB/s), no para el
+  # stub, que no lee nada: por eso el reloj fijo, que reproduce el "no pasó tiempo"
+  # que el propio guard describe en su comentario, y no una latencia de proceso.
   STUB="$ROOT/stub-sin-hash"; mkdir -p "$STUB"
   printf '#!/bin/sh\nexit 0\n' > "$STUB/sha256sum"; chmod +x "$STUB/sha256sum"
+  # date solo se usa en ms() (reloj de la medición) y en la cabecera 'fecha' del
+  # histórico, que está DESPUÉS del guard: aquí nunca se llega. Salida constante
+  # -> toda medición vale 0 ms -> guard siempre.
+  printf '#!/bin/sh\necho 1000000000000\n' > "$STUB/date"; chmod +x "$STUB/date"
   BD2="$ROOT/bench-degenerado"; mkdir -p "$BD2"
   PATH="$STUB:$PATH" CIZEN_VERIFY_STATE_DIR="$BD2" SCHED_BENCH_SIZE_MB=20 \
     SCHED_BENCH_ITERS=1 SCHED_BENCH_REPS=1 SCHED_BENCH_LOAD_N=1 \
