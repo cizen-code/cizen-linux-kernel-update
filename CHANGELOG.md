@@ -105,6 +105,10 @@ mismo y toda build con Thin/Full-LTO moría en validación. Estado: **417 ok,
   equipo lo ha interrumpido, no es un fallo del banco"*) y no tiene relación con
   este cambio: comprobado que da idéntico `rc=0, 1 fichero` contra el árbol de
   v27.31.45. Con la máquina tranquila sale verde.
+  **Corregido en [27.31.47]** (la causa real era que el test cronometraba la
+  latencia de arranque del `sha256sum` falso contra ese mismo suelo, con un
+  margen de 1-2 ms). Se deja aquí el síntoma porque es donde se cita por
+  primera vez; el arreglo y su explicación están en 27.31.47.
 
 ## [27.31.45] - 2026-09-27
 
