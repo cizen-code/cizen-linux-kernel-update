@@ -857,6 +857,63 @@ secure_boot_active() {
   [ "$val" = "1" ]
 }
 
+# ¿Tiene el fichero una firma embebida? 0=sí 1=no 2=no se puede comprobar.
+# Un fichero firmado por sbctl (osslsigncode) mete la firma en el certificado PE,
+# y binutils lo representa como sección .sig al listar. OJO: esto es una
+# comprobación de APOYO, no el veredicto. Lo que decide si la UKI está firmada es
+# el código de salida de 'sbctl sign', que no devuelve 0 si no firmó. Aquí solo
+# se informa, porque no se ha podido comprobar contra una UKI real de este
+# equipo (/boot es 0077) que la versión de binutils liste siempre .sig, y una
+# una suposición errada cumplida por un guard que además restaura UKIs es mala
+# idea.
+#   0 = sí  1 = no  2 = no se puede comprobar (sin objdump)
+uki_has_sig_section() {
+  [ -s "$1" ] || return 1
+  command -v objdump >/dev/null 2>&1 || return 2
+  objdump -h "$1" 2>/dev/null | grep -qE '[.][sS][iI][gG]'
+}
+
+# Firma en la ruta FINAL, no en el temporal de /tmp: 'sbctl sign --save' inscribe
+# esa ruta en /var/lib/sbctl/files.json, y una entrada que apunte a un temporal
+# ya borrado es exactamente la que tumbaba pacman (§32.4). Por eso la firma va
+# después de escribir, y por eso hace falta respaldo: si de verdad no se puede
+# firmar, se restaura la UKI anterior en vez de dejar sin firmar la del ESP.
+uki_prev_stage() {
+  local t
+  for t in "$@"; do
+    if "${SUDO[@]}" test -f "$t"; then
+      "${SUDO[@]}" cp -f -- "$t" "$t.cizen-prev" 2>/dev/null || \
+        warn "No pude respaldar la UKI anterior: $t"
+    fi
+  done
+  return 0
+}
+
+uki_prev_restore() {
+  local t r=0
+  for t in "$@"; do
+    if "${SUDO[@]}" test -f "$t.cizen-prev"; then
+      if "${SUDO[@]}" cp -f -- "$t.cizen-prev" "$t.cizen-tmp" && \
+         "${SUDO[@]}" mv -f -- "$t.cizen-tmp" "$t"; then
+        ok "UKI anterior restaurada (la nueva no se pudo firmar): $t"
+      else
+        err "No pude restaurar la UKI anterior: $t"
+        r=1
+      fi
+      "${SUDO[@]}" rm -f -- "$t.cizen-prev" 2>/dev/null || true
+    fi
+  done
+  return "$r"
+}
+
+uki_prev_drop() {
+  local t
+  for t in "$@"; do
+    "${SUDO[@]}" rm -f -- "$t.cizen-prev" 2>/dev/null || true
+  done
+  return 0
+}
+
 sign_uki_targets() {
   local t fail=0
   [ -n "$SBCTL_BIN" ] || { warn "sbctl no está instalado; no se puede firmar la UKI."; return 1; }
@@ -871,16 +928,21 @@ sign_uki_targets() {
       fail=1
     fi
   done
+  # Aquí está el veredicto. 'sbctl sign' no devuelve 0 si no firmó, así que
+  # llegar hasta aquí con fail=0 significa que la UKI está firmada; lo que viene
+  # después es solo comprobación de apoyo y NUNCA convierte un firmado en un fallo.
   [ "$fail" -eq 0 ] || return 1
   for t in "$@"; do
-    if "${SUDO[@]}" sbctl verify "$t" >/dev/null 2>&1; then
-      ok "Firma verificada: $t"
+    if uki_has_sig_section "$t"; then
+      ok "Sección .sig presente en la UKI: $t"
     else
-      err "La verificación de la firma falló: $t"
-      fail=1
+      warn "No veo la sección .sig en $t (sbctl sign dijo que firmó; puede ser que este binutils no la liste)."
+    fi
+    if ! "${SUDO[@]}" sbctl verify "$t" >/dev/null 2>&1; then
+      warn "sbctl verify no pudo confirmar la firma de $t; en este host no encuentra la ESP (§33.6), así que su fallo no es un veredicto."
     fi
   done
-  return "$fail"
+  return 0
 }
 
 # Claves sbctl ya generadas (sbctl create-keys). Firmar sin claves fallaría.
@@ -1057,6 +1119,11 @@ fi
 
 cleanup_uki_variants
 
+# Respaldo de lo que hay ahora mismo, antes de sobrescribirlo: si la firma
+# falla de verdad, sin esto el ESP se queda con una UKI sin firmar y el equipo no
+# arranca. Con esto se restaura la anterior, que sí arrancaba.
+uki_prev_stage "${targets[@]}"
+
 for t in "${targets[@]}"; do
   log "Actualizando .efi: $t"
   if ! "${SUDO[@]}" mkdir -p "$(dirname "$t")"; then
@@ -1087,10 +1154,20 @@ if [ "$DO_SIGN" = true ]; then
     fi
     warn "No hay claves sbctl (sudo sbctl create-keys): la UKI queda sin firmar por ahora."
   elif ! sign_uki_targets "${targets[@]}"; then
+    # Firmar va después de escribir (la firma tiene que inscribir la ruta final
+    # en la BD de sbctl), así que a estas alturas el ESP ya tiene la UKI nueva.
+    # Si no tiene firma de verdad, se vuelve a la anterior antes de morir: es
+    # preferible arrancar con la UKI de ayer que no arrancar.
     if secure_boot_active; then
+      if uki_prev_restore "${targets[@]}"; then
+        fatal "Secure Boot ACTIVO y la UKI nueva no se pudo firmar: he restaurado la anterior, que sí estaba firmada. Revisa sbctl (sbctl sign / sbctl enroll-keys --microsoft)."
+      fi
       fatal "La UKI no quedó firmada con Secure Boot ACTIVO: el sistema no arrancaría. Revisa sbctl (sbctl sign / sbctl enroll-keys --microsoft)."
     fi
+    uki_prev_restore "${targets[@]}" || true
     fatal "No se pudo firmar la UKI (sbctl sign/verify falló)."
+  else
+    uki_prev_drop "${targets[@]}"
   fi
 fi
 

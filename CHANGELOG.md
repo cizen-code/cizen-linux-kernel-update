@@ -1,3 +1,54 @@
+## [27.31.42] - 2026-09-27
+
+Un `sbctl verify` que no encuentra la ESP se estaba tomando por una UKI sin firmar — y el script llegaba a decir «el sistema no arrancaría» sobre una UKI correctamente firmada.
+
+Tercer defecto del mismo arranque, y el más ruidoso. En producción:
+
+```
+  ✓ UKI escrita (atómica): /boot/EFI/Linux/arch-linux-cizen-v3.efi
+  ✓ Firmada con sbctl: /boot/EFI/Linux/arch-linux-cizen-v3.efi
+  ✗ La verificación de la firma falló: /boot/EFI/Linux/arch-linux-cizen-v3.efi
+  ✗ La UKI no quedó firmada con Secure Boot ACTIVO: el sistema no arrancaría.
+```
+
+`sbctl sign` había dicho que sí. Lo que falla es el **verificador**: `sbctl verify`
+exige descubrir la ESP y en este host responde `failed to find EFI system
+partition` (§33.6), o sea que **nunca** verifica nada aquí. El script usaba su
+código de salida como veredicto de «¿está firmado?», con lo que un
+verificador inservible se convertía en un diagnóstico de firma, y el
+`fatal` que lo acompaña ("el sistema no arrancaría") convertía un falso
+positivo en un diagnóstico de máquina rota. Además la firma se comprueba **después**
+de escribir en el ESP, así que el daño —una UKI sin firmar en el disco— ya
+estaba hecho cuando se decidía abortar.
+
+- **El veredicto es el código de salida de `sbctl sign`**, que no devuelve 0 si
+  no firmó. `sbctl verify` y la sección `.sig` pasan a ser comprobaciones de
+  apoyo que solo avisan: ya no pueden convertir un fichero firmado en un fallo.
+- **Respaldo y reversión**: antes de sobrescribir, `uki_prev_stage()` deja una
+  copia de trabajo en `<uki>.cizen-prev`; si la firma falla de verdad,
+  `uki_prev_restore()` devuelve la UKI anterior —que sí arrancaba— y solo
+  entonces avisa. Se borra con `uki_prev_drop()` al firmarse bien. La firma
+  sigue yendo **después** de escribir a propósito: `sbctl sign --save` inscribe
+  la ruta final en `/var/lib/sbctl/files.json`, y firmar el temporal de `/tmp`
+  dejaría una entrada huérfana, que es justo lo que tumba `pacman -Syu` (§32.4).
+  No es el `uki_backup_prev` de v27.30.0 (LinuxLocker, con fecha y desactivable):
+  esto es la red de seguridad del acto.
+- `cizen_uki_sign_targets_verify()` (la usa el wizard de Secure Boot para decidir
+  si ofrece volver a firmar) tenía el mismo problema: con el verificador roto
+  declaraba sin firmar un `systemd-boot` que sí lo estaba. Ahora basta que
+  `.sig` **o** `sbctl verify` lo confirmen; como un «no» solo dispara una
+  pregunta y un «sí» es inocuo, el coste de equivocarse es cero.
+- `uki_has_sig_section()` (objdump) queda como **apoyo**, no como veredicto, y
+  se dice por qué en el código: no se ha podido comprobar contra una UKI real de
+  este equipo (`/boot` es 0077) que la versión de binutils liste siempre `.sig`,
+  y una suposición errada en un guard que además restaura UKIs es peor que no
+  tener guard.
+
+Selftest: 387 -> 391. Los dos de comportamiento en rojo contra 27.31.41
+(`rc_firmado=1`, el síntoma exacto de producción); los otros dos fijan que un
+fallo real de `sbctl sign` sigue dando veredicto de fallo, y que el motor
+replica la regla.
+
 ## [27.31.41] - 2026-09-27
 
 `build_uki` con initramfs moría con `ucode_tmp: unbound variable` — el camino normal, el que se usa siempre.

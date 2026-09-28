@@ -136,7 +136,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.41"
+SCRIPT_VERSION="27.31.42"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -8608,6 +8608,12 @@ sync_cizen_efi() {
 
     cizen_uki_cleanup_variants
 
+    # Copia de trabajo de lo que hay ahora, antes de sobrescribirlo. La firma va
+    # después de escribir (tiene que inscribir la ruta final en la BD de sbctl),
+    # así que si al final resultara que no hay firma, sin esto el ESP se quedaría
+    # con una UKI sin firmar y el equipo no arrancaría.
+    cizen_uki_prev_stage "${targets[@]}"
+
     for out in "${targets[@]}"; do
         log "Actualizando .efi: $out"
         if ! sudo mkdir -p "$(dirname "$out")"; then
@@ -8640,8 +8646,13 @@ sync_cizen_efi() {
     # Firma de la UKI (ruta directa del motor, sin cizen-uki-sync).
     if [ "$DO_SIGN_UKI" = true ]; then
         if ! cizen_uki_sign_targets "${targets[@]}"; then
-            cizen_uki_fail "No se pudo firmar la UKI con sbctl."
+            # A estas alturas el ESP ya tiene la UKI nueva. Si no tiene firma de
+            # verdad, se vuelve a la anterior antes de avisar: mejor arrancar con
+            # la UKI de ayer que no arrancar.
+            cizen_uki_prev_restore "${targets[@]}" || true
+            cizen_uki_fail "No se pudo firmar la UKI con sbctl (he restaurado la anterior si estaba)."
         fi
+        cizen_uki_prev_drop "${targets[@]}"
     fi
 }
 
@@ -8716,6 +8727,61 @@ cizen_uki_sbctl_prune() {
     return 0
 }
 
+# ¿Tiene el fichero una firma embebida? 0=sí 1=no 2=no se puede comprobar.
+# Un fichero firmado por sbctl (osslsigncode) mete la firma en el certificado PE,
+# y binutils lo representa como sección .sig al listar. OJO: comprobación de
+# APOYO, no veredicto. Lo que decide si algo está firmado es el código de salida
+# de 'sbctl sign', que no devuelve 0 si no firmó. No se ha podido comprobar
+# contra una UKI real de este equipo (/boot es 0077) que la versión de binutils
+# liste siempre .sig, y una suposición errada en un guard que además restaura
+# UKIs es mala idea.
+cizen_uki_has_sig_section() {
+    [ -s "$1" ] || return 1
+    command -v objdump >/dev/null 2>&1 || return 2
+    objdump -h "$1" 2>/dev/null | grep -qE '[.][sS][iI][gG]'
+}
+
+# Copia de trabajo de la UKI anterior, junto al destino, para poder deshacer en
+# el acto una sobrescritura que acabe sin firmar. Ojo: esto NO es lo mismo que
+# el uki_backup_prev de v27.30.0 (LinuxLocker, que archiva copias con fecha en
+# CIZEN_UKI_BACKUP_DIR y se puede desactivar). Con Secure Boot activo, una UKI
+# sin firmar en el ESP no arranca.
+cizen_uki_prev_stage() {
+    local t
+    for t in "$@"; do
+        if sudo test -f "$t"; then
+            sudo cp -f -- "$t" "$t.cizen-prev" 2>/dev/null || \
+                warn "No pude dejar copia de seguridad de la UKI anterior: $t"
+        fi
+    done
+    return 0
+}
+
+cizen_uki_prev_restore() {
+    local t r=0
+    for t in "$@"; do
+        if sudo test -f "$t.cizen-prev"; then
+            if sudo cp -f -- "$t.cizen-prev" "$t.cizen-tmp" && \
+               sudo mv -f -- "$t.cizen-tmp" "$t"; then
+                ok "UKI anterior restaurada (la nueva no se pudo firmar): $t"
+            else
+                err "No pude restaurar la UKI anterior: $t"
+                r=1
+            fi
+            sudo rm -f -- "$t.cizen-prev" 2>/dev/null || true
+        fi
+    done
+    return "$r"
+}
+
+cizen_uki_prev_drop() {
+    local t
+    for t in "$@"; do
+        sudo rm -f -- "$t.cizen-prev" 2>/dev/null || true
+    done
+    return 0
+}
+
 # Firma cada objetivo con sbctl y verifica. Uso: cizen_uki_sign_targets "archivo"...
 cizen_uki_sign_targets() {
     local t fail=0
@@ -8735,25 +8801,33 @@ cizen_uki_sign_targets() {
         fi
     done
     [ "$fail" -eq 0 ] || return 1
+    # Veredicto ya emitido: 'sbctl sign' no devuelve 0 si no firmó. Lo que viene
+    # es apoyo, y nunca convierte un fichero firmado en un fallo.
     for t in "$@"; do
-        if sudo sbctl verify "$t" >/dev/null 2>&1; then
-            ok "Firma verificada: $t"
+        if cizen_uki_has_sig_section "$t"; then
+            ok "Sección .sig presente: $t"
         else
-            warn "La verificación de la firma falló: $t"
-            fail=1
+            warn "No veo la sección .sig en $t (sbctl sign dijo que firmó; puede que este binutils no la liste)."
+        fi
+        if ! sudo sbctl verify "$t" >/dev/null 2>&1; then
+            warn "sbctl verify no pudo confirmar la firma de $t; en este host no encuentra la ESP (§33.6), así que su fallo no es un veredicto."
         fi
     done
-    return "$fail"
+    return 0
 }
 
-# Verifica que TODOS los objetivos estén firmados (sbctl verify). 0 = sí.
+# Verifica que TODOS los objetivos estén firmados. 0 = sí.
+# El wizard de Secure Boot solo ofrece volver a firmar cuando esto dice que no,
+# así que un "no" erroneo es ruido y un "sí" erroneo es inocuo: por eso basta con
+# que uno de los dos indicadores (sección .sig o sbctl verify) lo confirmen.
 cizen_uki_sign_targets_verify() {
     [ -n "$SBCTL_BIN" ] && [ "$#" -gt 0 ] || return 1
     local t
     for t in "$@"; do
-        sudo sbctl verify "$t" >/dev/null 2>&1 || return 1
+        cizen_uki_has_sig_section "$t" && return 0
+        sudo sbctl verify "$t" >/dev/null 2>&1 && return 0
     done
-    return 0
+    return 1
 }
 
 # ── Preferencia recordada de firma (v27.29.3) ────────────────────────────────

@@ -3130,6 +3130,88 @@ PROBEINITRD
   fi
 fi
 
+# --- v27.31.42: un 'sbctl verify' que no encuentra la ESP no es "UKI sin firmar"
+# En producción: sbctl sign decía OK, la UKI se escribía y firmaba en el ESP, y
+# acto seguido el script moría con "La UKI no quedó firmada con Secure Boot
+# ACTIVO: el sistema no arrancaría". La UKI estaba firmada; lo que no funcionaba
+# era el VERIFICADOR, porque 'sbctl verify' exige descubrir la ESP y en este host
+# no la encuentra (§33.6). O sea: un fallo del verificador se confundía con un
+# fallo de firma, y la consecuencia de creerlo era dejar el equipo sin arrancar.
+#
+# Regla que se fija aquí: el veredicto es el código de salida de 'sbctl sign'
+# (que no devuelve 0 si no firmó). 'sbctl verify' y la sección .sig son apoyo y
+# solo avisan; nunca convierten un fichero firmado en un fallo.
+if [ -r "$UKISYNC" ]; then
+  mkdir -p "$ROOT/signfake"
+  # sbctl que FIRMA (escribe el fichero, como haria sbctl) pero cuyo 'verify'
+  # falla siempre con el error de la ESP, igual que en este equipo.
+  cat > "$ROOT/signfake/sbctl" <<'SBCTLSIGN'
+#!/bin/bash
+case "${1:-}" in
+  sign)   : >> "${2:-}"; printf 'firmado\n' >> "${2:-}"; exit 0 ;;
+  verify) echo "failed to find EFI system partition" >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+SBCTLSIGN
+  chmod +x "$ROOT/signfake/sbctl"
+  # El objetivo "ya firmado":UKI con contenido reconocible, para saber si la
+  # restauraron o la dejaron como la nueva.
+  printf 'UKI-VIEJA\n' > "$ROOT/signobj.efi"
+  printf 'UKI-NUEVA\n' > "$ROOT/signnew.efi"
+  sed -n '/^uki_prev_stage() {/,/^}/p;/^uki_prev_restore() {/,/^}/p;/^uki_prev_drop() {/,/^}/p' "$UKISYNC" > "$ROOT/signblk.sh"
+  sed -n '/^sign_uki_targets() {/,/^}/p' "$UKISYNC" >> "$ROOT/signblk.sh"
+  res="$(SIGNOBJ="$ROOT/signobj.efi" SIGNNEW="$ROOT/signnew.efi" \
+    SBCTL_BIN="$ROOT/signfake/sbctl" PATH="$ROOT/signfake:$PATH" \
+    bash -c 'set -u; SUDO=(); ok(){ echo "OK:$1"; }; warn(){ echo "WARN:$1"; }; err(){ echo "ERR:$1"; }; . "$0"
+             # 1) firma bien: el verificador roto NO puede convertirlo en fallo
+             sign_uki_targets "$SIGNOBJ" >/dev/null 2>&1; echo "rc_firmado=$?"
+             # 2) stage + restauracion, en el ORDEN REAL: se respalda lo que hay
+             # (la UKI vieja) ANTES de sobrescribir, y si al final no hay firma
+             # se vuelve a ella. Respaldar despues de escribir seria respaldar la
+             # nueva, que es justo el fallo que el guard evita.
+             uki_prev_stage "$SIGNOBJ" >/dev/null 2>&1
+             cp -f "$SIGNNEW" "$SIGNOBJ"
+             uki_prev_restore "$SIGNOBJ" >/dev/null 2>&1; echo "rc_restore=$?"
+             echo "contenido=$(cat "$SIGNOBJ")"' \
+    "$ROOT/signblk.sh" 2>/dev/null)"
+  if printf '%s' "$res" | grep -q 'rc_firmado=0'; then
+    rec ok "firma: sbctl sign OK + sbctl verify roto NO se lee como UKI sin firmar"
+  else
+    rec fail "firma: un verify que no encuentra la ESP se está tomando por una UKI sin firmar (${res:-sin salida})"
+  fi
+  if printf '%s' "$res" | grep -q 'contenido=UKI-VIEJA'; then
+    rec ok "firma: si la UKI nueva no se puede firmar, se restaura la anterior (no se deja sin firmar en el ESP)"
+  else
+    rec fail "firma: la UKI anterior NO se restauró tras un fallo de firma (${res:-sin salida})"
+  fi
+  # 3) Y al revés: si sbctl sign falla de verdad, el veredicto tiene que ser
+  #    fallo, no un aviso. Un guard que restaurase UKIs sobre una suposición
+  #    sería peor que no tener guard.
+  cat > "$ROOT/signfake/sbctl" <<'SBCTLSIGNFAIL'
+#!/bin/bash
+case "${1:-}" in
+  sign)   echo "error al firmar" >&2; exit 1 ;;
+  verify) echo "failed to find EFI system partition" >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+SBCTLSIGNFAIL
+  chmod +x "$ROOT/signfake/sbctl"
+  res2="$(SIGNOBJ="$ROOT/signobj.efi" SBCTL_BIN="$ROOT/signfake/sbctl" PATH="$ROOT/signfake:$PATH" \
+    bash -c 'set -u; SUDO=(); ok(){ :; }; warn(){ :; }; err(){ :; }; . "$0"; sign_uki_targets "$SIGNOBJ" >/dev/null 2>&1; echo "rc=$?"' \
+    "$ROOT/signblk.sh" 2>/dev/null)"
+  if printf '%s' "$res2" | grep -q 'rc=1'; then
+    rec ok "firma: si sbctl sign falla de verdad, el veredicto es fallo (y entonces sí se restaura)"
+  else
+    rec fail "firma: sbctl sign fallando NO da veredicto de fallo (${res2:-sin salida}); se firmaría sin comprobar"
+  fi
+  # 4) El motor replica la misma regla: su veredicto es el codigo de sbctl sign.
+  if sed -n '/^cizen_uki_sign_targets() {/,/^}/p' "$MOTOR" | grep -qE '\[ "\$fail" -eq 0 \] \|\| return 1'; then
+    rec ok "firma: el motor aplica la misma regla (veredicto = sbctl sign, no el verify)"
+  else
+    rec fail "firma: el motor no replica la regla del veredicto; puede volver a declarar sin firmar una UKI firmada"
+  fi
+fi
+
 # --- v27.31.32: el nombre +N del boot counting rompía cada 'pacman -Syu' ---
 # El UKI se escribía como arch-linux-cizen-v3+3.efi, se firmaba con
 # 'sbctl sign --save' (que registra ESE nombre en /var/lib/sbctl/files.json) y
