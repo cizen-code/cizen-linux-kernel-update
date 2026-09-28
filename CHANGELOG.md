@@ -1,3 +1,84 @@
+## [27.31.44] - 2026-09-27
+
+Auditoría exhaustiva del flujo completo: un conjunto grande y dispar de
+defectos, mayoría confirmados **en código**, no en teoría. Al pie de cada
+defecto, la línea que lo demostraba. El selftest pasa de **402 a 412 ok,
+0 fail**, y `shellcheck -S warning` no añade ni uno solo contra la v27.31.43
+instalada.
+
+Lista por fichero:
+
+- **motor: `--save-auto-renames` no consumía su argumento.** El `case` metía
+  `SAVE_AUTO_RENAMES=true` pero **ningún `shift`**: el parser volvía a empezar
+  siempre con la misma opción y `while $#` giraba al **100% de CPU para
+  siempre**. Demostrado: `timeout 3 bash kernel-update.sh --save-auto-renames`
+  → 124. Ahora `shift ;;`.
+- **motor: `check_installed_release_generic()` se llamaba antes de definirse.**
+  Se usaba en la línea 10655 y se definía en la 10821; con `set -e` eso es
+  «command not found» (127) y abortaba. Cualquier backend no-arch la tocaba.
+  Movida al 10633 (< 10673).
+- **motor: el fallo del sync externo abortaba antes del camino directo.** El
+  motor delega en `cizen-uki-sync` y el `if !` enrojece, pero sin `|| true`
+  moría con `set -e` **antes** de `ensure_cizen_efi_updated`. Ahora: si el
+  sync externo falla se avisa, se reintenta por el camino directo del motor y
+  solo entonces es fatal de verdad.
+- **motor: `uki_backup_prev()` respaldaba en silencio.** La rama que no podía
+  copiar la UKI anterior no decía nada; si fallaba, el rollback no tenía a qué
+  volver. Ahora `warn "No se pudo respaldar el UKI previo en $dst."`.
+- **motor: leaks en las rutas de fallo.** `build_cizen_uki` devolvía 1 sin
+  borrar el `$osrel_file` temporal, y el fallo de la build lite dejaba
+  `.config.cizen-lite.old`. Los dos se limpian.
+- **motor + sync: `cizen_uki_cleanup_variants()` y `cleanup_uki_variants()` se
+  colgaban con la clave vacía.** Si el glob no encontraba variantes, `$key`
+  en blanco entraba en el `seen[]` y tiraba los `rm -f` *por defecto*: un
+  `cleanup "*"` podía borrar el padre. Guard `[ -n "$key" ] || continue` en
+  ambas. Y `-name` → `-iname`: mkinitcpio escribe el pkgbase en minúsculas pero
+  `EFI/Linux/ARCH-LINUX-*` (getconf LONG_BIT=32) era invisible.
+- **motor + sync: `sbctl` se invocaba... por nombre literal.** El `PATH`
+  debería existir (§33.3), pero los dos scripts tienen la variable
+  `SBCTL_BIN`/`$SBCTL_BIN` exactamente para no fiarse: ahora `sudo "$SBCTL_BIN"
+  sign --save`. El sbctl real está en el allowlist de sudo, sin cambio de
+  comportamiento en este host.
+- **`cizen-uki-sync`: el fallback objcopy producía una UKI sin `.initrd`.** La
+  preparación del initramfs vivía **solo** en la rama ukify; si caía al
+  fallback (sin ukify) no había `.initrd` ni `.uname`, y `cizen_uki_verify_image`
+  (que exige .initrd) te tumbaba la run ya en el ESP. Ahora la preparación es
+  común y el fallback embeble `.initrd`, `.uname` (contenido = `$rel`, que es
+  justo lo que sd-boot espera con el prefijo «Linux ») y `.ucode` si lo hay.
+- **`cizen-uki-sync`: `--dry-run` podía abortar con fatal.** `resolve_sign_request`
+  y la búsqueda de kernel/cmdline reventaban antes de imprimir nada (un `sudo
+  sbctl status` tras los 5 minutos de ticket → «no detected» → fatal). En seco
+  ya no se resuelve nada de eso; se imprime kernel/objetivos/signature y sale 0.
+- **`kernel-update-verify.sh`: el corte por módulos solo veía `.zst`.** El
+  journal aceptaba `.zst/.xz/.gz` integrales; el conteo por módulos marcaba
+  como «firmware ausente» un binario `.xz/.gz`. Se igualan a las tres.
+- **`kernel-update-notify.sh`: notificar a ciegas.** El `rc` de `notify-send`
+  se tragaba con `2>/dev/null` en una sustitución de comando y
+  independientemente del resultado se registraba como notificada. Ahora
+  `return "$rc"`, y solo si `rc=0` se escribe la marca; si no, se registra el
+  reintento.
+- **`kernel-update-menu.sh`: `read` con stdin cerrado = bucle infinito.** En
+  cron/systemd (sin TTY) `read` devuelve EOF y el `while true` giraba
+  consumiendo CPU. `choice || break` sale limpiamente.
+- **`podar-modulos.sh`: cierre transitivo muerto.** El `IFS=$'\n\t'` global no
+  incluye el espacio, y `modules.dep` separa dependencias con espacios: el
+  `for` del cierre no añadía nada, así que cualquier módulo con dependencias
+  se quedaba sin el resto y el arranque podía petar. Ambos bucles parten con
+  `IFS=' ' read -r -a _deparr <<< "…"`.
+- **`kernel-update-rollback.sh`: archive huérfano.** Al faltar el archive del
+  manifiesto (o sin manifiesto) `list_archives`/`restore_from_archive` ignoraban
+  el `*.tar.xz` realmente más reciente. Nuevo `resolve_archive()`: manifiesto
+  si lo hay, si no el más reciente.
+- **`kernel-update-manager.sh`: flip/backup apuntaban al primer `*.efi`.** Con
+  dos kernels (p. ej. LTS) `head -n1` podía fijar el oneshot al equivocado.
+  `cizen_ukis()` filtra por `*${UKI_SUFFIX}*.efi`, y `cmd_flip` casa la UKI por
+  pkgbase del release (`arch-${pb}[+0-9]*.efi`) cayendo a la UKI Cizen más
+  reciente; el ESP se deriva como la suite (`find_esp_root`).
+
+Regresiones: 10 tests nuevos en el selftest (uno por defecto listo para poder
+volver a rojo). El motor pasa `bash -n`; los 8 ficheros tocados no añaden ni
+una línea a `shellcheck -S warning` contra la copia instalada.
+
 ## [27.31.43] - 2026-09-27
 
 El motor llamaba a `cizen-uki-sync` por nombre desnudo, así que decidía el `PATH` — y una copia vieja en `/usr/local/bin` reenvenenaba la UKI después de cada actualización.

@@ -181,13 +181,13 @@ notify_update() {
     actions+=(--action=check="Validar y compilar")
     actions+=(--action=dismiss="Descartar")
   fi
-  local resp=""
+  local resp="" rc=0
   if [ "${#actions[@]}" -gt 0 ]; then
     resp="$("$NOTIFY_BIN" -a 'Kernel Updater' -u normal -t 0 -i system-software-update \
-      "${actions[@]}" "$title" "$body" 2>/dev/null || true)"
+      "${actions[@]}" "$title" "$body" 2>/dev/null)"; rc=$?
   else
     "$NOTIFY_BIN" -a 'Kernel Updater' -u normal -t 0 -i system-software-update \
-      "$title" "$body" >/dev/null 2>&1 || true
+      "$title" "$body" >/dev/null 2>&1; rc=$?
   fi
   case "$resp" in
     check)
@@ -207,6 +207,7 @@ notify_update() {
     dismiss) alog "Acción: descartada por el usuario" ;;
     *) alog "Notificación enviada (sin acción; resp='${resp:-ninguna}')" ;;
   esac
+  return "$rc"
 }
 
 main() {
@@ -247,9 +248,11 @@ main() {
     fi
     ok=0
     notify_update "$local" "$remote"; ok=$?
-    if [ "$ok" = 0 ] || command -v "$NOTIFY_BIN" >/dev/null 2>&1; then
+    if [ "$ok" = 0 ]; then
       printf '%s\n' "$remote" >"$LAST_FILE" 2>/dev/null || true
       alog "Registrada como notificada: $local -> $remote"
+    else
+      alog "notify-send no llegó a notificar (rc=$ok): $remote no se registra y se reintentará."
     fi
     return 0
   fi

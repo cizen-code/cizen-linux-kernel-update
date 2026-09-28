@@ -3456,12 +3456,12 @@ FAKE
   #    directory'. Deuda de v27.31.33 (§32.12).
   #    Humo de verdad: ejecutar el script. Con un suffix inexistente no hay
   #    kernel que buscar, así que debe morir con SU propio mensaje y solo con él.
-  smoke="$(CIZEN_UKI_SUFFIX=-cizen-inexistente bash "$UKISYNC" --dry-run 2>&1 || true)"
-  if printf '%s' "$smoke" | grep -q 'No encontré ningún kernel Cizen' \
+  smoke="$(CIZEN_UKI_SUFFIX=-cizen-inexistente bash "$UKISYNC" --dry-run 2>&1)"; smoke_rc=$?
+  if [ "$smoke_rc" -eq 0 ] \
      && ! printf '%s' "$smoke" | grep -qiE 'is a directory|command not found|syntax error|no such file or directory'; then
-    rec ok "uki: el sync arranca limpio y muere con su propio mensaje (humo de --dry-run)"
+    rec ok "uki: --dry-run solo imprime (no escribe, sale 0) aunque no haya kernel (v27.31.44)"
   else
-    rec fail "uki: el sync escupió errores al arrancar: $(printf '%s' "$smoke" | tr '\n' ' ')"
+    rec fail "uki: --dry-run escupió errores o no salió 0: $(printf '%s' "$smoke" | tr '\n' ' ')"
   fi
   # El motor, con su parser de opciones: una opción inválida solo puede dar
   # su propio mensaje de error.
@@ -3809,7 +3809,7 @@ if [ -r "$MOTOR" ]; then
 
   # c) Estático: el punto de llamada usa la variable, no el nombre desnudo. Es
   #    la forma exacta en que §33 se coló en producción.
-  if grep -qE '^[[:space:]]*sudo[[:space:]]+"?\$\{?UKI_SYNC_BIN' "$MOTOR" \
+  if grep -qE '^[[:space:]]*(if[[:space:]]+![[:space:]]+)?sudo[[:space:]]+"?\$\{?UKI_SYNC_BIN' "$MOTOR" \
      && ! grep -qE '^[[:space:]]*sudo[[:space:]]+cizen-uki-sync([[:space:]]|$)' "$MOTOR"; then
     rec ok "uki: el motor invoca cizen-uki-sync por ruta resuelta, nunca por nombre"
   else
@@ -3920,6 +3920,105 @@ if [ -r "$UKISYNC" ]; then
     rec fail "motor: cizen_uki_cleanup_variants/cizen_uki_cleanup_efi_bak divergen de cizen-uki-sync"
   fi
 fi
+
+# --- v27.31.44: regresiones de la auditoría exhaustiva del flujo ---
+PODAR_="$(dirname "$MOTOR")/podar-modulos.sh"
+VERIFYSRC_="$(dirname "$MOTOR")/kernel-update-verify.sh"
+NOTIFY_="$(dirname "$MOTOR")/kernel-update-notify.sh"
+MANAGER_="$(dirname "$MOTOR")/kernel-update-manager.sh"
+
+if [ -f "$PODAR_" ] && [ -f "$VERIFYSRC_" ] && [ -f "$NOTIFY_" ] && [ -f "$MANAGER_" ]; then
+# Parser del motor: cada opción del case tiene que consumir su argumento. Sin
+# el 'shift', '--save-auto-renames' giraba el bucle al 100% de CPU para
+# siempre (timeout 3 bash kernel-update.sh --save-auto-renames -> exit 124).
+if grep -qE -- '--save-auto-renames\)' "$MOTOR" \
+   && awk '/--save-auto-renames\)/{found=1} found{print} /--rename=\*/{exit}' "$MOTOR" | grep -q 'shift'; then
+  rec ok "motor: --save-auto-renames consume su argumento (shift) y no puede girar al vacío"
+else
+  rec fail "motor: --save-auto-renames no hace shift: el parser gira al 100% de CPU"
+fi
+
+# call-before-definition: en bash con set -e, llamar una función antes de
+# definirla es "command not found" (127) y aborta. Pasó con
+# check_installed_release_generic en los backends no-arch.
+_def_l="$(grep -n '^check_installed_release_generic()' "$MOTOR" | cut -d: -f1 | head -n1)"
+_use_l="$(grep -n '^[[:space:]]*check_installed_release_generic$' "$MOTOR" | cut -d: -f1 | head -n1)"
+if [ -n "$_def_l" ] && [ -n "$_use_l" ] && [ "$_def_l" -lt "$_use_l" ]; then
+  rec ok "motor: check_installed_release_generic se define antes de usarse (backends no-arch)"
+else
+  rec fail "motor: check_installed_release_generic se llama antes de definirse (def=$_def_l use=$_use_l)"
+fi
+unset _def_l _use_l
+
+# El motor delega en cizen-uki-sync, pero si este falla tiene que intentar su
+# camino directo (ensure_cizen_efi_updated), no abortar antes.
+if grep -qE '^[[:space:]]*if[[:space:]]+!.+UKI_SYNC_BIN' "$MOTOR" \
+   && sed -n '/^ensure_cizen_efi_updated() {/,/^}/p' "$MOTOR" | grep -q 'sync_cizen_efi'; then
+  rec ok "motor: un fallo de cizen-uki-sync deriva al camino directo en lugar de abortar"
+else
+  rec fail "motor: el fallo del sync externo aborta con 'set -e' sin probar el camino directo"
+fi
+
+# menú: `read` con stdin cerrado (cron/notify) entraba en bucle infinito.
+if grep -qE 'read[[:space:]]+-r[[:space:]]+-p[[:space:]]+"[^"]*"[[:space:]]+choice[[:space:]]*\|\|[[:space:]]*break' "$MENU"; then
+  rec ok "menú: read EOF sale del bucle (choice || break) en vez de girar para siempre"
+else
+  rec fail "menú: read sin '|| break': stdin cerrado -> bucle infinito"
+fi
+
+# podar-modulos: modules.dep separa dependencias con espacios; con IFS='\n\t'
+# global el cierre transitivo no añadía nada (dependencias muertas).
+if [ "$(grep -c "IFS=' ' read -r -a _deparr" "$PODAR_")" -ge 2 ]; then
+  rec ok "podar: el cierre transitivo parte las dependencias por espacios (2 bucles)"
+else
+  rec fail "podar: dependencias de modules.dep no se parten (IFS='\n\t'): cierre transitivo muerto"
+fi
+
+# verify: el conteo por módulos debe aceptar la misma extensión de firmware que
+# el del journal (.zst/.xz/.gz); antes marcaba como ausente un binario .xz/.gz.
+if sed -n '/^firmware_missing_for_module() {/,/^}/p' "$VERIFYSRC_" | grep -qE '\.xz|\.gz'; then
+  rec ok "verify: firmware por módulos acepta .xz/.gz igual que el journal"
+else
+  rec fail "verify: firmware por módulos solo ve .zst -> falsa alarma permanente"
+fi
+
+# notify: no marcar como entregada una notificación que no se envió.
+if sed -n '/^notify_update() {/,/^}/p' "$NOTIFY_" | grep -q 'return "$rc"' \
+   && sed -n "/notify_update \"\$local\" \"\$remote\"/,/return 0/p" "$NOTIFY_" | grep -q 'if \[ "\$ok" = 0 \]'; then
+  rec ok "notify: solo se registra como notificada si notify-send entregó (rc=0)"
+else
+  rec fail "notify: se registra como notificada aunque notify-send fallara"
+fi
+
+# rollback: si el archive del manifiesto no está, usar el *.tar.xz más reciente.
+if grep -q 'resolve_archive()' "$KROLLBACK" \
+   && sed -n '/^list_archives() {/,/^}/p' "$KROLLBACK" | grep -q 'resolve_archive' \
+   && sed -n '/^restore_from_archive() {/,/^}/p' "$KROLLBACK" | grep -q 'resolve_archive'; then
+  rec ok "rollback: resolve_archive cae al *.tar.xz más reciente si el del manifiesto falta"
+else
+  rec fail "rollback: manifiesto obsoleto = archive ignorado pese a existir"
+fi
+
+# Übersicht del barrido en cizen-uki-sync: el fallback objcopy tiene que embeber
+# .initrd (antes producía una UKI sin initrd que la verificación descartaba).
+if sed -n '/^build_uki() {/,/^}/p' "$UKISYNC" | grep -q -- '--add-section .initrd="\$initrd"'; then
+  rec ok "sync: el fallback objcopy embeble .initrd (ya no sale una UKI sin initrd)"
+else
+  rec fail "sync: el fallback objcopy no embeble .initrd -> cizen_uki_verify_image fatal"
+fi
+
+# manager: flip/backup solo consideran UKIs Cizen con patrón '.*suffix*.efi', no
+# el primer *.efi cualquiera (podía fijar oneshot al LTS).
+if grep -q 'cizen_ukis()' "$MANAGER_" \
+   && grep -q 'find_esp_root' "$MANAGER_"; then
+  rec ok "manager: flip/backup filtran UKIs por sufijo Cizen y derivan el ESP como la suite"
+else
+  rec fail "manager: flip/backup usan el primer *.efi y /boot/EFI fijo (puede oneshot al LTS)"
+fi
+else
+  printf '  (sin scripts auxiliares en el árbol: se omiten las regresiones de v27.31.44)\n'
+fi
+unset PODAR_ VERIFYSRC_ NOTIFY_ MANAGER_
 
 # --- resumen ---
 echo

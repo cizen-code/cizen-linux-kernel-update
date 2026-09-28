@@ -84,6 +84,17 @@ mf() {  # mf clave -> valor del manifiesto (vacío si no está)
   return 0
 }
 
+resolve_archive() {
+  # El archive que hay que usar: el del manifiesto si está, y si el archivo del
+  # manifiesto no existe (manifiesto viejo vs archive nuevo) el *.tar.xz más
+  # reciente de $ROLLBACK_DIR.
+  local archive found
+  archive="$(mf archive)"
+  [ -n "$archive" ] && sudo test -s "$ROLLBACK_DIR/$archive" 2>/dev/null && { printf '%s\n' "$archive"; return 0; }
+  found="$(sudo ls -1 "$ROLLBACK_DIR"/*.tar.xz 2>/dev/null | sort | tail -n1)"
+  [ -n "$found" ] && printf '%s\n' "$(basename -- "$found")"
+}
+
 confirm() {  # confirm "pregunta"
   if [ "$ASSUME_YES" = true ]; then return 0; fi
   if ! [ -t 0 ] && ! [ -t 1 ]; then
@@ -102,7 +113,7 @@ list_archives() {
 
   local pkgbase pkgver release sched pkgfile archive archive_rel ts pkgpath
   pkgbase="$(mf pkgbase)"; pkgver="$(mf pkgver)"; release="$(mf release)"
-  sched="$(mf sched)"; pkgfile="$(mf pkgfile)"; archive="$(mf archive)"
+  sched="$(mf sched)"; pkgfile="$(mf pkgfile)"; archive="$(resolve_archive || true)"
   archive_rel="$(mf archive_rel)"; ts="$(mf ts)"
   [ -n "$pkgfile" ] && pkgpath="$ROLLBACK_DIR/$pkgfile"
 
@@ -146,7 +157,7 @@ list_archives() {
 
 restore_from_archive() {  # plan B: extraer ficheros
   local archive archive_rel
-  archive="$(mf archive)"
+  archive="$(resolve_archive || true)"
   archive_rel="$(mf archive_rel)"
   [ -n "$archive" ] || fatal "No hay archive de rollback en $ROLLBACK_DIR."
   sudo test -s "$ROLLBACK_DIR/$archive" 2>/dev/null || fatal "El archive $archive no está o está vacío."

@@ -277,7 +277,7 @@ opt 9 "rollback"    "volver al kernel anterior · $(rollback_resumen)"
 rule
 
 while true; do
-  read -r -p "${W}  [0-17] > ${N}" choice
+  read -r -p "${W}  [0-17] > ${N}" choice || break
   case "$choice" in
     1) build_and_exec baja ask --absorb-rebels --check ;;
     2) build_and_exec alta ask --absorb-rebels --check ;;

@@ -23,7 +23,24 @@ set -uo pipefail
 SUITE="/usr/local/bin/kernel-update"
 UKI_SUFFIX="cizen-v3"   # coincide con CIZEN_UKI_SUFFIX de cizen-uki-sync
 BACKUP_DIR="/var/backups/cizen-kernels"
+# ESP: la misma heurística de raíces que cizen-uki-sync (dedup por inode del
+# punto de montaje); en este host /boot es la ESP. Fallback al clásico.
 ESP="/boot/EFI"
+_find_esp_root() {
+  local r
+  for r in /boot /efi /boot/efi; do
+    [ -d "$r/EFI/Linux" ] && { printf '%s/EFI\n' "$r"; return 0; }
+  done
+  printf '%s\n' "$ESP"
+}
+ESP="$( _find_esp_root)"
+
+# UKI(s) Cizen del ESP (patrón por sufijo; excluye *.efi.bak), más reciente
+# primero. Solo se pueden arrancar los *.efi a secas, que es lo que filtra esto.
+cizen_ukis() {
+  find "$ESP" -type f -name "*${UKI_SUFFIX}*" -name '*.efi' -printf '%T@ %p\n' 2>/dev/null \
+    | sort -k1,1nr | awk '{ $1=""; sub(/^ /,""); print }'
+}
 
 r=""
 g=""
@@ -122,10 +139,18 @@ cmd_info() {
 
 cmd_flip() {
   [ $# -gt 0 ] || fatal "flip requiere un release (kernel-update-manager.sh flip 7.2.6-cizen-v3)"
-  local rel entry
+  local rel pb uki entry
   rel="$(release_by_arg "${1%*.efi}")" || fatal "Release '$1' no está instalado."
-  entry="$(basename "$(find "$ESP" -type f -name '*.efi' 2>/dev/null | head -n1)" .efi)"
-  [ -n "$entry" ] || fatal "No se encontró ninguna UKI en $ESP."
+  pb="$(release_label "$rel")"
+  # La UKI de ese release: arch-<pkgbase>[+N].efi (el +N es el de boot counting).
+  # Si no se encuentra, la UKI Cizen más reciente (nunca una de otro pkgbase).
+  uki=""
+  if [ -n "$pb" ]; then
+    uki="$(cizen_ukis | sed -nE "s#^.*/(arch-(${pb})[+0-9]*\.efi)\$#\1#p" | head -n1)"
+  fi
+  [ -n "$uki" ] || uki="$(cizen_ukis | head -n1)"
+  [ -n "$uki" ] || fatal "No se encontró ninguna UKI Cizen en $ESP."
+  entry="${uki%.efi}"
   info "Fijando arranque en modo oneshot a '$entry' (release $rel)..."
   sudo bootctl set-oneshot "$entry" || fatal "bootctl set-oneshot falló."
   ok "Al reiniciar se arrancará $rel. (bootctl unset-oneshot para cancelar.)"
@@ -139,7 +164,7 @@ cmd_backup() {
   sudo rsync -a --delete "/usr/lib/modules/$rel/" "$dst/modules/" 2>/dev/null \
     || sudo cp -a "/usr/lib/modules/$rel" "$dst/modules" || fatal "No se pudo respaldar los módulos."
   local uki
-  uki="$(find "$ESP" -type f -name '*.efi' 2>/dev/null | head -n1)"
+  uki="$(cizen_ukis | head -n1)"
   [ -n "$uki" ] && sudo cp -f "$uki" "$dst/$(basename "$uki")" 2>/dev/null
   ok "Kernel $rel respaldado en $dst"
 }

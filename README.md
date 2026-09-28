@@ -148,7 +148,7 @@ sigue vivo en el tmpfs:
 sudo pacman -U <ruta-del-pkg-en-el-tmpfs>   # no desmontes nada todavía
 ```
 
-En el menú interactivo, el rollback es la **opción 9** (`cizen-menu`), que además
+En el menú interactivo, el rollback es la **opción 9** (`kernel-update-menu.sh`), que además
 muestra en la propia etiqueta a qué se vuelve:
 
 ```

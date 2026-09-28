@@ -635,7 +635,7 @@ build_uki() {
   # con `set -u` declararlas solo dentro de la rama del microcode hacia reventar
   # con "ucode_tmp: unbound variable" en el camino NORMAL (con initramfs), que es
   # justo el que no probaba el test de la UKI: el suyo forzaba prepare a fallar.
-  local ucode_tmp="" ucode_dir="" cpuid_hex="" ucode_bin="" ucode_rev=""
+  local ucode_tmp="" ucode_dir="" cpuid_hex="" ucode_bin="" ucode_rev="" uname_file=""
 
   cmdline_text="$(<"$cmdline_file")"
 
@@ -670,6 +670,27 @@ build_uki() {
     ukify_bin="/usr/lib/systemd/ukify"
   fi
 
+  # El initramfs se regenera y valida AQUÍ, no antes: build_uki es la única
+  # puerta por la que pasa todo initrd que acabe dentro de una UKI, así que
+  # es aquí donde tiene que estar la comprobación. Antes se embebía el
+  # fichero que hubiera en /boot sin mirarlo: si no había ninguno la UKI
+  # salía sin initrd sin decir nada, y si había uno corrupto, truncado o de
+  # otra versión se embebía igual. Se hace ANTES de elegir rama: el fallback
+  # objcopy también tiene que embeber lo validado, no solo ukify.
+  local initrd="" have_initrd=0
+  if cizen_initramfs_prepare; then
+    initrd="$INITRAMFS_PATH"
+    have_initrd=1
+  elif [ "${CIZEN_INITRAMFS_REQUIRED:-0}" = "1" ]; then
+    err "No hay initramfs válido y CIZEN_INITRAMFS_REQUIRED=1: no construyo la UKI."
+    return 1
+  else
+    # El diseño del motor es que el equipo arranca igual sin initramfs
+    # (btrfs y el resto built-in; ver verify_build_tree()), así que se
+    # sigue, pero nunca en silencio.
+    warn "Sin initramfs válido: la UKI saldrá sin initrd y el arranque será degradado."
+  fi
+
   if [ -n "$ukify_bin" ]; then
     local -a args=("$ukify_bin" build --linux="$kernel" --cmdline="$cmdline_text" --output="$out")
     if [ -n "$osrel_file" ]; then
@@ -682,26 +703,6 @@ build_uki() {
     # es --uname, no --version (este último imprime la versión de ukify y sale).
     if [ -n "$rel" ]; then
       args+=(--uname="$rel")
-    fi
-    # El initramfs se regenera y valida AQUÍ, no antes: build_uki es la única
-    # puerta por la que pasa todo initrd que acabe dentro de una UKI, así que
-    # es aquí donde tiene que estar la comprobación. Antes se embebía el
-    # fichero que hubiera en /boot sin mirarlo: si no había ninguno la UKI
-    # salía sin initrd sin decir nada, y si había uno corrupto, truncado o de
-    # otra versión se embebía igual.
-    local initrd=""
-    local have_initrd=0
-    if cizen_initramfs_prepare; then
-      initrd="$INITRAMFS_PATH"
-      have_initrd=1
-    elif [ "${CIZEN_INITRAMFS_REQUIRED:-0}" = "1" ]; then
-      err "No hay initramfs válido y CIZEN_INITRAMFS_REQUIRED=1: no construyo la UKI."
-      return 1
-    else
-      # El diseño del motor es que el equipo arranca igual sin initramfs
-      # (btrfs y el resto built-in; ver verify_build_tree()), así que se
-      # sigue, pero nunca en silencio.
-      warn "Sin initramfs válido: la UKI saldrá sin initrd y el arranque será degradado."
     fi
     if [ "$have_initrd" -eq 1 ]; then
       args+=(--initrd="$initrd")
@@ -764,18 +765,40 @@ build_uki() {
   if [ -n "$stub" ] && command -v objcopy >/dev/null 2>&1; then
     local -a objargs=(
       --add-section .cmdline="$cmdline_file"
-      --set-section-flags .cmdline=noload,readonly
+      --set-section-flags '.cmdline=noload,readonly'
     )
     if [ -n "$osrel_file" ]; then
       objargs+=(--add-section .osrel="$osrel_file")
-      objargs+=(--set-section-flags .osrel=noload,readonly)
+      objargs+=(--set-section-flags '.osrel=noload,readonly')
     fi
     objargs+=(--add-section .linux="$kernel")
-    objargs+=(--set-section-flags .linux=noload,readonly)
+    objargs+=(--set-section-flags '.linux=noload,readonly')
+    if [ "$have_initrd" -eq 1 ]; then
+      # El stub trae la sección .initrd ya declarada: objcopy la rellena con el
+      # initramfs que se acaba de validar. Sin esto el fallback producía una UKI
+      # sin .initrd (y sin .uname) que cizen_uki_verify_image descartaba: el
+      # "fallback" solo triunfaba en el modo degradado sin initramfs.
+      objargs+=(--add-section .initrd="$initrd")
+      objargs+=(--set-section-flags '.initrd=noload,readonly')
+    fi
+    if [ -n "$rel" ]; then
+      uname_file="$(mktemp /tmp/cizen-uname.XXXXXX)" || uname_file=""
+      if [ -n "$uname_file" ]; then
+        printf '%s\n' "$rel" > "$uname_file"
+        objargs+=(--add-section .uname="$uname_file")
+        objargs+=(--set-section-flags '.uname=noload,readonly')
+      fi
+    fi
+    if [ -n "$ucode_tmp" ]; then
+      objargs+=(--add-section .ucode="$ucode_tmp")
+      objargs+=(--set-section-flags '.ucode=noload,readonly')
+    fi
     if objcopy "${objargs[@]}" "$stub" "$out"; then
       [ -n "$osrel_file" ] && rm -f "$osrel_file"
+      [ -n "$uname_file" ] && rm -f "$uname_file"
       return 0
     fi
+    [ -n "$uname_file" ] && rm -f "$uname_file"
   fi
 
   [ -n "$osrel_file" ] && rm -f "$osrel_file"
@@ -831,10 +854,9 @@ cleanup_uki_variants() {
       [ -n "$f" ] || continue
       [ "$(basename -- "$f")" = "$current" ] && continue
       key="$("${SUDO[@]}" stat -c '%d:%i' -- "$f" 2>/dev/null || true)"
-      if [ -n "$key" ]; then
-        [ -n "${seen[$key]:-}" ] && continue
-        seen[$key]="$f"
-      fi
+      [ -n "$key" ] || continue
+      [ -n "${seen[$key]:-}" ] && continue
+      seen[$key]="$f"
       "${SUDO[@]}" rm -f -- "$f" 2>/dev/null || true
     done < <("${SUDO[@]}" find "$pfx$r" -maxdepth 5 -type f \
                 \( -name "${base}.efi" -o -name "${base}+*.efi" \
@@ -869,10 +891,9 @@ cleanup_efi_bak_copies() {
     while IFS= read -r f; do
       [ -n "$f" ] || continue
       key="$("${SUDO[@]}" stat -c '%d:%i' -- "$f" 2>/dev/null || true)"
-      if [ -n "$key" ]; then
-        [ -n "${seen[$key]:-}" ] && continue
-        seen[$key]="$f"
-      fi
+      [ -n "$key" ] || continue
+      [ -n "${seen[$key]:-}" ] && continue
+      seen[$key]="$f"
       log "Borrando copia huérfana del ESP: $f"
       "${SUDO[@]}" rm -f -- "$f" 2>/dev/null || true
     done < <("${SUDO[@]}" find "$pfx$r" -maxdepth 5 -type f -name '*.efi.bak' \
@@ -974,7 +995,7 @@ sign_uki_targets() {
   # sin --save el hook de pacman (sbctl sign-all) no re-firma la UKI en
   # actualizaciones y sbctl verify deja de reconocerla.
   for t in "$@"; do
-    if "${SUDO[@]}" sbctl sign --save "$t" >/dev/null 2>&1; then
+    if "${SUDO[@]}" "$SBCTL_BIN" sign --save "$t" >/dev/null 2>&1; then
       ok "Firmada con sbctl: $t"
     else
       err "sbctl sign falló: $t"
@@ -991,7 +1012,7 @@ sign_uki_targets() {
     else
       warn "No veo la sección .sig en $t (sbctl sign dijo que firmó; puede ser que este binutils no la liste)."
     fi
-    if ! "${SUDO[@]}" sbctl verify "$t" >/dev/null 2>&1; then
+    if ! "${SUDO[@]}" "$SBCTL_BIN" verify "$t" >/dev/null 2>&1; then
       warn "sbctl verify no pudo confirmar la firma de $t; en este host no encuentra la ESP (§33.6), así que su fallo no es un veredicto."
     fi
   done
@@ -1055,6 +1076,12 @@ sbctl_prune_stale() {
 # Decide DO_SIGN a partir de CIZEN_SIGN_UKI / --sign / --no-sign. auto firma
 # SIEMPRE con Secure Boot activo (fail-safe: una UKI sin firmar no arrancaría).
 resolve_sign_request() {
+  # En seco no se decide ni se comprueba nada que pueda abortar (Secure Boot
+  # activo sin sbctl, --no-sign con SB activo...): --dry-run solo imprime.
+  if [ "$DRY_RUN" = 1 ]; then
+    info "(--dry-run: la resolución de firma se omite; nada se escribe ni se abre)"
+    return 0
+  fi
   case "$SIGN_REQUEST" in
     yes)
       DO_SIGN=true
@@ -1106,12 +1133,28 @@ resolve_sign_request
 
 kernel="$(find_cizen_installed_kernel || true)"
 if [ -z "$kernel" ] || [ ! -s "$kernel" ]; then
-  fatal "No encontré ningún kernel Cizen instalado (buscado: /usr/lib/modules/*$CIZEN_UKI_SUFFIX/vmlinuz y /boot/vmlinuz-*$CIZEN_UKI_SUFFIX)."
+  if [ "$DRY_RUN" = 1 ]; then
+    kernel=""
+    info "(--dry-run: no se detecta kernel Cizen instalado; destino no resuelto)"
+  else
+    fatal "No encontré ningún kernel Cizen instalado (buscado: /usr/lib/modules/*$CIZEN_UKI_SUFFIX/vmlinuz y /boot/vmlinuz-*$CIZEN_UKI_SUFFIX)."
+  fi
+else
+  ok "Kernel Cizen instalado: $kernel"
 fi
-ok "Kernel Cizen instalado: $kernel"
 
-cmdline_file="$(prepare_cmdline_file)" || fatal "No pude preparar la línea de comandos de arranque."
-info "cmdline: $(<"$cmdline_file")"
+cmdline_file=""
+cmdline_file="$(prepare_cmdline_file)" || {
+  if [ "$DRY_RUN" = 1 ]; then
+    cmdline_file=""
+    warn "(--dry-run: no pude preparar la línea de comandos; se continúa solo con parámetros)"
+  else
+    fatal "No pude preparar la línea de comandos de arranque."
+  fi
+}
+if [ -n "$cmdline_file" ]; then
+  info "cmdline: $(<"$cmdline_file")"
+fi
 
 targets=()
 while IFS= read -r t; do
@@ -1121,20 +1164,25 @@ done < <(find_uki_targets "$(uki_efi_name)" || true)
 if [ "${#targets[@]}" -eq 0 ]; then
   esp="$(detect_esp_root 2>/dev/null || true)"
   if [ -z "$esp" ]; then
-    rm -f "$cmdline_file"
-    fatal "No encontré una partición EFI montada ni $(uki_efi_name) en el ESP; no hay nada que actualizar."
+    if [ "$DRY_RUN" = 1 ]; then
+      warn "(--dry-run: no se detecta la ESP; sin destino que imprimir)"
+    else
+      [ -n "$cmdline_file" ] && rm -f "$cmdline_file"
+      fatal "No encontré una partición EFI montada ni $(uki_efi_name) en el ESP; no hay nada que actualizar."
+    fi
+  else
+    targets=("$esp/EFI/Linux/$(uki_efi_name)")
   fi
-  targets=("$esp/EFI/Linux/$(uki_efi_name)")
 fi
 
 if [ "$DRY_RUN" = 1 ]; then
-  info "Kernel:  $kernel"
+  [ -n "$kernel" ] && info "Kernel:  $kernel"
   info "Objetivos:"
   for t in "${targets[@]}"; do
     printf '  - %s\n' "$t"
   done
   info "(modo --dry-run: no se escribe nada)"
-  rm -f "$cmdline_file"
+  [ -n "$cmdline_file" ] && rm -f "$cmdline_file"
   exit 0
 fi
 

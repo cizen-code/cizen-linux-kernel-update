@@ -627,8 +627,13 @@ firmware_missing_for_module() {
   while IFS= read -r fw; do
     [ -n "$fw" ] || continue
     rel="${fw#firmware/}"
-    # El árbol linux-firmware almacena los binarios comprimidos como .zst
-    if [ ! -f "$FIRMWARE_DIR/$rel" ] && [ ! -f "$FIRMWARE_DIR/$rel.zst" ]; then
+    # El árbol linux-firmware almacena los binarios comprimidos como .zst;
+    # también puede traer .xz/.gz, igual que en la rama del journal (v27.31.20):
+    # el fichero "falta" solo si no está de ninguna forma.
+    if { [ ! -f "$FIRMWARE_DIR/$rel" ] \
+         && [ ! -f "$FIRMWARE_DIR/$rel.zst" ] \
+         && [ ! -f "$FIRMWARE_DIR/$rel.xz" ] \
+         && [ ! -f "$FIRMWARE_DIR/$rel.gz" ]; }; then
       printf '%s (%s)\n' "$fw" "$mod"
     fi
   done <<< "$out"

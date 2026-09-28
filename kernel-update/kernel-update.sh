@@ -136,7 +136,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.43"
+SCRIPT_VERSION="27.31.44"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -687,7 +687,8 @@ while [ $# -gt 0 ]; do
         err "--rename requiere VIEJO=NUEVO"; exit 1
       fi ;;
     --save-auto-renames)
-      SAVE_AUTO_RENAMES=true ;;
+      SAVE_AUTO_RENAMES=true
+      shift ;;
     --rename=*)
       DO_RENAME=true
       RENAME_PAIR="${1#--rename=}"
@@ -6134,7 +6135,7 @@ prepare_lite_config() {
       err "Detalle de localmodconfig (motivo del fallo):"
       sed 's/^/    /' "$lite_log" | tail -40 >&2 || true
     fi
-    rm -f -- "$SRC/.config.cizen-lite" "$lite_log"
+    rm -f -- "$SRC/.config.cizen-lite" "$SRC/.config.cizen-lite.old" "$lite_log"
     fatal "make localmodconfig falló (rc=$rc). El modo lite es el ÚNICO modo de compilación: se aborta en lugar de compilar la config completa."
   fi
   unset rc karch ksrcarch lite_gap lite_log ARCH SRCARCH
@@ -7903,14 +7904,13 @@ cizen_uki_cleanup_variants() {
             [ -n "$f" ] || continue
             [ "$(basename -- "$f")" = "$current" ] && continue
             key="$(sudo stat -c '%d:%i' -- "$f" 2>/dev/null || true)"
-            if [ -n "$key" ]; then
-                [ -n "${seen[$key]:-}" ] && continue
-                seen[$key]="$f"
-            fi
+            [ -n "$key" ] || continue
+            [ -n "${seen[$key]:-}" ] && continue
+            seen[$key]="$f"
             sudo rm -f -- "$f" 2>/dev/null || true
-        done < <(sudo find "$r" -maxdepth 5 -type f \( -name "${base}.efi" -o -name "${base}+*.efi" \
-                   -o -name "${base}.efi.cizen-prev" -o -name "${base}.efi.cizen-tmp" \
-                   -o -name "${base}+*.efi.cizen-prev" -o -name "${base}+*.efi.cizen-tmp" \) 2>/dev/null || true)
+        done < <(sudo find "$r" -maxdepth 5 -type f \( -iname "${base}.efi" -o -iname "${base}+*.efi" \
+                   -o -iname "${base}.efi.cizen-prev" -o -iname "${base}.efi.cizen-tmp" \
+                   -o -iname "${base}+*.efi.cizen-prev" -o -iname "${base}+*.efi.cizen-tmp" \) 2>/dev/null || true)
     done
 }
 
@@ -8528,6 +8528,7 @@ build_cizen_uki() {
             initrd="$CIZEN_INITRAMFS_PATH"
             have_initrd=1
         elif [ "${CIZEN_INITRAMFS_REQUIRED:-0}" = "1" ]; then
+            rm -f "$osrel_file"
             err "No hay initramfs válido y CIZEN_INITRAMFS_REQUIRED=1: no construyo la UKI."
             return 1
         else
@@ -8853,7 +8854,7 @@ cizen_uki_sign_targets() {
   # sin --save el hook de pacman (sbctl sign-all) no re-firma systemd-boot/UKI
   # en actualizaciones y sbctl verify deja de reconocer el fichero.
   for t in "$@"; do
-        if sudo sbctl sign --save "$t" >/dev/null 2>&1; then
+        if sudo "$SBCTL_BIN" sign --save "$t" >/dev/null 2>&1; then
             ok "Firmada con sbctl: $t"
         else
             warn "sbctl sign falló: $t"
@@ -8869,7 +8870,7 @@ cizen_uki_sign_targets() {
         else
             warn "No veo la sección .sig en $t (sbctl sign dijo que firmó; puede que este binutils no la liste)."
         fi
-        if ! sudo sbctl verify "$t" >/dev/null 2>&1; then
+        if ! sudo "$SBCTL_BIN" verify "$t" >/dev/null 2>&1; then
             warn "sbctl verify no pudo confirmar la firma de $t; en este host no encuentra la ESP (§33.6), así que su fallo no es un veredicto."
         fi
     done
@@ -10626,6 +10627,23 @@ if [ "$CIZEN_PKG_BACKEND" = "arch" ]; then
   validate_split_package_transition_metadata
 fi
 
+# Backends sin pacman: abortar si el release resultante ya está instalado en
+# /usr/lib/modules (definida ANTES de la rama que la usa: llamarla después
+# rompería el flujo no-arch con "command not found").
+check_installed_release_generic() {
+  local rel
+  rel="$(make -C "$SRC" -s kernelrelease 2>/dev/null || echo "$VERSION-cizen-v3")"
+  if [ -d "/usr/lib/modules/$rel" ]; then
+    warn "El release $rel ya está instalado en /usr/lib/modules."
+    if [ "$FORCE" = true ]; then
+      warn "Se continúa por --force (reinstalando sobre el release existente)."
+    else
+      fatal "Ya existe /usr/lib/modules/$rel; se aborta (usa --force para reinstalar igual)."
+    fi
+  fi
+  return 0
+}
+
 # Evitar reinstalar exactamente el mismo paquete si ya está instalado.
 if [ "$CIZEN_PKG_BACKEND" = "arch" ]; then
   if pacman -Q "$PKG_NAME" >/dev/null 2>&1; then
@@ -10815,23 +10833,6 @@ install_kernel_package() {
   return 1
 }
 
-# Comprueba que el release generado no esté ya instalado con un pkgrel igual o
-# mayor que el del build actual (analogo al control pacman, para backends sin
-# pacman mediante ras tronco de /usr/lib/modules).
-check_installed_release_generic() {
-  local rel
-  rel="$(make -C "$SRC" -s kernelrelease 2>/dev/null || echo "$VERSION-cizen-v3")"
-  if [ -d "/usr/lib/modules/$rel" ]; then
-    warn "El release $rel ya está instalado en /usr/lib/modules."
-    if [ "$FORCE" = true ]; then
-      warn "Se continúa por --force (reinstalando sobre el release existente)."
-    else
-      fatal "Ya existe /usr/lib/modules/$rel; se aborta (usa --force para reinstalar igual)."
-    fi
-  fi
-  return 0
-}
-
 # v27.30.0 (feature LinuxLocker): respalda el UKI previo a sobrescribirlo.
 uki_backup_prev() {
   [ "$CIZEN_UKI_BACKUP" = "1" ] || return 0
@@ -10845,6 +10846,8 @@ uki_backup_prev() {
     dst="$CIZEN_UKI_BACKUP_DIR/$(basename "$tgt").before-$rel-$(date +%Y%m%d-%H%M%S)"
     if sudo cp -f "$tgt" "$dst" 2>/dev/null; then
       ok "UKI previo respaldado en $dst"
+    else
+      warn "No se pudo respaldar el UKI previo en $dst."
     fi
   done < <(find_cizen_uki_targets 2>/dev/null || true)
   # Poda defensiva: conservar solo las 8 copias mas recientes por nombre.
@@ -10979,7 +10982,9 @@ UKI_SYNC_BIN="$(cizen_uki_sync_bin)"
 if [ -z "$UKI_SYNC_BIN" ]; then
   fatal "No encuentro cizen-uki-sync ni en $SCRIPT_DIR ni en el PATH."
 fi
-sudo "$UKI_SYNC_BIN" "${UKI_SYNC_ARGS[@]}"
+if ! sudo "$UKI_SYNC_BIN" "${UKI_SYNC_ARGS[@]}"; then
+  warn "cizen-uki-sync falló; se reintenta la sincronización con el camino de generación directo del motor."
+fi
 ensure_cizen_efi_updated
 ok "UKI sincronizado"
 if [ "$DO_SIGN_UKI" = true ]; then

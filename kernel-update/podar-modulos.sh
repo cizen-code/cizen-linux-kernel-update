@@ -270,10 +270,14 @@ while IFS= read -r _l || [ -n "$_l" ]; do
   _n="${_f##*/}"; _n="${_n%.ko*}"; _n="${_n//-/_}"
   [ -n "$_n" ] || continue
   _rl=""
-  for _d in $_rest; do
+  # modules.dep separa las dependencias con espacios, no con saltos de línea;
+  # con IFS=$'\n\t' el for no las partiría. read -a con IFS=' ' aísla la división.
+  IFS=' ' read -r -a _deparr <<< "$_rest" 2>/dev/null || true
+  for _d in "${_deparr[@]:-}"; do
     _dn="${_d##*/}"; _dn="${_dn%.ko*}"; _dn="${_dn//-/_}"
     [ -n "$_dn" ] && _rl="$_rl $_dn"
   done
+  unset _deparr
   DEPS["$_n"]="${_rl# }"
 done < "$MODDIR/modules.dep"
 
@@ -290,11 +294,13 @@ while [ "${#STACK[@]}" -gt 0 ]; do
   DONE["$_cur"]=1
   [ -z "${FILE_BY_NAME[$_cur]:-}" ] && continue
   KEEP["$_cur"]=1
-  for _d in ${DEPS[$_cur]:-}; do
+  IFS=' ' read -r -a _deparr <<< "${DEPS[$_cur]:-}" 2>/dev/null || true
+  for _d in "${_deparr[@]:-}"; do
     if [ -z "${DONE[$_d]:-}" ] && [ -n "${FILE_BY_NAME[$_d]:-}" ]; then
       STACK+=("$_d")
     fi
   done
+  unset _deparr
 done
 unset _k _cur
 
