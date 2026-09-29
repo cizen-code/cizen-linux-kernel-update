@@ -1,3 +1,29 @@
+## [27.31.49] - 2026-09-29
+
+Dos correcciones de **presentación del resumen final**, encontradas leyendo el
+log del build de `7.2.8_cizen_v3-10` (BORE + clang/THIN LTO, 32m 54s). No
+tocan la compilación ni el flujo: solo lo que el motor le enseña al usuario al
+terminar. Estado: **419 ok, 0 fail** en selftest (418 si se ejecuta contra la
+copia instalada, que se salta el test de paridad de la unit de verify por no
+tener `_repo_root`) y `bash -n` sin avisos.
+
+- **`Paquete:` duplicaba la ruta.** Era
+  `Paquete     : ${PKG:+$(basename "$PKG")}${PKG:---sin paquete (modules_install)}`.
+  El segundo trozo no es un "si está vacío, muestra esto": es `${PKG:-defecto}`,
+  el operador de **valor por defecto**, así que con `PKG` puesto devuelve el
+  valor de `PKG` entero. Resultado en pantalla:
+  `Paquete : linux-cizen-v3-7.2.8_cizen_v3-10-x86_64.pkg.tar.zst/tmp/cizen-kernel-build/linux-7.2.8/linux-cizen-v3-7.2.8_cizen_v3-10-x86_64.pkg.tar.zst`
+  (el basename pegado a la ruta absoluta). Ahora es un `basename` con su rama
+  de "sin paquete", igual que el resto del bloque.
+- **El consejo de prioridad se contradecía a sí mismo.** El resumen tenía
+  hardcodeado `(CIZEN_BUILD_PRIORITY=normal para máxima velocidad)` para todos
+  los casos, así que en un build a plena prioridad salía
+  `Build prio : máxima (CIZEN_BUILD_PRIORITY=normal para máxima velocidad)`.
+  El consejo solo se muestra si el rótulo actual **no** es `máxima`.
+
+Verificado con `bash -n`, con las 4 combinaciones (paquete con ruta / vacío ×
+rótulo `máxima` / `low`) y con el selftest.
+
 ## [Perfil Cizen v5.15.0] - 2026-09-28
 
 Adelgaza el perfil del OptiPlex 7050 (v5.13.0 → v5.14.0 → v5.15.0) y **audita

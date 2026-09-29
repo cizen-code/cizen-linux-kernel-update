@@ -136,7 +136,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.48"
+SCRIPT_VERSION="27.31.49"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -11172,9 +11172,9 @@ Perfil      : $PROFILE
   CC          : $([ "$CLANG_BUILD" = true ] && echo 'LLVM/Clang' || echo 'GCC')
 ${PUBLISH_REPO_MSG:+  ${PUBLISH_REPO_MSG}}
   Hilos       : $JOBS
-Build prio  : $BUILD_PRIORITY_LABEL (CIZEN_BUILD_PRIORITY=normal para máxima velocidad)
+Build prio  : $BUILD_PRIORITY_LABEL$([ "$BUILD_PRIORITY_LABEL" != "máxima" ] && printf '%s' ' (CIZEN_BUILD_PRIORITY=normal para máxima velocidad)')
   Backend     : $CIZEN_PKG_BACKEND
-  Paquete     : ${PKG:+$(basename "$PKG")}${PKG:---sin paquete (modules_install)}
+  Paquete     : $( [ -n "$PKG" ] && basename "$PKG" || echo '--sin paquete (modules_install)')
   Mod-firma   : $([ "$CIZEN_MODULE_SIGN" = "yes" ] && echo 'sí (MOK persistente)' || echo 'no')
  Config base : $FINAL_CONFIG
  Build tmpfs : $TMPFS_ROOT (size=$TMPFS_SIZE) → $TMPFS_LINE
