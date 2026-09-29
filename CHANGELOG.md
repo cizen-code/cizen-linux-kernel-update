@@ -78,6 +78,83 @@ Validación: `--check` en verde (`EXIT 0`, `ENABLE 37/37`, `DISABLE 291/291` con
 motor detecta el renombre `SCHED_BORE → SCHED_CORE` (viene del patch BORE, no
 del perfil) y lo reaplica en cada ejecución; es ruido, no rotura.
 
+## [27.31.48] - 2026-09-29
+
+Arregla un **error de orden de definición** en el motor que abortaba el
+preflight con `Error 127` antes de compilar nada, y actualiza el test del perfil
+a la decisión v5.16.0 (BORE, sin sched_ext). Estado: **419 ok, 0 fail**.
+
+- **Qué pasaba.** El motor se ejecuta línea a línea mientras bash lo lee, así que
+  una llamada a nivel superior solo ve las definiciones **ya leídas**.
+  `build_effective_arrays()` se invoca en el nivel superior (L1651) y su cierre
+  transitivo usaba `eff_remove()` (L6459) y `apply_config_requests()` (L6665),
+  definidos miles de líneas más abajo. Con un símbolo a la vez en
+  `OPTS_ENABLE` y `OPTS_DISABLE` —el caso real: el motor hace
+  `add_unique enable DEBUG_INFO_BTF` (`kernel-update.sh:1639`) y el perfil lo
+  desactivaba para no pagar `pahole`— `add_unique()` reventaba con
+  `line 1538: eff_remove: orden no encontrada` y el preflight moría con
+  `Error 127`. El workaround era no listar nunca `DEBUG_INFO_BTF` en el perfil.
+- **Por qué no lo veían los tests**: los dos tests de `add_unique` y del overlay
+  de LTO hacen `eval "$(sed -n '/^eff_remove() {/,/^}/p' …)"` a mano, en el orden
+  correcto. El fallo solo se manifiesta en la **ejecución real**, donde nada
+  evalúa esas dos funciones antes de tiempo.
+- **Arreglo**: se traslada el subsistema Kconfig completo (493 líneas, 12
+  funciones y los cuatro `declare -A`/`KCONFIG_*_BUILT` que accompany, todos
+  dentro del rango) por encima de `add_unique()`, de modo que el cierre
+  transitivo de `build_effective_arrays()` esté definido antes de su llamada.
+  No se mueve la llamada: `check_profile_contradictions()` se invoca en el nivel
+  superior en L1678 e itera `EFF_ENABLE`/`EFF_DISABLE`/`EFF_SETVAL`/`EFF_SETSTR`,
+  así que los arrays tienen que estar poblados ahí y retrasarla rompería la
+  validación de contradicciones.
+- **No era una sola función**: el análisis del cierre transitivo de
+  `build_effective_arrays()` revela seis funciones usadas antes de existir, no una:
+  `build_kconfig_symbol_index` (L6235), `kconfig_symbol_known` (L6260),
+  `kconfig_auto_candidate` (L6324), `auto_resolve_effective_symbols` (L6393),
+  `eff_remove` (L6459) y `apply_config_requests` (L6665). Solo `eff_remove`
+  crasheaba porque las demás estaban en ramas que aquel `--check` no tomaba:
+  la misma bomba, detonando por turnos.
+- **Test de regresión** (`tests/selftest.sh`): comprueba el **orden real del
+  fichero** —que las seis estén definidas antes de la primera invocación de
+  nivel superior de `build_effective_arrays()`— en vez de evaluarlas a mano.
+  Comprobado en rojo contra el motor previo (falla, y nombra las seis) y en
+  verde con este.
+- **Test del perfil actualizado a v5.16.0**: las expectativas seguían clavadas en
+  el layout de v5.13.0 (`SCHED_CLASS_EXT` en `OPTS_ENABLE`). Ahora comprueban la
+  decisión actual: `SCHED_CLASS_EXT` en `OPTS_DISABLE` (y ausente de
+  `OPTS_ENABLE`), `KALLSYMS_ALL` y `SLAB_MERGE_DEFAULT` en `OPTS_DISABLE`.
+  De paso el `awk` del test **ignora los comentarios**: el perfil explica por qué
+  *no* lista `DEBUG_INFO_BTF` y lo cita entrecomillado, y antes eso contaba como
+  si fuera una entrada de la lista.
+- **Verificado**: el escenario que fallaba (perfil con `DEBUG_INFO_BTF` a la vez
+  en `OPTS_DISABLE` y en el `enable` del motor) da `Error 127` con el motor
+  anterior y `CHECK EXITOSO` (exit 0) con este. `shellcheck` sin deltas (41
+  avisos antes y después; solo cambian los números de línea). Suite completa
+  **419 ok / 0 fail** (antes 417 ok / 2 fail con este mismo perfil).
+
+## [Perfil Cizen v5.16.0] - 2026-09-29
+
+El usuario elige **BORE** y renuncia a sched_ext y a BTF. Sustituye a la decisión
+documentada en v5.15.0, que conservaba `CONFIG_DEBUG_INFO_BTF=y` para no perder
+`scx-scheds`.
+
+- **`SCHED_CLASS_EXT`: de `OPTS_ENABLE` a `OPTS_DISABLE`.** BORE sustituye a
+  `SCHED_CORE` como planificador de núcleo, y sched_ext se engancha precisamente
+  a `SCHED_CORE`: son excluyentes. Con BORE no hay sched_ext que perder.
+- **BTF se apaga y `DEBUG_INFO_REDUCED` se enciende.** Sigue habiendo
+  información de tipo (estructuras legibles, backtraces con nombres de símbolo)
+  sin pagar el `pahole`, que llegó a 6,7 GB de RSS y dejó la máquina con 338 MiB
+  de RAM disponibles durante la build de v5.15.0. `DEBUG_INFO_BTF_MODULES` y
+  `GDB_SCRIPTS` se mantienen apagados.
+- **`DEBUG_INFO_BTF` NO se lista en `OPTS_DISABLE`, y es deliberado.** El motor
+  lo activa por su cuenta (`kernel-update.sh:1639`) y listarlo aquí creaba un
+  conflicto que, con el motor de v27.31.47, abortaba el preflight con `Error 127`
+  (ver [27.31.48]). El apagado correcto es el opt-out del motor: `--no-btf`, o
+  `CIZEN_NO_BTF=1` exportado antes de lanzarlo, que además baja el umbral de
+  preflight de 12288 MB a 8192 MB. Un símbolo en `OPTS_DISABLE` que el motor
+  quita por dependencia además dispara un aviso:
+  `CONFIG_DEBUG_INFO_BTF no existe en esta configuración`.
+- Sin cambio de `SCRIPT_VERSION` (esto es el perfil del host, no el motor).
+
 ## [27.31.47] - 2026-09-28
 
 Arregla un flake del propio harness (`tests/selftest.sh`), no del motor ni de

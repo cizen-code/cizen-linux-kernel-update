@@ -136,7 +136,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.47"
+SCRIPT_VERSION="27.31.48"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -1525,6 +1525,514 @@ declare -A APPLIED_RENAMES=()
 
 declare -A SEEN_ENABLE=() SEEN_DISABLE=() SEEN_CRITICAL=()
 
+
+# ============================================================
+# v27.31.48: el motor se ejecuta línea a línea mientras bash lo lee, de modo que
+# una llamada a nivel superior solo ve las definiciones ya leídas.
+# build_effective_arrays() se invoca en el nivel superior mucho antes de que
+# existieran eff_remove() y apply_config_requests(), que están miles de líneas
+# más abajo: si un símbolo aparece a la vez en OPTION_ENABLE y en
+# OPTION_DISABLE (p. ej. el motor activa DEBUG_INFO_BTF y el perfil lo
+# desactiva), add_unique() reventaba con
+#   line 1538: eff_remove: orden no encontrada
+# y el preflight abortaba con Error 127 sin llegar a compilar.
+# El subsistema Kconfig se traslada aquí, completo, para que todo el cierre
+# transitivo de build_effective_arrays() esté definido antes de la llamada.
+# No reordenar sin volver a comprobar ese cierre.
+# ============================================================
+# Existencia real en el Kconfig de la versión objetivo. No depende de que el
+# símbolo aparezca previamente en .config; Kconfig puede materializarlo después
+# de olddefconfig. El resultado se cachea durante la ejecución.
+declare -A KCONFIG_SYMBOL_KNOWN=()
+declare -A KCONFIG_SYMBOL_TYPE=()
+KCONFIG_TYPE_INDEX_BUILT=false
+KCONFIG_SYMBOL_INDEX_BUILT=false
+
+build_kconfig_symbol_index() {
+  [ "$KCONFIG_SYMBOL_INDEX_BUILT" = true ] && return 0
+
+  local sym
+  # El pipeline interno puede devolver rc!=0 legítimamente: xargs parte la lista
+  # en varios lotes y un lote cuyo grep no encuentre ningún `config`/`menuconfig`
+  # sale con status 1. Con `set -Eeuo pipefail` (heredado por el subshell del
+  # process-substitution), el `find | xargs | grep | awk | sort` del pipeline entero
+  # reportaría error y el trap ERR del subshell dispararía `on_err` falsamente
+  # (salida "Error ... sort -u", índice ya construido pero abortado en apariencia).
+  # El índice se construye leyendo el stream: `|| true` absorbe ese rc legítimo sin
+  # enmascarar un fallo de ESCALADO (Kconfig no encontrado sigue dejando el índice vacío).
+  while IFS= read -r sym; do
+    [ -n "$sym" ] || continue
+    KCONFIG_SYMBOL_KNOWN["$sym"]=1
+  done < <(
+    find "$SRC" \( -name 'Kconfig' -o -name 'Kconfig.*' \) -print0 2>/dev/null |
+      xargs -0 -r grep -hoE '^[[:space:]]*(menuconfig|config)[[:space:]]+[A-Za-z0-9_]+' 2>/dev/null |
+      awk '{print $2}' |
+      sort -u || true
+  )
+
+  KCONFIG_SYMBOL_INDEX_BUILT=true
+}
+
+kconfig_symbol_known() {
+  local sym="$1"
+  build_kconfig_symbol_index
+  [ -n "${KCONFIG_SYMBOL_KNOWN[$sym]:-}" ]
+}
+
+# v27.31.28: el índice se cachea una sola vez por proceso, así que un parche que
+# añade símbolos Kconfig (BORE mete config SCHED_BORE en init/Kconfig y config
+# MIN_BASE_SLICE_NS en kernel/Kconfig.hz) llegaba al validador con el índice del
+# árbol SIN parchear. Resultado: "ENABLE: CONFIG_SCHED_BORE no existe en esta
+# versión" para un símbolo que existe, y un "--rename" que no arreglaba nada.
+# Cualquier cambio en el árbol tiene que tirar el índice.
+kconfig_index_invalidate() {
+  KCONFIG_SYMBOL_KNOWN=()
+  KCONFIG_TYPE_INDEX_BUILT=false
+  KCONFIG_SYMBOL_INDEX_BUILT=false
+}
+
+# Tipo Kconfig de un símbolo: bool | tristate | int | hex | string (vacío = bool,
+# que es el tipo por defecto de Kconfig si el bloque no lo declara).
+# v27.31.28: hace falta porque PATCH_SYMBOLS asumía que todo era booleano y
+# forzaba a "=y" símbolos que no lo son. MIN_BASE_SLICE_NS es `int` (lo declara
+# el parche BORE en kernel/Kconfig.hz): scripts/config le ponía CONFIG_...=y,
+# olddefconfig lo devolvía a su default y la validación se quedaba en 37/38
+# para siempre, sin decir de qué símbolo se trataba.
+build_kconfig_type_index() {
+  [ "$KCONFIG_TYPE_INDEX_BUILT" = true ] && return 0
+  local pair sym tipo
+  # v27.31.29: separador TAB y IFS explícito. El motor trabaja con IFS=$'\n\t',
+  # así que un "read -r sym tipo" NO parte por el espacio: las claves acababan
+  # siendo "MIN_BASE_SLICE_NS int" enteras, ninguna búsqueda por nombre encontraba
+  # nada y TODOS los símbolos parecían booleanos (que es justo el bug que esto
+  # iba a arreglar: el int de BORE volvía a la rama de forzar a "=y").
+  while IFS=$'\t' read -r sym tipo; do
+    [ -n "$sym" ] || continue
+    KCONFIG_SYMBOL_TYPE["$sym"]="$tipo"
+  done < <(
+    find "$SRC" \( -name 'Kconfig' -o -name 'Kconfig.*' \) -print0 2>/dev/null |
+      xargs -0 -r cat 2>/dev/null |
+      awk '
+        /^[[:space:]]*(menuconfig|config)[[:space:]]+[A-Za-z0-9_]+/ {
+          if (sym != "") printf "%s\t%s\n", sym, tipo
+          sym = $2; tipo = ""; next
+        }
+        sym != "" && tipo == "" &&
+          match($0, /^[[:space:]]*(bool|tristate|int|hex|string|def_bool|def_tristate|def_int|def_hex|def_string)([[:space:]]|$)/) {
+          tipo = substr($0, RSTART, RLENGTH); gsub(/[[:space:]]/, "", tipo); sub(/^def_/, "", tipo)
+        }
+        END { if (sym != "") printf "%s\t%s\n", sym, tipo }
+      ' 2>/dev/null | sort -u || true
+  )
+  KCONFIG_TYPE_INDEX_BUILT=true
+}
+
+kconfig_symbol_type() { # vacío = bool (el tipo por defecto de Kconfig)
+  build_kconfig_type_index
+  printf '%s' "${KCONFIG_SYMBOL_TYPE[$1]:-}"
+}
+
+# v27.31.28: renombrado automático. Busca el símbolo más parecido entre los que
+# SÍ existen en el Kconfig de esta versión y lo devuelve SOLO si hay un
+# candidato único y claramente mejor que el segundo. Con dos candidatos
+#empatados no se inventa nada: es mejor pedir confirmación que activar el
+#símbolo equivocado en un kernel que se está a punto de arrancar.
+kconfig_auto_candidate() { # $1 = símbolo desconocido
+  local sym="$1" best="" second=0 best_score=0 tie=0
+  local s c i n cp score suffix best_cp=0
+  build_kconfig_symbol_index
+  [ "${#KCONFIG_SYMBOL_KNOWN[@]}" -gt 0 ] || return 0
+  s="${sym#CONFIG_}"
+  n=${#s}
+  for c in "${!KCONFIG_SYMBOL_KNOWN[@]}"; do
+    c="${c#CONFIG_}"
+    # Filtro barato: un renombrado conserva el principio o el final.
+    if [ "${c:0:3}" != "${s:0:3}" ] && [ "${c: -4}" != "${s: -4}" ]; then
+      continue
+    fi
+    cp=0
+    i=0
+    while [ "$i" -lt "$n" ] && [ "$i" -lt "${#c}" ] && [ "${s:$i:1}" = "${c:$i:1}" ]; do
+      cp=$((cp + 1)); i=$((i + 1))
+    done
+    suffix=0
+    while [ "$suffix" -lt "$n" ] && [ "$suffix" -lt "${#c}" ] \
+       && [ "${s:$((n - suffix - 1)):1}" = "${c:$(( ${#c} - suffix - 1 )):1}" ]; do
+      suffix=$((suffix + 1))
+    done
+    # Un parecido solo cuenta si comparten un trozo reconocible: 5 al principio
+    # o 6 al final (p. ej. FOO_BAR -> FOO_BAR_NEW / FOO -> NEW_FOO).
+    if [ "$cp" -lt 5 ] && [ "$suffix" -lt 6 ]; then
+      continue
+    fi
+    score=$((cp + suffix))
+    if [ "$score" -gt "$best_score" ]; then
+      second=$best_score; best_score=$score; best="$c"; best_cp=$cp; tie=0
+    elif [ "$score" -eq "$best_score" ] && [ -n "$best" ]; then
+      tie=1
+    elif [ "$score" -gt "$second" ]; then
+      second=$score
+    fi
+  done
+  # Que sea el mejor no basta: tiene que ser *el mismo nombre*. Se exige un
+  # prefijo común largo (>= 6), que ninguno sea prefijo del otro y que la
+  # diferencia sea corta (4 caracteres o menos: el final cambiado, un renombrado
+  # de verdad). Se rechazan a propósito los dos casos que parecen renombres y no
+  # lo son, porque activar el símbolo equivocado en un kernel que se va a
+  # arrancar es peor que no renombrar nada:
+  #   - división de feature: PREEMPT_DYNAMIC_KSYMS -> PREEMPT_DYNAMIC (una es
+  #     parte de la otra; encender la padre no es encender la hija)
+  #   - opción nueva: SCHED_BORE -> SCHED_BORE_MITIGATION (apareció algo, no se
+  #     renombró nada)
+  # Con la regla laxa, PERF_GUEST_EVENTS se "renombraba" a PERF_EVENTS y
+  # activaba un símbolo que el perfil no pidió nunca.
+  if [ -z "$best" ] || [ "$tie" = 1 ] || [ "$best_score" -le "$second" ]; then
+    return 0
+  fi
+  if [ "$best_cp" -lt 6 ]; then
+    return 0
+  fi
+  case "$s" in "$best"|"$best"_*|"$best"-*) return 0 ;; esac
+  case "$best" in "$s"|"$s"_*|"$s"-*) return 0 ;; esac
+  if [ $(( ${#s} > ${#best} ? ${#s} - ${#best} : ${#best} - ${#s} )) -gt 4 ]; then
+    return 0
+  fi
+  printf '%s' "$best"
+  return 0
+}
+
+# Resuelve automáticamente los símbolos de las listas efectivas que no existen en
+# el Kconfig de esta versión. Se aplica a todas (ENABLE/DISABLE/CRITICAL/SETVAL/
+# SETSTR) porque un renombrado no distingue: si el perfil pide FOO y aquí se llama
+# BAR, hay que renombrarlo en todas partes. Lo que se resuelve queda anotado en
+# APPLIED_RENAMES y se informa; con --save-auto-renames se persiste en el mapa.
+auto_resolve_effective_symbols() {
+  local o cand
+  local -a nn=()
+  local any=false
+  [ -d "$SRC" ] || return 0
+  build_kconfig_symbol_index
+  for o in "${EFF_ENABLE[@]}" "${EFF_DISABLE[@]}" "${EFF_CRITICAL[@]}" \
+           "${!EFF_SETVAL[@]}" "${!EFF_SETSTR[@]}"; do
+    [ -n "$o" ] || continue
+    if kconfig_symbol_known "$o"; then
+      nn+=("$o"); continue
+    fi
+    cand="$(kconfig_auto_candidate "$o")"
+    if [ -n "$cand" ]; then
+      nn+=("$cand")
+      APPLIED_RENAMES["$o"]="$cand"
+      AUTO_RENAMES["$o"]="$cand"
+      any=true
+    else
+      nn+=("$o")
+    fi
+  done
+  # Se reconstruyen las listas limpias, sin duplicados y con el orden original.
+  if [ "$any" = true ]; then
+    local -A seen=()
+    local -a e=() d=() c=()
+    for o in "${EFF_ENABLE[@]}"; do
+      cand="${APPLIED_RENAMES[$o]:-$o}"; [ -n "${seen[e$cand]:-}" ] || { seen[e$cand]=1; e+=("$cand"); }
+    done
+    for o in "${EFF_DISABLE[@]}"; do
+      cand="${APPLIED_RENAMES[$o]:-$o}"; [ -n "${seen[d$cand]:-}" ] || { seen[d$cand]=1; d+=("$cand"); }
+    done
+    for o in "${EFF_CRITICAL[@]}"; do
+      cand="${APPLIED_RENAMES[$o]:-$o}"; [ -n "${seen[c$cand]:-}" ] || { seen[c$cand]=1; c+=("$cand"); }
+    done
+    # v27.31.29: SETVAL/SETSTR se reconstruyen con arrays asociativos nuevos, NO
+    # con un string "SYM=$>valor". Ese round-trip estaba roto desde v27.31.28:
+    # el patrón "=*>" exige un '>' al FINAL del match, pero el valor va detrás del
+    # separador "$>", así que ${x%%=*>} y ${x#*=>} devolvían el string entero.
+    # Resultado: la clave pasaba a ser "HZ=$>1000", kconfig_symbol_known decía
+    # que no existía y el validador contaba 28 SETVAL + 1 SETSTR como "missing"
+    # con una .config perfectamente correcta.
+    local -A seen2=() nsv=() nss=()
+    for o in "${!EFF_SETVAL[@]}"; do
+      cand="${APPLIED_RENAMES[$o]:-$o}"; [ -n "${seen2[$cand]:-}" ] || { seen2[$cand]=1; nsv["$cand"]="${EFF_SETVAL[$o]}"; }
+    done
+    seen2=()
+    for o in "${!EFF_SETSTR[@]}"; do
+      cand="${APPLIED_RENAMES[$o]:-$o}"; [ -n "${seen2[$cand]:-}" ] || { seen2[$cand]=1; nss["$cand"]="${EFF_SETSTR[$o]}"; }
+    done
+    EFF_ENABLE=("${e[@]}"); EFF_DISABLE=("${d[@]}"); EFF_CRITICAL=("${c[@]}")
+    EFF_SETVAL=(); EFF_SETSTR=()
+    local k
+    for k in "${!nsv[@]}"; do EFF_SETVAL["$k"]="${nsv[$k]}"; done
+    for k in "${!nss[@]}"; do EFF_SETSTR["$k"]="${nss[$k]}"; done
+  fi
+}
+
+# ============================================================
+# V27.30.0 — OVERLAY DE COMPILACIÓN SOBRE EL PERFIL
+# Las opciones de compilación (OLEVEL, HZ, LTO, ntsync, firma de módulos) NO
+# van al perfil: mutan los arrays efectivos justo antes de apply_config_requests
+# para que viajen en la misma pasada de scripts/config, se re-normalicen en la
+# auditoría (olddefconfig) y la validación los acepte como esperados.
+# ============================================================
+# Borra un símbolo de un array EFF_*0 por su valor exacto (recompacta índices).
+eff_remove() {
+  local arr="$1" val="$2" i
+  case "$arr" in
+    EFF_ENABLE)
+      for i in "${!EFF_ENABLE[@]}"; do
+        [ "${EFF_ENABLE[$i]}" = "$val" ] && unset 'EFF_ENABLE[$i]'
+      done
+      EFF_ENABLE=("${EFF_ENABLE[@]}")
+      ;;
+    EFF_DISABLE)
+      for i in "${!EFF_DISABLE[@]}"; do
+        [ "${EFF_DISABLE[$i]}" = "$val" ] && unset 'EFF_DISABLE[$i]'
+      done
+      EFF_DISABLE=("${EFF_DISABLE[@]}")
+      ;;
+  esac
+}
+
+inject_build_overlay() {
+  local o
+
+  # Frecuencia del timer: override del pin del perfil (EFF_SETVAL[HZ]).
+  if [ "$CIZEN_TIMER_FREQ" != "inherit" ]; then
+    EFF_SETVAL["HZ"]="$CIZEN_TIMER_FREQ"
+    EXPECTED_REBEL_SET["HZ"]=1
+    info "Overlay: CONFIG_HZ=$CIZEN_TIMER_FREQ (override del perfil)."
+  fi
+
+  # Nivel de optimización (choice): 3 activa CC_OPTIMIZE_FOR_PERFORMANCE_O3 y
+  # suelta CC_OPTIMIZE_FOR_PERFORMANCE; 2 lo inverso.
+  case "$CIZEN_CFLAGS_OLEVEL" in
+    3)
+      eff_remove EFF_ENABLE CC_OPTIMIZE_FOR_PERFORMANCE
+      eff_remove EFF_ENABLE CC_OPTIMIZE_FOR_SIZE
+      add_unique enable "CC_OPTIMIZE_FOR_PERFORMANCE_O3"
+      add_unique disable "CC_OPTIMIZE_FOR_PERFORMANCE"
+      add_unique disable "CC_OPTIMIZE_FOR_SIZE"
+      EXPECTED_REBEL_SET[CC_OPTIMIZE_FOR_PERFORMANCE_O3]=1
+      EXPECTED_REBEL_SET[CC_OPTIMIZE_FOR_PERFORMANCE]=1
+      EXPECTED_REBEL_SET[CC_OPTIMIZE_FOR_SIZE]=1
+      PATCH_KCONFIG_FILTER[CC_OPTIMIZE_FOR_PERFORMANCE_O3]=1
+      info "Overlay: compilación de rendimiento -O3."
+      ;;
+    2)
+      eff_remove EFF_ENABLE CC_OPTIMIZE_FOR_PERFORMANCE_O3
+      add_unique enable "CC_OPTIMIZE_FOR_PERFORMANCE"
+      add_unique disable "CC_OPTIMIZE_FOR_PERFORMANCE_O3"
+      EXPECTED_REBEL_SET[CC_OPTIMIZE_FOR_PERFORMANCE]=1
+      EXPECTED_REBEL_SET[CC_OPTIMIZE_FOR_PERFORMANCE_O3]=1
+      PATCH_KCONFIG_FILTER[CC_OPTIMIZE_FOR_PERFORMANCE]=1
+      info "Overlay: compilación de rendimiento -O2."
+      ;;
+  esac
+
+  # LTO (clang): enlazar módulo-con-módulo al armar el kernel. Solo inyecta si
+  # la sanidad temprana (parser de args) dejó CIZEN_LLVM_LTO!=0 con clang real.
+  case "$CIZEN_LLVM_LTO" in
+    thin|full)
+      o="LTO_CLANG_${CIZEN_LLVM_LTO^^}"
+      add_unique enable "$o"
+      # v27.31.46: solo se desactivan las opciones ALTERNATIVAS. Antes se pasaban
+      # las tres (THIN/FULL/NONE) por disable, así que la elegida acababa
+      # también en EFF_DISABLE; como la pasada de scripts/config aplica primero
+      # enable y después disable, el disable pisaba al enable y la build moría en
+      # validación con "[ENABLE] CONFIG_LTO_CLANG_THIN quedó n".
+      for _lto in LTO_CLANG_THIN LTO_CLANG_FULL LTO_NONE; do
+        [ "$_lto" = "$o" ] && continue
+        add_unique disable "$_lto"
+        EXPECTED_REBEL_SET["$_lto"]=1
+      done
+      EXPECTED_REBEL_SET["$o"]=1
+      PATCH_KCONFIG_FILTER["$o"]=1
+      info "Overlay: LTO de Clang ${CIZEN_LLVM_LTO^^}."
+      ;;
+    0)
+      add_unique enable "LTO_NONE"
+      add_unique disable "LTO_CLANG_THIN"
+      add_unique disable "LTO_CLANG_FULL"
+      EXPECTED_REBEL_SET[LTO_NONE]=1
+      EXPECTED_REBEL_SET[LTO_CLANG_THIN]=1
+      EXPECTED_REBEL_SET[LTO_CLANG_FULL]=1
+      ;;
+  esac
+
+  # v27.31.45 PGO/AutoFDO: con perfil se fuerza CONFIG_AUTOFDO_CLANG (solo
+  # existe con CC_IS_CLANG; la sanidad temprana ya abortó si el compilador es
+  # gcc). El fichero solo se entrega a la fase BUILD (KCFLAGS), no a la config.
+  if [ -n "${CIZEN_PGO_PROFILE:-}" ]; then
+    add_unique enable "AUTOFDO_CLANG"
+    EXPECTED_REBEL_SET[AUTOFDO_CLANG]=1
+    PATCH_KCONFIG_FILTER[AUTOFDO_CLANG]=1
+    info "Overlay: PGO AutoFDO con $CIZEN_PGO_PROFILE."
+  fi
+
+  # NTSYNC: en mainline >= 6.10 es un CONFIG nativo (drivers/misc/ntsync.c).
+  # Para kernels más viejos se pide el parche (patch_desc_ntsync) y aquí no se
+  # fuerza símbolo alguno (el parche lo aporta).
+  if [ "$CIZEN_PATCH_NTSYNC" != "0" ] && kernel_version_ge "$VERSION" "6.10"; then
+    add_unique enable "NTSYNC"
+    EXPECTED_REBEL_SET[NTSYNC]=1
+    PATCH_KCONFIG_FILTER[NTSYNC]=1
+  fi
+
+  # Firma persistente de módulos (MODULE_SIG=y; las claves MOK se instalan tras
+  # el build y se firman los módulos en el árbol de módulos instalado).
+  if [ "$CIZEN_MODULE_SIGN" = "yes" ]; then
+    add_unique enable "MODULE_SIG"
+    EXPECTED_REBEL_SET[MODULE_SIG]=1
+    PATCH_KCONFIG_FILTER[MODULE_SIG]=1
+    info "Overlay: firma de módulos del kernel (MODULE_SIG=yes)."
+  fi
+
+  # Scheduler: si NO se aplicó ningún parche de scheduler (EEVDF/Vanilla),
+  # desactivar TODOS los schedulers alternativos para evitar que una config
+  # base previa deje uno activo. Cuando se aplicó un parche (bore, pds, etc.)
+  # los símbolos del parche ya están en EFF_ENABLE y no se tocan.
+  if [ -z "${PATCHES_APPLIED[*]:-}" ]; then
+    for o in SCHED_BORE SCHED_PDS SCHED_BMQ SCHED_LFBMQ SCHED_MUQSS SCHED_ALT; do
+      add_unique disable "$o"
+      EXPECTED_REBEL_SET["$o"]=1
+    done
+    info "Overlay: scheduler EEVDF (vanilla) — schedulers alternativos desactivados."
+  fi
+
+  unset o
+}
+
+# ============================================================
+# V27.30.0 — FRAGS DE CONFIGURACIÓN REUTILIZABLES (.frag)
+# Un frag es un mini-perfil portable con líneas CONFIG_X=y|m|n, valores y
+# cadenas, o "# CONFIG_X is not set". Soporta "#include otro.frag" (relativo al
+# directorio). Se aplican DESPUÉS del perfil (y del overlay), así que permiten
+# afinar sin tocar el perfil; no pueden contradecir símbolos que el perfil
+# exige (la validación lo detecta igualmente).
+# ============================================================
+process_frag_file() {
+  local f="$1" line inc
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ ^[[:space:]]*#include[[:space:]]+([^[:space:]]+)[[:space:]]*$ ]]; then
+      inc="$CIZEN_FRAGS_DIR/${BASH_REMATCH[1]}"
+      if [ -f "$inc" ] && process_frag_file "$inc"; then
+        :
+      else
+        warn "frag: include no encontrado: ${BASH_REMATCH[1]}"
+      fi
+      continue
+    fi
+    printf '%s\n' "$line"
+  done < "$f"
+}
+
+apply_config_fragments() {
+  [ -d "$CIZEN_FRAGS_DIR" ] || return 0
+
+  local -a __frags=() __args=()
+  local f line k v parsed got=0
+  shopt -s nullglob
+  while IFS= read -r -d '' f; do __frags+=("$f"); done \
+    < <(find "$CIZEN_FRAGS_DIR" -maxdepth 1 -type f -name '*.frag' -print0 2>/dev/null || true)
+  shopt -u nullglob
+  [ "${#__frags[@]}" -gt 0 ] || return 0
+
+  while IFS= read -r f; do
+    __args=()
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        '') continue ;;
+        '# CONFIG_'*' is not set')
+          k="${line#\# }"; k="${k%% is not set*}"
+          __args+=(--disable "${k#CONFIG_}") ;;
+        '#'*) continue ;;
+        CONFIG_*=*)
+          k="${line%%=*}"; v="${line#*=}"
+          case "$v" in
+            y) __args+=(--enable "${k#CONFIG_}") ;;
+            m) __args+=(--module "${k#CONFIG_}") ;;
+            n) __args+=(--disable "${k#CONFIG_}") ;;
+            *)
+              if [[ "$v" =~ ^\"(.*)\"$ ]]; then
+                __args+=(--set-str "${k#CONFIG_}" "${BASH_REMATCH[1]}")
+              else
+                __args+=(--set-val "${k#CONFIG_}" "$v")
+              fi
+              ;;
+          esac
+          ;;
+        *)
+          warn "frag ${f##*/}: línea ignorada: $line" ;;
+      esac
+    done < <(process_frag_file "$f")
+
+    [ "${#__args[@]}" -gt 0 ] || continue
+    if ( cd "$SRC" && scripts/config "${__args[@]}" ) >/dev/null 2>&1; then
+      got=$((got + 1))
+      info "Frag aplicado: ${f##*/} ($(( ${#__args[@]} / 2 )) directivas)"
+    else
+      warn "El frag ${f##*/} no se pudo aplicar; build continúa sin él."
+    fi
+  done < <(printf '%s\n' "${__frags[@]}" | sort -V)
+
+  if [ "$got" -gt 0 ]; then
+    ok "Frags de configuración: $got aplicado(s) desde $CIZEN_FRAGS_DIR (se re-normalizan en la auditoría)."
+  fi
+  return 0
+}
+
+apply_config_requests() {
+  local o rc=0
+  local -a args=()
+
+  # Antes de tocar nada: si el perfil pide un símbolo que esta versión llama de
+  # otra forma, se resuelve solo (cuando el candidato es único) y se avisa de lo
+  # que se renombró, en vez de saltar el símbolo y dejar la validación cojea.
+  auto_resolve_effective_symbols
+
+  if [ "${PROFILE_CHANGED:-false}" = true ]; then
+    log "Preparando ${#EFF_ENABLE[@]} activaciones, ${#EFF_DISABLE[@]} desactivaciones, ${#EFF_SETVAL[@]} valores numéricos y ${#EFF_SETSTR[@]} valores de texto..."
+  else
+    log "Preparando configuración Cizen..."
+  fi
+
+  for o in "${EFF_ENABLE[@]}"; do
+    if kconfig_symbol_known "$o"; then
+      args+=(--enable "$o")
+    else
+      warn "ENABLE: CONFIG_$o no existe en esta versión ni tiene un renombrado inequívoco en su Kconfig; se omite."
+      warn "       (si ya sabes cómo se llama aquí: $0 --rename $o=OTRO_NOMBRE)"
+    fi
+  done
+
+  for o in "${EFF_DISABLE[@]}"; do
+    if kconfig_symbol_known "$o"; then
+      args+=(--disable "$o")
+    fi
+  done
+
+  for o in "${!EFF_SETVAL[@]}"; do
+    if kconfig_symbol_known "$o"; then
+      args+=(--set-val "$o" "${EFF_SETVAL[$o]}")
+    else
+      warn "SETVAL: CONFIG_$o no existe en el Kconfig de esta versión."
+    fi
+  done
+
+  for o in "${!EFF_SETSTR[@]}"; do
+    if kconfig_symbol_known "$o"; then
+      args+=(--set-str "$o" "${EFF_SETSTR[$o]}")
+    else
+      warn "SETSTR: CONFIG_$o no existe en el Kconfig de esta versión."
+    fi
+  done
+
+  if [ "${#args[@]}" -gt 0 ]; then
+    if ! scripts/config "${args[@]}"; then
+      err "scripts/config falló al aplicar el perfil en una única pasada."
+      rc=1
+    fi
+  fi
+
+  return "$rc"
+}
 add_unique() {
   local arr_name="$1" sym="$2"
   # Un símbolo NO puede quedar a la vez en EFF_ENABLE y EFF_DISABLE: la pasada
@@ -6224,499 +6732,6 @@ config_symbol_state() {
   fi
 }
 
-# Existencia real en el Kconfig de la versión objetivo. No depende de que el
-# símbolo aparezca previamente en .config; Kconfig puede materializarlo después
-# de olddefconfig. El resultado se cachea durante la ejecución.
-declare -A KCONFIG_SYMBOL_KNOWN=()
-declare -A KCONFIG_SYMBOL_TYPE=()
-KCONFIG_TYPE_INDEX_BUILT=false
-KCONFIG_SYMBOL_INDEX_BUILT=false
-
-build_kconfig_symbol_index() {
-  [ "$KCONFIG_SYMBOL_INDEX_BUILT" = true ] && return 0
-
-  local sym
-  # El pipeline interno puede devolver rc!=0 legítimamente: xargs parte la lista
-  # en varios lotes y un lote cuyo grep no encuentre ningún `config`/`menuconfig`
-  # sale con status 1. Con `set -Eeuo pipefail` (heredado por el subshell del
-  # process-substitution), el `find | xargs | grep | awk | sort` del pipeline entero
-  # reportaría error y el trap ERR del subshell dispararía `on_err` falsamente
-  # (salida "Error ... sort -u", índice ya construido pero abortado en apariencia).
-  # El índice se construye leyendo el stream: `|| true` absorbe ese rc legítimo sin
-  # enmascarar un fallo de ESCALADO (Kconfig no encontrado sigue dejando el índice vacío).
-  while IFS= read -r sym; do
-    [ -n "$sym" ] || continue
-    KCONFIG_SYMBOL_KNOWN["$sym"]=1
-  done < <(
-    find "$SRC" \( -name 'Kconfig' -o -name 'Kconfig.*' \) -print0 2>/dev/null |
-      xargs -0 -r grep -hoE '^[[:space:]]*(menuconfig|config)[[:space:]]+[A-Za-z0-9_]+' 2>/dev/null |
-      awk '{print $2}' |
-      sort -u || true
-  )
-
-  KCONFIG_SYMBOL_INDEX_BUILT=true
-}
-
-kconfig_symbol_known() {
-  local sym="$1"
-  build_kconfig_symbol_index
-  [ -n "${KCONFIG_SYMBOL_KNOWN[$sym]:-}" ]
-}
-
-# v27.31.28: el índice se cachea una sola vez por proceso, así que un parche que
-# añade símbolos Kconfig (BORE mete config SCHED_BORE en init/Kconfig y config
-# MIN_BASE_SLICE_NS en kernel/Kconfig.hz) llegaba al validador con el índice del
-# árbol SIN parchear. Resultado: "ENABLE: CONFIG_SCHED_BORE no existe en esta
-# versión" para un símbolo que existe, y un "--rename" que no arreglaba nada.
-# Cualquier cambio en el árbol tiene que tirar el índice.
-kconfig_index_invalidate() {
-  KCONFIG_SYMBOL_KNOWN=()
-  KCONFIG_TYPE_INDEX_BUILT=false
-  KCONFIG_SYMBOL_INDEX_BUILT=false
-}
-
-# Tipo Kconfig de un símbolo: bool | tristate | int | hex | string (vacío = bool,
-# que es el tipo por defecto de Kconfig si el bloque no lo declara).
-# v27.31.28: hace falta porque PATCH_SYMBOLS asumía que todo era booleano y
-# forzaba a "=y" símbolos que no lo son. MIN_BASE_SLICE_NS es `int` (lo declara
-# el parche BORE en kernel/Kconfig.hz): scripts/config le ponía CONFIG_...=y,
-# olddefconfig lo devolvía a su default y la validación se quedaba en 37/38
-# para siempre, sin decir de qué símbolo se trataba.
-build_kconfig_type_index() {
-  [ "$KCONFIG_TYPE_INDEX_BUILT" = true ] && return 0
-  local pair sym tipo
-  # v27.31.29: separador TAB y IFS explícito. El motor trabaja con IFS=$'\n\t',
-  # así que un "read -r sym tipo" NO parte por el espacio: las claves acababan
-  # siendo "MIN_BASE_SLICE_NS int" enteras, ninguna búsqueda por nombre encontraba
-  # nada y TODOS los símbolos parecían booleanos (que es justo el bug que esto
-  # iba a arreglar: el int de BORE volvía a la rama de forzar a "=y").
-  while IFS=$'\t' read -r sym tipo; do
-    [ -n "$sym" ] || continue
-    KCONFIG_SYMBOL_TYPE["$sym"]="$tipo"
-  done < <(
-    find "$SRC" \( -name 'Kconfig' -o -name 'Kconfig.*' \) -print0 2>/dev/null |
-      xargs -0 -r cat 2>/dev/null |
-      awk '
-        /^[[:space:]]*(menuconfig|config)[[:space:]]+[A-Za-z0-9_]+/ {
-          if (sym != "") printf "%s\t%s\n", sym, tipo
-          sym = $2; tipo = ""; next
-        }
-        sym != "" && tipo == "" &&
-          match($0, /^[[:space:]]*(bool|tristate|int|hex|string|def_bool|def_tristate|def_int|def_hex|def_string)([[:space:]]|$)/) {
-          tipo = substr($0, RSTART, RLENGTH); gsub(/[[:space:]]/, "", tipo); sub(/^def_/, "", tipo)
-        }
-        END { if (sym != "") printf "%s\t%s\n", sym, tipo }
-      ' 2>/dev/null | sort -u || true
-  )
-  KCONFIG_TYPE_INDEX_BUILT=true
-}
-
-kconfig_symbol_type() { # vacío = bool (el tipo por defecto de Kconfig)
-  build_kconfig_type_index
-  printf '%s' "${KCONFIG_SYMBOL_TYPE[$1]:-}"
-}
-
-# v27.31.28: renombrado automático. Busca el símbolo más parecido entre los que
-# SÍ existen en el Kconfig de esta versión y lo devuelve SOLO si hay un
-# candidato único y claramente mejor que el segundo. Con dos candidatos
-#empatados no se inventa nada: es mejor pedir confirmación que activar el
-#símbolo equivocado en un kernel que se está a punto de arrancar.
-kconfig_auto_candidate() { # $1 = símbolo desconocido
-  local sym="$1" best="" second=0 best_score=0 tie=0
-  local s c i n cp score suffix best_cp=0
-  build_kconfig_symbol_index
-  [ "${#KCONFIG_SYMBOL_KNOWN[@]}" -gt 0 ] || return 0
-  s="${sym#CONFIG_}"
-  n=${#s}
-  for c in "${!KCONFIG_SYMBOL_KNOWN[@]}"; do
-    c="${c#CONFIG_}"
-    # Filtro barato: un renombrado conserva el principio o el final.
-    if [ "${c:0:3}" != "${s:0:3}" ] && [ "${c: -4}" != "${s: -4}" ]; then
-      continue
-    fi
-    cp=0
-    i=0
-    while [ "$i" -lt "$n" ] && [ "$i" -lt "${#c}" ] && [ "${s:$i:1}" = "${c:$i:1}" ]; do
-      cp=$((cp + 1)); i=$((i + 1))
-    done
-    suffix=0
-    while [ "$suffix" -lt "$n" ] && [ "$suffix" -lt "${#c}" ] \
-       && [ "${s:$((n - suffix - 1)):1}" = "${c:$(( ${#c} - suffix - 1 )):1}" ]; do
-      suffix=$((suffix + 1))
-    done
-    # Un parecido solo cuenta si comparten un trozo reconocible: 5 al principio
-    # o 6 al final (p. ej. FOO_BAR -> FOO_BAR_NEW / FOO -> NEW_FOO).
-    if [ "$cp" -lt 5 ] && [ "$suffix" -lt 6 ]; then
-      continue
-    fi
-    score=$((cp + suffix))
-    if [ "$score" -gt "$best_score" ]; then
-      second=$best_score; best_score=$score; best="$c"; best_cp=$cp; tie=0
-    elif [ "$score" -eq "$best_score" ] && [ -n "$best" ]; then
-      tie=1
-    elif [ "$score" -gt "$second" ]; then
-      second=$score
-    fi
-  done
-  # Que sea el mejor no basta: tiene que ser *el mismo nombre*. Se exige un
-  # prefijo común largo (>= 6), que ninguno sea prefijo del otro y que la
-  # diferencia sea corta (4 caracteres o menos: el final cambiado, un renombrado
-  # de verdad). Se rechazan a propósito los dos casos que parecen renombres y no
-  # lo son, porque activar el símbolo equivocado en un kernel que se va a
-  # arrancar es peor que no renombrar nada:
-  #   - división de feature: PREEMPT_DYNAMIC_KSYMS -> PREEMPT_DYNAMIC (una es
-  #     parte de la otra; encender la padre no es encender la hija)
-  #   - opción nueva: SCHED_BORE -> SCHED_BORE_MITIGATION (apareció algo, no se
-  #     renombró nada)
-  # Con la regla laxa, PERF_GUEST_EVENTS se "renombraba" a PERF_EVENTS y
-  # activaba un símbolo que el perfil no pidió nunca.
-  if [ -z "$best" ] || [ "$tie" = 1 ] || [ "$best_score" -le "$second" ]; then
-    return 0
-  fi
-  if [ "$best_cp" -lt 6 ]; then
-    return 0
-  fi
-  case "$s" in "$best"|"$best"_*|"$best"-*) return 0 ;; esac
-  case "$best" in "$s"|"$s"_*|"$s"-*) return 0 ;; esac
-  if [ $(( ${#s} > ${#best} ? ${#s} - ${#best} : ${#best} - ${#s} )) -gt 4 ]; then
-    return 0
-  fi
-  printf '%s' "$best"
-  return 0
-}
-
-# Resuelve automáticamente los símbolos de las listas efectivas que no existen en
-# el Kconfig de esta versión. Se aplica a todas (ENABLE/DISABLE/CRITICAL/SETVAL/
-# SETSTR) porque un renombrado no distingue: si el perfil pide FOO y aquí se llama
-# BAR, hay que renombrarlo en todas partes. Lo que se resuelve queda anotado en
-# APPLIED_RENAMES y se informa; con --save-auto-renames se persiste en el mapa.
-auto_resolve_effective_symbols() {
-  local o cand
-  local -a nn=()
-  local any=false
-  [ -d "$SRC" ] || return 0
-  build_kconfig_symbol_index
-  for o in "${EFF_ENABLE[@]}" "${EFF_DISABLE[@]}" "${EFF_CRITICAL[@]}" \
-           "${!EFF_SETVAL[@]}" "${!EFF_SETSTR[@]}"; do
-    [ -n "$o" ] || continue
-    if kconfig_symbol_known "$o"; then
-      nn+=("$o"); continue
-    fi
-    cand="$(kconfig_auto_candidate "$o")"
-    if [ -n "$cand" ]; then
-      nn+=("$cand")
-      APPLIED_RENAMES["$o"]="$cand"
-      AUTO_RENAMES["$o"]="$cand"
-      any=true
-    else
-      nn+=("$o")
-    fi
-  done
-  # Se reconstruyen las listas limpias, sin duplicados y con el orden original.
-  if [ "$any" = true ]; then
-    local -A seen=()
-    local -a e=() d=() c=()
-    for o in "${EFF_ENABLE[@]}"; do
-      cand="${APPLIED_RENAMES[$o]:-$o}"; [ -n "${seen[e$cand]:-}" ] || { seen[e$cand]=1; e+=("$cand"); }
-    done
-    for o in "${EFF_DISABLE[@]}"; do
-      cand="${APPLIED_RENAMES[$o]:-$o}"; [ -n "${seen[d$cand]:-}" ] || { seen[d$cand]=1; d+=("$cand"); }
-    done
-    for o in "${EFF_CRITICAL[@]}"; do
-      cand="${APPLIED_RENAMES[$o]:-$o}"; [ -n "${seen[c$cand]:-}" ] || { seen[c$cand]=1; c+=("$cand"); }
-    done
-    # v27.31.29: SETVAL/SETSTR se reconstruyen con arrays asociativos nuevos, NO
-    # con un string "SYM=$>valor". Ese round-trip estaba roto desde v27.31.28:
-    # el patrón "=*>" exige un '>' al FINAL del match, pero el valor va detrás del
-    # separador "$>", así que ${x%%=*>} y ${x#*=>} devolvían el string entero.
-    # Resultado: la clave pasaba a ser "HZ=$>1000", kconfig_symbol_known decía
-    # que no existía y el validador contaba 28 SETVAL + 1 SETSTR como "missing"
-    # con una .config perfectamente correcta.
-    local -A seen2=() nsv=() nss=()
-    for o in "${!EFF_SETVAL[@]}"; do
-      cand="${APPLIED_RENAMES[$o]:-$o}"; [ -n "${seen2[$cand]:-}" ] || { seen2[$cand]=1; nsv["$cand"]="${EFF_SETVAL[$o]}"; }
-    done
-    seen2=()
-    for o in "${!EFF_SETSTR[@]}"; do
-      cand="${APPLIED_RENAMES[$o]:-$o}"; [ -n "${seen2[$cand]:-}" ] || { seen2[$cand]=1; nss["$cand"]="${EFF_SETSTR[$o]}"; }
-    done
-    EFF_ENABLE=("${e[@]}"); EFF_DISABLE=("${d[@]}"); EFF_CRITICAL=("${c[@]}")
-    EFF_SETVAL=(); EFF_SETSTR=()
-    local k
-    for k in "${!nsv[@]}"; do EFF_SETVAL["$k"]="${nsv[$k]}"; done
-    for k in "${!nss[@]}"; do EFF_SETSTR["$k"]="${nss[$k]}"; done
-  fi
-}
-
-# ============================================================
-# V27.30.0 — OVERLAY DE COMPILACIÓN SOBRE EL PERFIL
-# Las opciones de compilación (OLEVEL, HZ, LTO, ntsync, firma de módulos) NO
-# van al perfil: mutan los arrays efectivos justo antes de apply_config_requests
-# para que viajen en la misma pasada de scripts/config, se re-normalicen en la
-# auditoría (olddefconfig) y la validación los acepte como esperados.
-# ============================================================
-# Borra un símbolo de un array EFF_*0 por su valor exacto (recompacta índices).
-eff_remove() {
-  local arr="$1" val="$2" i
-  case "$arr" in
-    EFF_ENABLE)
-      for i in "${!EFF_ENABLE[@]}"; do
-        [ "${EFF_ENABLE[$i]}" = "$val" ] && unset 'EFF_ENABLE[$i]'
-      done
-      EFF_ENABLE=("${EFF_ENABLE[@]}")
-      ;;
-    EFF_DISABLE)
-      for i in "${!EFF_DISABLE[@]}"; do
-        [ "${EFF_DISABLE[$i]}" = "$val" ] && unset 'EFF_DISABLE[$i]'
-      done
-      EFF_DISABLE=("${EFF_DISABLE[@]}")
-      ;;
-  esac
-}
-
-inject_build_overlay() {
-  local o
-
-  # Frecuencia del timer: override del pin del perfil (EFF_SETVAL[HZ]).
-  if [ "$CIZEN_TIMER_FREQ" != "inherit" ]; then
-    EFF_SETVAL["HZ"]="$CIZEN_TIMER_FREQ"
-    EXPECTED_REBEL_SET["HZ"]=1
-    info "Overlay: CONFIG_HZ=$CIZEN_TIMER_FREQ (override del perfil)."
-  fi
-
-  # Nivel de optimización (choice): 3 activa CC_OPTIMIZE_FOR_PERFORMANCE_O3 y
-  # suelta CC_OPTIMIZE_FOR_PERFORMANCE; 2 lo inverso.
-  case "$CIZEN_CFLAGS_OLEVEL" in
-    3)
-      eff_remove EFF_ENABLE CC_OPTIMIZE_FOR_PERFORMANCE
-      eff_remove EFF_ENABLE CC_OPTIMIZE_FOR_SIZE
-      add_unique enable "CC_OPTIMIZE_FOR_PERFORMANCE_O3"
-      add_unique disable "CC_OPTIMIZE_FOR_PERFORMANCE"
-      add_unique disable "CC_OPTIMIZE_FOR_SIZE"
-      EXPECTED_REBEL_SET[CC_OPTIMIZE_FOR_PERFORMANCE_O3]=1
-      EXPECTED_REBEL_SET[CC_OPTIMIZE_FOR_PERFORMANCE]=1
-      EXPECTED_REBEL_SET[CC_OPTIMIZE_FOR_SIZE]=1
-      PATCH_KCONFIG_FILTER[CC_OPTIMIZE_FOR_PERFORMANCE_O3]=1
-      info "Overlay: compilación de rendimiento -O3."
-      ;;
-    2)
-      eff_remove EFF_ENABLE CC_OPTIMIZE_FOR_PERFORMANCE_O3
-      add_unique enable "CC_OPTIMIZE_FOR_PERFORMANCE"
-      add_unique disable "CC_OPTIMIZE_FOR_PERFORMANCE_O3"
-      EXPECTED_REBEL_SET[CC_OPTIMIZE_FOR_PERFORMANCE]=1
-      EXPECTED_REBEL_SET[CC_OPTIMIZE_FOR_PERFORMANCE_O3]=1
-      PATCH_KCONFIG_FILTER[CC_OPTIMIZE_FOR_PERFORMANCE]=1
-      info "Overlay: compilación de rendimiento -O2."
-      ;;
-  esac
-
-  # LTO (clang): enlazar módulo-con-módulo al armar el kernel. Solo inyecta si
-  # la sanidad temprana (parser de args) dejó CIZEN_LLVM_LTO!=0 con clang real.
-  case "$CIZEN_LLVM_LTO" in
-    thin|full)
-      o="LTO_CLANG_${CIZEN_LLVM_LTO^^}"
-      add_unique enable "$o"
-      # v27.31.46: solo se desactivan las opciones ALTERNATIVAS. Antes se pasaban
-      # las tres (THIN/FULL/NONE) por disable, así que la elegida acababa
-      # también en EFF_DISABLE; como la pasada de scripts/config aplica primero
-      # enable y después disable, el disable pisaba al enable y la build moría en
-      # validación con "[ENABLE] CONFIG_LTO_CLANG_THIN quedó n".
-      for _lto in LTO_CLANG_THIN LTO_CLANG_FULL LTO_NONE; do
-        [ "$_lto" = "$o" ] && continue
-        add_unique disable "$_lto"
-        EXPECTED_REBEL_SET["$_lto"]=1
-      done
-      EXPECTED_REBEL_SET["$o"]=1
-      PATCH_KCONFIG_FILTER["$o"]=1
-      info "Overlay: LTO de Clang ${CIZEN_LLVM_LTO^^}."
-      ;;
-    0)
-      add_unique enable "LTO_NONE"
-      add_unique disable "LTO_CLANG_THIN"
-      add_unique disable "LTO_CLANG_FULL"
-      EXPECTED_REBEL_SET[LTO_NONE]=1
-      EXPECTED_REBEL_SET[LTO_CLANG_THIN]=1
-      EXPECTED_REBEL_SET[LTO_CLANG_FULL]=1
-      ;;
-  esac
-
-  # v27.31.45 PGO/AutoFDO: con perfil se fuerza CONFIG_AUTOFDO_CLANG (solo
-  # existe con CC_IS_CLANG; la sanidad temprana ya abortó si el compilador es
-  # gcc). El fichero solo se entrega a la fase BUILD (KCFLAGS), no a la config.
-  if [ -n "${CIZEN_PGO_PROFILE:-}" ]; then
-    add_unique enable "AUTOFDO_CLANG"
-    EXPECTED_REBEL_SET[AUTOFDO_CLANG]=1
-    PATCH_KCONFIG_FILTER[AUTOFDO_CLANG]=1
-    info "Overlay: PGO AutoFDO con $CIZEN_PGO_PROFILE."
-  fi
-
-  # NTSYNC: en mainline >= 6.10 es un CONFIG nativo (drivers/misc/ntsync.c).
-  # Para kernels más viejos se pide el parche (patch_desc_ntsync) y aquí no se
-  # fuerza símbolo alguno (el parche lo aporta).
-  if [ "$CIZEN_PATCH_NTSYNC" != "0" ] && kernel_version_ge "$VERSION" "6.10"; then
-    add_unique enable "NTSYNC"
-    EXPECTED_REBEL_SET[NTSYNC]=1
-    PATCH_KCONFIG_FILTER[NTSYNC]=1
-  fi
-
-  # Firma persistente de módulos (MODULE_SIG=y; las claves MOK se instalan tras
-  # el build y se firman los módulos en el árbol de módulos instalado).
-  if [ "$CIZEN_MODULE_SIGN" = "yes" ]; then
-    add_unique enable "MODULE_SIG"
-    EXPECTED_REBEL_SET[MODULE_SIG]=1
-    PATCH_KCONFIG_FILTER[MODULE_SIG]=1
-    info "Overlay: firma de módulos del kernel (MODULE_SIG=yes)."
-  fi
-
-  # Scheduler: si NO se aplicó ningún parche de scheduler (EEVDF/Vanilla),
-  # desactivar TODOS los schedulers alternativos para evitar que una config
-  # base previa deje uno activo. Cuando se aplicó un parche (bore, pds, etc.)
-  # los símbolos del parche ya están en EFF_ENABLE y no se tocan.
-  if [ -z "${PATCHES_APPLIED[*]:-}" ]; then
-    for o in SCHED_BORE SCHED_PDS SCHED_BMQ SCHED_LFBMQ SCHED_MUQSS SCHED_ALT; do
-      add_unique disable "$o"
-      EXPECTED_REBEL_SET["$o"]=1
-    done
-    info "Overlay: scheduler EEVDF (vanilla) — schedulers alternativos desactivados."
-  fi
-
-  unset o
-}
-
-# ============================================================
-# V27.30.0 — FRAGS DE CONFIGURACIÓN REUTILIZABLES (.frag)
-# Un frag es un mini-perfil portable con líneas CONFIG_X=y|m|n, valores y
-# cadenas, o "# CONFIG_X is not set". Soporta "#include otro.frag" (relativo al
-# directorio). Se aplican DESPUÉS del perfil (y del overlay), así que permiten
-# afinar sin tocar el perfil; no pueden contradecir símbolos que el perfil
-# exige (la validación lo detecta igualmente).
-# ============================================================
-process_frag_file() {
-  local f="$1" line inc
-  while IFS= read -r line || [ -n "$line" ]; do
-    if [[ "$line" =~ ^[[:space:]]*#include[[:space:]]+([^[:space:]]+)[[:space:]]*$ ]]; then
-      inc="$CIZEN_FRAGS_DIR/${BASH_REMATCH[1]}"
-      if [ -f "$inc" ] && process_frag_file "$inc"; then
-        :
-      else
-        warn "frag: include no encontrado: ${BASH_REMATCH[1]}"
-      fi
-      continue
-    fi
-    printf '%s\n' "$line"
-  done < "$f"
-}
-
-apply_config_fragments() {
-  [ -d "$CIZEN_FRAGS_DIR" ] || return 0
-
-  local -a __frags=() __args=()
-  local f line k v parsed got=0
-  shopt -s nullglob
-  while IFS= read -r -d '' f; do __frags+=("$f"); done \
-    < <(find "$CIZEN_FRAGS_DIR" -maxdepth 1 -type f -name '*.frag' -print0 2>/dev/null || true)
-  shopt -u nullglob
-  [ "${#__frags[@]}" -gt 0 ] || return 0
-
-  while IFS= read -r f; do
-    __args=()
-    while IFS= read -r line || [ -n "$line" ]; do
-      case "$line" in
-        '') continue ;;
-        '# CONFIG_'*' is not set')
-          k="${line#\# }"; k="${k%% is not set*}"
-          __args+=(--disable "${k#CONFIG_}") ;;
-        '#'*) continue ;;
-        CONFIG_*=*)
-          k="${line%%=*}"; v="${line#*=}"
-          case "$v" in
-            y) __args+=(--enable "${k#CONFIG_}") ;;
-            m) __args+=(--module "${k#CONFIG_}") ;;
-            n) __args+=(--disable "${k#CONFIG_}") ;;
-            *)
-              if [[ "$v" =~ ^\"(.*)\"$ ]]; then
-                __args+=(--set-str "${k#CONFIG_}" "${BASH_REMATCH[1]}")
-              else
-                __args+=(--set-val "${k#CONFIG_}" "$v")
-              fi
-              ;;
-          esac
-          ;;
-        *)
-          warn "frag ${f##*/}: línea ignorada: $line" ;;
-      esac
-    done < <(process_frag_file "$f")
-
-    [ "${#__args[@]}" -gt 0 ] || continue
-    if ( cd "$SRC" && scripts/config "${__args[@]}" ) >/dev/null 2>&1; then
-      got=$((got + 1))
-      info "Frag aplicado: ${f##*/} ($(( ${#__args[@]} / 2 )) directivas)"
-    else
-      warn "El frag ${f##*/} no se pudo aplicar; build continúa sin él."
-    fi
-  done < <(printf '%s\n' "${__frags[@]}" | sort -V)
-
-  if [ "$got" -gt 0 ]; then
-    ok "Frags de configuración: $got aplicado(s) desde $CIZEN_FRAGS_DIR (se re-normalizan en la auditoría)."
-  fi
-  return 0
-}
-
-apply_config_requests() {
-  local o rc=0
-  local -a args=()
-
-  # Antes de tocar nada: si el perfil pide un símbolo que esta versión llama de
-  # otra forma, se resuelve solo (cuando el candidato es único) y se avisa de lo
-  # que se renombró, en vez de saltar el símbolo y dejar la validación cojea.
-  auto_resolve_effective_symbols
-
-  if [ "${PROFILE_CHANGED:-false}" = true ]; then
-    log "Preparando ${#EFF_ENABLE[@]} activaciones, ${#EFF_DISABLE[@]} desactivaciones, ${#EFF_SETVAL[@]} valores numéricos y ${#EFF_SETSTR[@]} valores de texto..."
-  else
-    log "Preparando configuración Cizen..."
-  fi
-
-  for o in "${EFF_ENABLE[@]}"; do
-    if kconfig_symbol_known "$o"; then
-      args+=(--enable "$o")
-    else
-      warn "ENABLE: CONFIG_$o no existe en esta versión ni tiene un renombrado inequívoco en su Kconfig; se omite."
-      warn "       (si ya sabes cómo se llama aquí: $0 --rename $o=OTRO_NOMBRE)"
-    fi
-  done
-
-  for o in "${EFF_DISABLE[@]}"; do
-    if kconfig_symbol_known "$o"; then
-      args+=(--disable "$o")
-    fi
-  done
-
-  for o in "${!EFF_SETVAL[@]}"; do
-    if kconfig_symbol_known "$o"; then
-      args+=(--set-val "$o" "${EFF_SETVAL[$o]}")
-    else
-      warn "SETVAL: CONFIG_$o no existe en el Kconfig de esta versión."
-    fi
-  done
-
-  for o in "${!EFF_SETSTR[@]}"; do
-    if kconfig_symbol_known "$o"; then
-      args+=(--set-str "$o" "${EFF_SETSTR[$o]}")
-    else
-      warn "SETSTR: CONFIG_$o no existe en el Kconfig de esta versión."
-    fi
-  done
-
-  if [ "${#args[@]}" -gt 0 ]; then
-    if ! scripts/config "${args[@]}"; then
-      err "scripts/config falló al aplicar el perfil en una única pasada."
-      rc=1
-    fi
-  fi
-
-  return "$rc"
-}
 
 run_kconfig_audit() {
   export KCONFIG_WARN_UNKNOWN_SYMBOLS=1

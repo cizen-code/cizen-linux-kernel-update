@@ -4090,6 +4090,38 @@ else
   rec fail "add_unique: EFF_ENABLE/EFF_DISABLE se solapan ($_au_bad)"
 fi
 
+# v27.31.48: ORDEN DE DEFINICIÓN. El motor se ejecuta línea a línea mientras bash
+# lo lee, así que una llamada a nivel superior solo ve lo que ya ha leído.
+# build_effective_arrays() se invoca en el nivel superior y su cierre transitivo
+# usaba eff_remove() y apply_config_requests(), definidos miles de líneas más
+# abajo. Con un símbolo a la vez en OPTION_ENABLE y en OPTION_DISABLE (el motor
+# activaba DEBUG_INFO_BTF y el perfil lo desactivaba) add_unique() reventaba con
+# "line 1538: eff_remove: orden no encontrada" y el preflight abortaba con
+# Error 127 sin llegar a compilar.
+# Los tests de arriba NO lo detectaban: evalúan a mano eff_remove y add_unique en
+# el orden correcto, así que el fallo solo se manifiesta en la ejecución real.
+# Aquí se comprueba el orden real del fichero.
+_ord_bad=""
+_ord_call="$(grep -n '^build_effective_arrays$' "$MOTOR" | head -1 | cut -d: -f1)"
+if [ -z "$_ord_call" ]; then
+  rec fail "orden: no aparece la invocación de nivel superior de build_effective_arrays"
+else
+  for _f in build_kconfig_symbol_index kconfig_symbol_known kconfig_auto_candidate \
+           auto_resolve_effective_symbols eff_remove apply_config_requests; do
+    _ord_def="$(grep -n "^${_f}() {" "$MOTOR" | head -1 | cut -d: -f1)"
+    if [ -z "$_ord_def" ]; then
+      _ord_bad="$_ord_bad ${_f}(sin definicion);"
+    elif [ "$_ord_def" -ge "$_ord_call" ]; then
+      _ord_bad="$_ord_bad ${_f}(L${_ord_def}>=L${_ord_call});"
+    fi
+  done
+  if [ -z "$_ord_bad" ]; then
+    rec ok "orden: el cierre transitivo de build_effective_arrays() esta definido antes de su llamada (L${_ord_call})"
+  else
+    rec fail "orden: build_effective_arrays() usa funciones definidas despues de la llamada ($_ord_bad) -> 'orden no encontrada'"
+  fi
+fi
+
 # Übersicht del barrido en cizen-uki-sync: el fallback objcopy tiene que embeber
 # .initrd (antes producía una UKI sin initrd que la verificación descartaba).
 if sed -n '/^build_uki() {/,/^}/p' "$UKISYNC" | grep -q -- '--add-section .initrd="\$initrd"'; then
@@ -4116,18 +4148,31 @@ PROFILE_="$(dirname "$MOTOR")/profiles/cizen-optiplex7050.conf"
 PGO_="$(dirname "$MOTOR")/pgo-collect.sh"
 if [ -f "$PROFILE_" ] && [ -f "$PGO_" ]; then
   if bash -n "$PROFILE_" && bash -n "$PGO_" && bash -n "$MOTOR"; then
-    rec ok "v27.31.45: sintaxis OK (motor, perfil v5.13.0 y pgo-collect.sh)"
+    rec ok "sintaxis OK (motor, perfil Cizen y pgo-collect.sh)"
   else
     rec fail "v27.31.45: error de sintaxis (motor/perfil/pgo-collect.sh)"
   fi
-  MO_="$(awk 'BEGIN{b=0;n=0} /^declare -a OPTS_ENABLE=\($/ {b=1;next} /^\)$/ {b=0} b && index($0,"\"SCHED_CLASS_EXT\"") {n++} END{print n}' "$PROFILE_")"
-  MD_="$(awk 'BEGIN{b=0;n=0} /^declare -a OPTS_DISABLE=\($/ {b=1;next} /^\)$/ {b=0} b && index($0,"\"SCHED_CLASS_EXT\"") {n++} END{print n}' "$PROFILE_")"
-  MK_="$(awk 'BEGIN{b=0;n=0} /^declare -a OPTS_DISABLE=\($/ {b=1;next} /^\)$/ {b=0} b && index($0,"\"KALLSYMS_ALL\"") {n++} END{print n}' "$PROFILE_")"
-  MS_="$(awk 'BEGIN{b=0;n=0} /^declare -a OPTS_DISABLE=\($/ {b=1;next} /^\)$/ {b=0} b && index($0,"\"SLAB_MERGE_DEFAULT\"") {n++} END{print n}' "$PROFILE_")"
-  if [ "$MO_" -eq 1 ] && [ "$MD_" -eq 0 ] && [ "$MK_" -eq 1 ] && [ "$MS_" -eq 1 ]; then
-    rec ok "perfil v5.13.0: sched_ext reactivado y KALLSYMS_ALL/SLAB_MERGE_DEFAULT en DISABLE"
+  # v5.16.0: el usuario elige BORE y renuncia a sched_ext. BORE sustituye a
+  # SCHED_CORE, que es donde sched_ext se engancha, así que SCHED_CLASS_EXT pasa
+  # de OPTS_ENABLE a OPTS_DISABLE (y con él, por dependencia, DEBUG_INFO_BTF).
+  # El awk ignora comentarios: el perfil explica por qué NO lista BTF y cita
+  # "DEBUG_INFO_BTF" entrecomillado, que antes contaba como si fuera una entrada.
+  _prof_sym() { # $1=fichero $2=bloque(ENABLE|DISABLE) $3=símbolo
+    awk -v blk="declare -a OPTS_$2=(" -v want="\"$3\"" 'BEGIN{b=0;n=0}
+      /^[[:space:]]*#/ {next}
+      index($0,blk)==1 {b=1;next}
+      /^\)$/ {b=0}
+      b && index($0,want) {n++}
+      END{print n+0}' "$1"
+  }
+  ES_="$(_prof_sym "$PROFILE_" ENABLE  SCHED_CLASS_EXT)"
+  DS_="$(_prof_sym "$PROFILE_" DISABLE SCHED_CLASS_EXT)"
+  DK_="$(_prof_sym "$PROFILE_" DISABLE KALLSYMS_ALL)"
+  DM_="$(_prof_sym "$PROFILE_" DISABLE SLAB_MERGE_DEFAULT)"
+  if [ "$ES_" -eq 0 ] && [ "$DS_" -eq 1 ] && [ "$DK_" -eq 1 ] && [ "$DM_" -eq 1 ]; then
+    rec ok "perfil v5.16.0: sched_ext en DISABLE (BORE) y KALLSYMS_ALL/SLAB_MERGE_DEFAULT en DISABLE"
   else
-    rec fail "perfil v5.13.0: bloques sched_ext/KALLSYMS/SLAB_MERGE incorrectos (ENABLE=$MO_ DISABLE_scx=$MD_ KA=$MK_ SM=$MS_)"
+    rec fail "perfil v5.16.0: bloques sched_ext/KALLSYMS/SLAB_MERGE incorrectos (EN_scx=$ES_ DIS_scx=$DS_ KA=$DK_ SM=$DM_)"
   fi
   if grep -q 'CIZEN_PGO_PROFILE' "$MOTOR" \
      && grep -q 'CLANG_AUTOFDO_PROFILE=$CIZEN_PGO_PROFILE' "$MOTOR" \
@@ -4140,7 +4185,7 @@ if [ -f "$PROFILE_" ] && [ -f "$PGO_" ]; then
 else
   printf '  (sin perfiles/pgo-collect.sh en el árbol: se omiten las regresiones de v27.31.45)\n'
 fi
-unset PROFILE_ PGO_ MO_ MD_ MK_ MS_
+unset PROFILE_ PGO_ ES_ DS_ DK_ DM_
 
 # --- resumen ---
 echo
