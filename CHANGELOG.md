@@ -1,3 +1,83 @@
+## [Perfil Cizen v5.15.0] - 2026-09-28
+
+Adelgaza el perfil del OptiPlex 7050 (v5.13.0 → v5.14.0 → v5.15.0) y **audita
+el fichero "Bloques para acelerar la compilación"** que se pasó: de sus tres
+bloques, solo uno era aplicable. Todo verificado contra el Kconfig real de
+Linux 7.2.8 y contra el hardware de la máquina. **No cambia `SCRIPT_VERSION`**
+(esto es solo el perfil del host, no el motor).
+
+**v5.14.0 — seis frentes de poda, con BTF resuelto.** 32 símbolos nuevos,
+todos existentes en 7.2.8 y **los 32 ya estaban `=y`** (impacto real, no
+decorativo): `SATA_MOBILE_LPM_POLICY` de `3` a `0` (el `3` es "min_power" y
+provoca resets de disco al reanudar desde suspensión), `PROC_KCORE`,
+`DEVMEM`, `ZRAM_BACKEND_LZ4`/`_842`, 27 símbolos MFD/PMIC/TWL/Wolfson de
+hardware ausente, y `PINCTRL_AMD` (este socket nunca tendrá AMD). Bonus:
+`STRICT_DEVMEM` cae sin pedirlo, porque `depends on MMU && DEVMEM`
+(`lib/Kconfig.debug:1964`).
+
+Se conservan a propósito `MFD_CORE`, `MFD_SYSCON`, `MFD_INTEL_LPSS(_PCI)` y
+`REGULATOR_NETLINK_EVENTS`: son infraestructura genérica en uso, y apagarlos
+rompe más de lo que ahorra.
+
+**Decisión BTF: se conserva `CONFIG_DEBUG_INFO_BTF=y`, no se usa `FAST_BUILD`.**
+`SCHED_CLASS_EXT depends on BPF_SYSCALL && BPF_JIT && DEBUG_INFO_BTF`
+(`kernel/Kconfig.preempt:171`) y `scx-scheds` necesita BTF para sus
+schedulers CO-RE. Quitar BTF no es ahorro de build: es quedarse sin
+planificador. `--no-btf` queda como opt-out, con la condición de quitar
+también `SCHED_CLASS_EXT` y aceptar perder `scx-scheds`.
+
+**v5.15.0 — auditoría del fichero de "bloques para acelerar".**
+
+- **BLOQUE 1 (DEBUG_INFO): no aplicado.** Además de arrastrar BTF, su parte de
+  compresión es contradictoria: `DEBUG_INFO_COMPRESSED_NONE` ya es la opción
+  activa y el bloque mete `NONE`, `ZLIB` y `ZSTD` a la vez en `DISABLE`,
+  dejando la `choice` sin ninguna opción válida. Se recupera solo lo seguro:
+  **`DEBUG_INFO_BTF_MODULES`** (depende de `DEBUG_INFO_BTF && MODULES`, así que
+  puede ser `n` con BTF intacto; ni el motor ni el verificador lo miran) y
+  `GDB_SCRIPTS`. Ahorra pasar `pahole` por cada uno de los 129 módulos.
+- **BLOQUE 2 (70 `NET_VENDOR_*`): no aplicado, porque no ahorra nada.** Los 70
+  existen y los 70 estaban `=y`, pero `--lite` es el **único** modo de la
+  suite (`kernel-update.sh:54`, no existe `--no-lite`) y siempre ejecuta
+  `make localmodconfig`, que ya apaga los drivers hijos: `R8169 is not set`,
+  `NETXEN_NIC is not set`, y solo quedan 129 `=m` en toda la config. Poner los
+  bools padre a `n` limpia texto, no compila nada menos.
+- **BLOQUE 3 (MFD): ya aplicado en v5.14.0 salvo los GPIO.** Tres de los cuatro
+  `GPIO_*` ya habían caído solos al apagarse sus MFD; solo quedaba
+  `GPIO_CRYSTAL_COVE` (`=y`), que depende de `INTEL_SOC_PMIC`, el PMIC de
+  Atom/Baytrail, y estaba activo por herencia en un Kaby Lake de escritorio.
+
+**Aceleración de la compilación: tres palancas medidas, las tres negativas**
+(así que no se aplicó ninguna). Método importante: **cccache contamina las
+mediciones de tiempo**; con ccache activo, `-Os` salía *más lento* que `-O2`.
+Todo se midió con `CCACHE_DISABLE=1` o contra una caché de contenido conocido.
+
+| palanca | medición | decisión |
+|---|---|---|
+| `-j6` / `-j8` | −3% / **+8%** frente a `-j4` | no aplicado; 4 núcleos ya es el techo |
+| `sloppiness` de ccache | +7% (ruido) | no aplicado |
+| quitar DWARF (BLOQUE 1) | 20%, no 30-50% | no aplicado (costaría BTF) |
+| `-Os` | ~6% | no aplicado (degrada runtime) |
+
+- **ccache funciona bien**: una segunda pasada idéntica de `net/core/` va de
+  65.133 ms a **2.642 ms** (25×). El "63,7% de aciertos" que muestra
+  `ccache -s` es un promedio histórico acumulado, no un fallo. Tocar
+  `include/generated/autoconf.h` **no** invalida la caché, porque ccache hashea
+  contenido y no mtime; por eso `sloppiness` no aportaba nada.
+- Se retiró una hipótesis falsa: `scaling_governor=powersave` a 900 MHz NO es
+  cuello de botella; bajo carga la CPU sube a 3.600 MHz (EPP
+  `balance_performance`).
+
+**ccache a 20 GiB** (documentado porque es fácil de hacer mal): el motor
+exporta `CCACHE_DIR="$HOME/.cache/ccache"` (`kernel-update.sh:10481`), así que
+`ccache -o max_size=20G` debe escribirse ahí, no en
+`~/.config/ccache/ccache.conf`. Y `CCACHE_MAX_SIZE` no es una variable de
+ccache sino del motor (línea 10488), que solo aplica si se exporta.
+
+Validación: `--check` en verde (`EXIT 0`, `ENABLE 37/37`, `DISABLE 291/291` con
+0 rebeldes, `SETVAL 29/29`, `SETSTR 2/2`). Nota para la siguiente build: el
+motor detecta el renombre `SCHED_BORE → SCHED_CORE` (viene del patch BORE, no
+del perfil) y lo reaplica en cada ejecución; es ruido, no rotura.
+
 ## [27.31.47] - 2026-09-28
 
 Arregla un flake del propio harness (`tests/selftest.sh`), no del motor ni de

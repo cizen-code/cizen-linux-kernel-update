@@ -238,7 +238,18 @@ vuelve al comportamiento anterior (solo archive de ficheros).
 | luks-audit | `kernel-update.sh --luks-audit` | Avisa si la raíz LUKS no tiene parámetros de desbloqueo en el cmdline antes de regenerar el UKI |
 | manager | `kernel-update-manager.sh list` | Gestor de kernels instalados: `list`, `info`, `flip`, `backup`, `remove`, `guide` |
 
-### Plan de rendimiento (v27.31.45, perfil v5.13.0)
+### Plan de rendimiento (v27.31.45, perfil v5.13.0 → v5.15.0)
+
+> **Actualización 2026-09-28 (perfil v5.15.0)**: el perfil del host se
+> adelgazó (32 símbolos) y se **conservó `CONFIG_DEBUG_INFO_BTF=y`**: lo exige
+> `SCHED_CLASS_EXT` (`kernel/Kconfig.preempt:171`) y lo necesitan los
+> schedulers CO-RE de `scx-scheds`. No use `--no-btf`/`FAST_BUILD` si quiere
+> conservar `scx-scheds`. Además se apagó `DEBUG_INFO_BTF_MODULES` (no lo mira
+> ni el motor ni el verificador) y `GDB_SCRIPTS`, lo que evita pasar `pahole`
+> por cada uno de los 129 módulos. Medido: quitar la info de debug entera da
+> solo un **20%** y cuesta BTF; `-Os` da un **6%** y degrada el runtime, así que
+> no se aplican. Subir `-j` por encima de 4 empeora (`-j8` = +8%). Detalle en el
+> CHANGELOG, entrada «Perfil Cizen v5.15.0».
 
 - **Thin-LTO por defecto**: `CIZEN_LLVM_LTO=thin` (clang/LLVM). Escape:
   `--no-lto`. Enlaza módulo-con-módulo en la fase de enlazado → IPC más alto.
