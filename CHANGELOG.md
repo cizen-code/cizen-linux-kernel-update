@@ -1,3 +1,173 @@
+## [27.31.51] - 2026-09-29
+
+Revisión a fondo de la suite (motor, UKI, manager, rollback, verify, helpers y
+perfil). Todo lo que se toca aquí se verificó contra el código real, y la parte
+del perfil se verificó además con `make olddefconfig` sobre linux-7.2.8.
+Estado: **459 ok, 0 fail** en selftest (34 tests nuevos), `bash -n` limpio en
+los 9 scripts, **0 hallazgos de nivel error en ShellCheck** en toda la suite
+(incluido `tests/selftest.sh`, que arrastraba dos desde v27.31.34).
+
+### Motor (`kernel-update.sh`)
+
+- **Tres `abort` que no deberían abortar.** Con `set -Eeuo pipefail`, una
+  degradación documentada que devuelve `1` se convierte en muerte del script:
+  `ensure_optional_pahole` (sin `pahole` se perdía BTF *y* el build entero),
+  `secure_boot_guided_setup` (sin `sbctl` se caía el build aunque el propio
+  mensaje dijera "continuando") y la validación de `CIZEN_KERNEL_TRACK`
+  inválido, que se ejecutaba **antes** de que `fatal` estuviera definida y
+  moría con `fatal: command not found` (127) en vez de con su mensaje. Las tres
+  ahora degradan o avisan.
+- **Un fallo de UKI se anunciaba como éxito.** `sync_cizen_efi` no propagaba el
+  fallo: si `cizen-uki-sync` fallaba y el camino directo tampoco, el motor
+  acababa imprimiendo `✓ UKI sincronizado`. Con el Secure Boot puesto eso deja al
+  sistema arrancando el UKI viejo sin decirlo. Ahora una bandera
+  `CIZEN_UKI_SYNC_FAILED` marca el estado y el resumen avisa de que el UKI
+  anterior sigue en pie, con el comando para relanzar.
+- **El fallback `objcopy` fabricaba una UKI sin initramfs.** Las variables se
+  declaraban dentro de la rama de `ukify` (sin `ukify`, `set -u` las reventaba),
+  pero el fallo de fondo era peor: la preparación del initramfs estaba **dentro**
+  de esa misma rama, así que el camino de `objcopy` se encontraba con
+  `have_initrd=0` sin haberlo preparado nunca —UKI sin initrd justo en el equipo
+  que no tiene `ukify`. Ahora el initramfs se regenera y valida antes de elegir
+  constructor, y las dos vías embeben `.initrd`, `.uname` y `.ucode`; los
+  temporales se limpian. Dos regresiones fijan el orden y la unicidad.
+- **El fallback sin `ukify` escribía un `vmlinuz` desnudo** en el ESP, con nombre
+  de UKI, y de paso avisaba de que no era una UKI. Eso no arranca. Se quitó: si
+  no hay `ukify`, no se escribe nada y se dice por qué.
+- `lite_missing_check` partía la lista de símbolos por espacios (con el
+  `IFS` global del script, un `for` sin comillas no parte por espacios); `relaunch_with_version`
+  también expandía argumentos vacíos y phantom; `cizen_uki_sign_targets_verify`
+  usaba `$SBCTL_BIN` mal documentado y no comprobaba que hubiera objetivos.
+
+### UKI, manager, rollback y verify
+
+- `kernel-update-manager.sh`: `cmd_flip` y `cmd_backup` elegían el **primer**
+  `*.efi` del ESP, que puede ser el del LTS: un `flip 7.2.8-cizen-v3` one-shot
+  a otro kernel. Ahora se lee el `.uname` de cada UKI y se exige coincidencia
+  exacta con el release pedido. `release_by_arg` distingue exacto > Cizen >
+  distro (antes `6.18.54` devolvía el kernel en ejecución), `cmd_remove` se niega
+  a borrar un kernel de distro, y el ESP se deriva con `findmnt` como el resto de
+  la suite.
+- `kernel-update-rollback.sh`: `resolve_archive` comparaba versiones con orden
+  **alfabético** (`7.2.10` < `7.2.9`); ahora usa `sort -V`. `list_archives` se
+  comía su propio código de salida.
+- `kernel-update-verify.sh`: la huella de estado no incluía la versión del
+  kernel, así que arrancar un kernel distinto se comía los avisos de
+  inconsistencias pendientes.
+
+### Los fallos que solo aparecen al ejecutarlo de verdad
+
+Lo anterior se encontró leyendo el código. Lo siguiente se encontró ejecutando
+la suite contra el sistema real, y **ninguno de los cuatro lo delata un mock**:
+los cuatro necesitan un ESP con permisos de root o un manifiesto incompleto.
+
+- **`sudo <cmd>` sin `-n` pide contraseña SIEMPRE**, aunque el allowlist de
+  `sudoers` cubriera ese comando: el prompt se abre *antes* de que sudo mire la
+  lista. `rollback --list` —que solo lee— terminaba en `Se necesita sudo para
+  restaurar` y no servía en cron, en un agente ni sin terminal. Ahora hay un
+  helper `_priv` (igual que en el manager): primero el comando sin privilegios,
+  luego `sudo -n`, y solo al final la contraseña de verdad, que es lo que hace
+  falta para **restaurar**. El gate `sudo -v` de `list_archives` desaparece por
+  lo mismo.
+- **`sudo -n test` no funciona, y no por culpa del allowlist**: `test` es un
+  builtin de bash, sudo lo busca en `secure_path` y no lo encuentra, así que
+  falla con 127 aunque `/usr/bin/test` sea ejecutable y esté en la lista. El
+  manager usaba `sudo -n test -r/-d` para comprobar la existencia del ESP, o
+  sea justo los ficheros que root-only no deja ni mirar. Se usa la ruta
+  absoluta.
+- **`set -u` + `local x` sin asignar = `unbound variable`.** `list_archives`
+  declaraba `pkgpath` y solo lo asignaba si el manifiesto traía `pkgfile`; un
+  manifiesto sin ese campo —uno viejo, o a medio escribir— abortaba el `list`
+  entero con `pkgpath: unbound variable` en vez de decir que no hay paquete.
+- **Un test puede fallar por su propia explicación.** Los comentarios que
+  documentan el `sudo -n test` antiguo se leían igual que código, así que el
+  grep que buscaba ese patrón los encontraba a ellos. Las regresiones de sudo
+  comparan solo líneas de código.
+
+### `cizen-uki-sync --help` regeneraba la UKI (y aquí sí se rompió el arranque)
+
+Esto ya no es una lectura de código: pasó de verdad, ejecutando
+`cizen-uki-sync --help` para ver la ayuda.
+
+El bucle de argumentos hacía `*) break`, así que cualquier argumento
+desconocido se ignoraba y **la regeneración se ligaba igual**. En un script que
+reescribe el fichero del que arranca el equipo, pedir la ayuda regeneraba la UKI
+sobre el ESP. Como además no había TTY para `mkinitcpio`, el initramfs no se
+regeneró y la UKI nueva salió **sin `.initrd` y sin firmar** encima de la que sí
+arrancaba.
+
+Lo que evitó que el equipo quedara sin arranque fue el fichero
+`.cizen-prev`, no el código: **la red de seguridad no llegó a dispararse**,
+porque `uki_prev_restore` comprobaba `"${SUDO[@]}" test -f "$t.cizen-prev"` y
+`test` es un builtin de bash que sudo no encuentra en `secure_path` (devuelve
+127). El script creyó que no había copia y se fue sin restaurar. La UKI se
+restauró a mano y quedó verificada (firmada, `.initrd` de 15.5 MB,
+`.uname=7.2.8-cizen-v3`).
+
+Tres arreglos:
+
+- **`-h|--help` imprime la ayuda y sale; un argumento desconocido es un error**
+  (rc 2). Nada cae ya en la regeneración por el camino equivocado.
+- **Las nueve llamadas `sudo test` de este script usan `/usr/bin/test`.** La
+  comprobación de las claves de sbctl tenía el mismo problema, y hacía que
+  `sbctl_keys_present` dijera que no hay claves cuando sí las había.
+- **Una UKI sin `.initrd` ya no puede sustituir a una que sí lo tiene.** Antes
+  solo salía un aviso de «arranque degradado» y la escritura continuaba: un
+  `mkinitcpio` fallido cambiaba un arranque con initramfs por uno sin `/init`,
+  sin udev y sin keymap, y con Secure Boot sin firma directamente no arranca.
+  Se necesita `CIZEN_UKI_ALLOW_DEGRADED_INITRD=1` para hacerlo a propósito.
+
+Verificado contra el sistema real: `list` e `info` del manager sin prompt,
+`flip` a un release inexistente y a un kernel de distro rechazados **sin tocar
+el arranque**, `backup` completo con la UKI correcta verificada por su
+`.uname`, y `rollback --list` sin TTY resolviendo el plan B por `sort -V`.
+
+### Réplicas y helpers
+
+- `cizen-uki-sync` y el motor tienen copias de la construcción de UKI, y se
+  habían separado: `claim_preset` machacaba el initramfs propio del perfil, y
+  ambas firmaban **antes** de limpiar las UKIs viejas (sbctl se negaba a firmar
+  con una UKI duplicada en el ESP). La limpieza ahora va antes de firmar, en
+  los dos, y `claim_preset` respeta `cizen_initramfs_path()`.
+- `kernel-update-notify.sh` usaba `local` como nombre de variable (SC2316, nivel
+  error) y `sched-bench.sh` lanzaba `ITERS` procesos en vez de `LOAD_N` en el
+  modo paralelo, comparando luego `ITERS²` contra `ITERS`. `podar-modulos.sh`
+  usaba `DONE` como estado de array, que shellcheck lee como problema.
+
+### Perfil v5.16.1 (poda verificada)
+
+Se aplicó el perfil entero con `scripts/config` y se normalizó con
+`make olddefconfig` sobre linux-7.2.8; después se releyó el `.config` con una
+réplica de `validate_config()`. Resultado: **ENABLE 35/35, CRITICAL 13/13,
+DISABLE 299/299, 0 `DISABLE_WARN`**, y el kernel pasa de **2141 a 2029**
+símbolos en `=y`/`=m` (**-112**).
+
+- **Xen**: se apaga la raíz `XEN` y caen los 28 `CONFIG_XEN*`. Este host usa
+  KVM/QEMU como hipervisor; no es dom0 ni guest de Xen.
+- **Intel TDX**: Kaby Lake no tiene TDX, y el Kconfig lo pone `=y` por defecto.
+  La raíz correcta es `INTEL_TDX_HOST` (la relación es `KVM_INTEL_TDX depends on
+  INTEL_TDX_HOST`): apagar solo `KVM_INTEL_TDX` dejaba `TDX_HOST_SERVICES=**m**`
+  y sacaba `ARCH_KEEP_MEMBLOCK=y`. Con la raíz correcta caen los tres y se
+  resuelve el "rebel" `TDX_HOST_SERVICES` que se toleraba desde v5.12.2.
+- **ftrace**: la raíz `FTRACE` y sus 12 trazadores hijos. El perfil ya pedía "sin
+  profilers" pero el motor seguía compilado. *Cambio visible*: se pierde `ftrace`
+  y `perf trace` (`perf record`/`perf stat` y bpftrace siguen, usan la PMU).
+- `NUMA_BALANCING` (socket único) y `ZSWAP_DEFAULT_ON` (el cmdline ya pone
+  `zswap.enabled=0` y aquí se usa ZRAM, no swap en disco).
+- 9 símbolos que solo imprimen diagnóstico (`ACPI_DEBUG`, `PM_DEBUG`,
+  `FW_LOADER_DEBUG`, `VIRTIO_DEBUG`, …) que inundaban el journal de arranque.
+- `MODULE_SIG_ALL` pasa a `OPTS_ENABLE`: ya salía `=y` por `default y`, pero
+  anclarlo evita depender del default de upstream para algo de Secure Boot.
+- **Retirados** `PERF_GUEST_EVENTS` y `MQ_IOSCHED_ADIOS`: no existen en 7.2.8
+  (0 coincidencias en todo el árbol Kconfig) y solo generaban el aviso de
+  "símbolo no existente" en cada build. Igual en el frag de i915, que pedía
+  `CONFIG_EXTRA_FIRMWARE_FILE`, que tampoco es un símbolo.
+- `X86_FRED` a `EXPECTED_REBELS`: `KVM_INTEL` lo selecciona sin condiciones
+  (`arch/x86/kvm/Kconfig:99`) y KVM es obligatorio, así que es inapagable.
+- Se listan **solo las raíces**: Kconfig cascada a los hijos, y enumerarlos los
+  convertía en "RETIRED / símbolo inexistente" al validarlos. Se comprobó que la
+  lista de raíces da un `.config` **idéntico byte a byte** a la lista con hijos.
+
 ## [27.31.50] - 2026-09-29
 
 Cierra los tres hallazgos que salieron al leer el log del build de

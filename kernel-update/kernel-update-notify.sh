@@ -214,16 +214,20 @@ main() {
   local dry_run=false
   [ "${1:-}" = "--dry-run" ] && dry_run=true
 
-  local remote local last_notified=""
+  # NO usar 'local' como nombre de variable (era 'local remote local
+  # last_notified=""'): aunque bash lo acepta —'local=x' se parsea como
+  # asignación, no como el builtin—, deja una variable llamada 'local' y confunde
+  # a shellcheck (SC2316) y a cualquiera que lea la función. 'local_ver'.
+  local remote local_ver last_notified=""
   remote="$(get_remote_latest_stable)" || {
     alog "No se pudo consultar kernel.org ($KERNEL_RELEASES_JSON_URL); se omite."
     return 0
   }
   [ -f "$LAST_FILE" ] && last_notified="$(cat -- "$LAST_FILE" 2>/dev/null || true)"
 
-  local="${CIZEN_KERNEL_LOCAL_VERSION:-$(get_local_kernel_version)}"
+  local_ver="${CIZEN_KERNEL_LOCAL_VERSION:-$(get_local_kernel_version)}"
 
-  if [ -z "$local" ]; then
+  if [ -z "$local_ver" ]; then
     alog "Sin kernel Cizen instalado como referencia; stable remota: $remote. Nada que notificar."
     if [ "$dry_run" = true ]; then
       echo "Sin kernel Cizen identificado como referencia remota local."
@@ -233,24 +237,24 @@ main() {
   fi
 
   if [ "$dry_run" = true ]; then
-    if version_gt "$remote" "$local"; then
-      echo "ACTUALIZACIÓN DISPONIBLE: $local → $remote (ya notificada: ${last_notified:-ninguna})"
+    if version_gt "$remote" "$local_ver"; then
+      echo "ACTUALIZACIÓN DISPONIBLE: $local_ver → $remote (ya notificada: ${last_notified:-ninguna})"
     else
-      echo "Sin actualización: Cizen=$local  kernel.org=$remote"
+      echo "Sin actualización: Cizen=$local_ver  kernel.org=$remote"
     fi
     return 0
   fi
 
-  if version_gt "$remote" "$local"; then
+  if version_gt "$remote" "$local_ver"; then
     if [ "$last_notified" = "$remote" ]; then
       alog "Release $remote ya notificada previamente; se omite."
       return 0
     fi
     ok=0
-    notify_update "$local" "$remote"; ok=$?
+    notify_update "$local_ver" "$remote"; ok=$?
     if [ "$ok" = 0 ]; then
       printf '%s\n' "$remote" >"$LAST_FILE" 2>/dev/null || true
-      alog "Registrada como notificada: $local -> $remote"
+      alog "Registrada como notificada: $local_ver -> $remote"
     else
       alog "notify-send no llegó a notificar (rc=$ok): $remote no se registra y se reintentará."
     fi
@@ -263,15 +267,15 @@ main() {
   # 7.2.8 → debe notificarse de nuevo.
   if [ -n "$last_notified" ]; then
     local note
-    if version_gt "$local" "$last_notified"; then
-      note="(el kernel local $local ya supera lo notificado $last_notified)"
+    if version_gt "$local_ver" "$last_notified"; then
+      note="(el kernel local $local_ver ya supera lo notificado $last_notified)"
     else
-      note="(kernel local $local; lo notificado $last_notified quedó obsoleto en la rama)"
+      note="(kernel local $local_ver; lo notificado $last_notified quedó obsoleto en la rama)"
     fi
     rm -f -- "$LAST_FILE" 2>/dev/null || true
     alog "Marca de notificación limpiada $note"
   fi
-  alog "Sin actualización: Cizen=$local  kernel.org=$remote"
+  alog "Sin actualización: Cizen=$local_ver  kernel.org=$remote"
   return 0
 }
 

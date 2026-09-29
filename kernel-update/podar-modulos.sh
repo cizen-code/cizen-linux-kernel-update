@@ -169,6 +169,11 @@ if [ -f "$MODDIR/modules.alias" ] && [ "${#HW_ALIASES[@]}" -gt 0 ]; then
         _pat="${_rest% *}"
         if [ -n "$_mod" ] && [ -n "$_pat" ]; then
           for _ma in "${HW_ALIASES[@]}"; do
+            # El patrón de modules.alias (pci:v00008086d0000...sv*) se compara
+            # como PATRÓN a propósito: es glob de shell, no una cadena. Por eso
+            # el lado derecho va sin comillas — shellcheck avisa (SC2053) y el
+            # aviso es correcto en general, pero aquí globbear es lo que se pide.
+            # shellcheck disable=SC2053
             if [[ "$_ma" == $_pat ]]; then
               keep_mod "$_mod"
             fi
@@ -281,22 +286,21 @@ while IFS= read -r _l || [ -n "$_l" ]; do
   DEPS["$_n"]="${_rl# }"
 done < "$MODDIR/modules.dep"
 
-declare -A DONE=()
+declare -A VISITED=()
 declare -a STACK=()
-_k=0
 for _k in "${!KEEP[@]}"; do
   STACK+=("$_k")
 done
 while [ "${#STACK[@]}" -gt 0 ]; do
   _cur="${STACK[0]}"
   STACK=("${STACK[@]:1}")
-  [ -n "${DONE[$_cur]:-}" ] && continue
-  DONE["$_cur"]=1
+  [ -n "${VISITED[$_cur]:-}" ] && continue
+  VISITED["$_cur"]=1
   [ -z "${FILE_BY_NAME[$_cur]:-}" ] && continue
   KEEP["$_cur"]=1
   IFS=' ' read -r -a _deparr <<< "${DEPS[$_cur]:-}" 2>/dev/null || true
   for _d in "${_deparr[@]:-}"; do
-    if [ -z "${DONE[$_d]:-}" ] && [ -n "${FILE_BY_NAME[$_d]:-}" ]; then
+    if [ -z "${VISITED[$_d]:-}" ] && [ -n "${FILE_BY_NAME[$_d]:-}" ]; then
       STACK+=("$_d")
     fi
   done

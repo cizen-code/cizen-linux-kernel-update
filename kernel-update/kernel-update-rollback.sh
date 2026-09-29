@@ -73,6 +73,18 @@ err(){ printf '%s  %s %s\n' "$R" "✗" "$*" >&2; }
 info(){ printf '%s  %s %s\n' "$C" "•" "$*"; }
 fatal(){ err "$*"; exit 1; }
 
+# Lecturas como root sin depender de un TTY (v27.31.51). `sudo <cmd>` a secas
+# pide contraseña siempre, así que `--list` fallaba en cron, en un agente o en
+# cualquier sitio sin terminal, aunque el allowlist de sudoers cubriera el
+# comando: el prompt aparecía antes de que sudo mirase la lista. Primero se
+# prueba sin privilegios, luego `sudo -n`, y solo al final se pide la contraseña
+# de verdad, que es lo que se necesita para RESTAURAR.
+_priv() {
+  "$@" 2>/dev/null && return 0
+  sudo -n "$@" 2>/dev/null && return 0
+  sudo "$@"
+}
+
 mf() {  # mf clave -> valor del manifiesto (vacío si no está)
   local key="$1" line
   [ -f "$MANIFEST" ] || return 0
@@ -80,7 +92,7 @@ mf() {  # mf clave -> valor del manifiesto (vacío si no está)
     case "$line" in
       "$key="*) printf '%s\n' "${line#*=}"; return 0 ;;
     esac
-  done < <(sudo cat -- "$MANIFEST" 2>/dev/null || cat -- "$MANIFEST" 2>/dev/null)
+  done < <(_priv cat -- "$MANIFEST" 2>/dev/null || cat -- "$MANIFEST" 2>/dev/null)
   return 0
 }
 
@@ -90,8 +102,14 @@ resolve_archive() {
   # reciente de $ROLLBACK_DIR.
   local archive found
   archive="$(mf archive)"
-  [ -n "$archive" ] && sudo test -s "$ROLLBACK_DIR/$archive" 2>/dev/null && { printf '%s\n' "$archive"; return 0; }
-  found="$(sudo ls -1 "$ROLLBACK_DIR"/*.tar.xz 2>/dev/null | sort | tail -n1)"
+  [ -n "$archive" ] && _priv test -s "$ROLLBACK_DIR/$archive" 2>/dev/null && { printf '%s\n' "$archive"; return 0; }
+  # sort -V (orden de versión), NO sort (byte a byte): los archives se nombran
+  # por release, no por marca de tiempo, y con LC_ALL=C el byte sort hace que
+  # '7.2.10-cizen-v3.tar.xz' sea MENOR que '7.2.8-cizen-v3.tar.xz'. tail -n1
+  # devolvía entonces 7.2.9 y el plan B restauraba los módulos de un kernel MÁS
+  # VIEJO que el que se iba a retirar. El propio proyecto ya usa sort -Vr en
+  # kernel-update-manager.sh:installed_releases.
+  found="$(_priv ls -1 "$ROLLBACK_DIR"/*.tar.xz 2>/dev/null | sort -V | tail -n1)"
   [ -n "$found" ] && printf '%s\n' "$(basename -- "$found")"
 }
 
@@ -109,9 +127,17 @@ confirm() {  # confirm "pregunta"
 }
 
 list_archives() {
-  sudo -v 2>/dev/null || sudo -n true 2>/dev/null || { sudo -v || fatal "Se necesita sudo para leer $ROLLBACK_DIR."; }
+  # Sin gate de sudo: TODO lo de aquí son lecturas y van por _priv, que ya
+  # intenta sin privilegios y luego `sudo -n` (v27.31.51). Antes esta línea
+  # llamaba a `sudo -v`, que abre prompt aunque el allowlist cubriera todo:
+  # preguntar por una lista era pedir la contraseña de restaurar sin restaurar.
 
-  local pkgbase pkgver release sched pkgfile archive archive_rel ts pkgpath
+  # Con `set -u`, un `local` declarado y NO asignado sigue sin valor: si el
+  # manifiesto no trae `pkgfile` (uno viejo o a medio escribir), la línea de
+  # abajo nunca asigna pkgpath y el `[ -n "$pkgpath" ]` posterior aborta con
+  # 'pkgpath: unbound variable', tirándose el `list` entero. Se inicializa.
+  local pkgbase="" pkgver="" release="" sched="" pkgfile="" archive=""
+  local archive_rel="" ts="" pkgpath=""
   pkgbase="$(mf pkgbase)"; pkgver="$(mf pkgver)"; release="$(mf release)"
   sched="$(mf sched)"; pkgfile="$(mf pkgfile)"; archive="$(resolve_archive || true)"
   archive_rel="$(mf archive_rel)"; ts="$(mf ts)"
@@ -132,14 +158,14 @@ list_archives() {
     [ -n "$sched" ] && printf '  (scheduler: %s)' "$sched"
     [ -n "$release" ] && printf '  release %s' "$release"
     echo
-    if [ -n "$pkgpath" ] && sudo test -s "$pkgpath" 2>/dev/null; then
-      printf '  %sfichero%s  %s (%s)\n' "$G" "$N" "$pkgpath" "$(sudo du -h -- "$pkgpath" 2>/dev/null | cut -f1)"
+    if [ -n "$pkgpath" ] && _priv test -s "$pkgpath" 2>/dev/null; then
+      printf '  %sfichero%s  %s (%s)\n' "$G" "$N" "$pkgpath" "$(_priv du -h -- "$pkgpath" 2>/dev/null | cut -f1)"
     else
       printf '  %sfichero%s  %sNO ESTÁ (%s)\n' "$Y" "$N" "$N" "${pkgpath:-desconocido}"
     fi
     [ -n "$ts" ] && printf '  %sguardado%s  %s\n' "$G" "$N" "$ts"
   fi
-  if [ -n "$archive" ] && sudo test -s "$ROLLBACK_DIR/$archive" 2>/dev/null; then
+  if [ -n "$archive" ] && _priv test -s "$ROLLBACK_DIR/$archive" 2>/dev/null; then
     echo
     printf '  %splan B%s    %s (ficheros%s)\n' "$Y" "$N" "$archive" \
       "$([ -n "$archive_rel" ] && printf ' de %s' "$archive_rel")"
@@ -147,7 +173,7 @@ list_archives() {
     info "diciendo que está el kernel nuevo: úsalo solo como último recurso."
   fi
   echo
-  if [ -n "$pkgver" ] && [ -n "$pkgpath" ] && sudo test -s "$pkgpath" 2>/dev/null; then
+  if [ -n "$pkgver" ] && [ -n "$pkgpath" ] && _priv test -s "$pkgpath" 2>/dev/null; then
     ok "Listo. Para volver atrás:  sudo $SELF"
   else
     warn "No hay paquete utilizable: solo queda el archive de ficheros."
@@ -160,7 +186,7 @@ restore_from_archive() {  # plan B: extraer ficheros
   archive="$(resolve_archive || true)"
   archive_rel="$(mf archive_rel)"
   [ -n "$archive" ] || fatal "No hay archive de rollback en $ROLLBACK_DIR."
-  sudo test -s "$ROLLBACK_DIR/$archive" 2>/dev/null || fatal "El archive $archive no está o está vacío."
+  _priv test -s "$ROLLBACK_DIR/$archive" 2>/dev/null || fatal "El archive $archive no está o está vacío."
 
   echo
   echo "${C}Se restaurarán los ficheros de${N} ${archive_rel:-el kernel anterior}"
@@ -186,7 +212,7 @@ restore_package() {  # plan A: reinstalar el paquete
   sched="$(mf sched)"; pkgfile="$(mf pkgfile)"; ts="$(mf ts)"
   [ -n "$pkgfile" ] || { restore_from_archive; return $?; }
   pkgpath="$ROLLBACK_DIR/$pkgfile"
-  sudo test -s "$pkgpath" 2>/dev/null || {
+  _priv test -s "$pkgpath" 2>/dev/null || {
     warn "El paquete de rollback ($pkgfile) no está en $ROLLBACK_DIR."
     restore_from_archive
     return $?
@@ -243,7 +269,10 @@ restore_package() {  # plan A: reinstalar el paquete
 }
 
 case "$DO_LIST" in
-  true) list_archives; exit 0 ;;
+  # El rc de list_archives se propaga: 'sin nada que restaurar' es 1, y se
+  # perdía con el 'exit 0' de aquí. Un caller que encadena (o un script que
+  # decide con if) veía 'todo correcto' con un ROLLBACK_DIR vacío.
+  true) list_archives; exit $? ;;
 esac
 
 sudo -v || fatal "Se necesita sudo para restaurar."

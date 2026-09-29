@@ -742,8 +742,14 @@ secureboot_check() {
 # nunca. Refleja lo que el usuario tiene que reaccionar a: perfil, scheduler,
 # patrones del journal, firmware y Secure Boot.
 verify_state_fingerprint() {
-  printf 'perfil=%s|sched=%s/%s|journal=%s|fw=%s|sb=%s|iss=%s' \
-    "${BASE_ISSUES:-0}" "${SCHED_EXPECTED:-?}" "${SCHED_RUNNING:-?}" \
+  # 'ver=' NO es cosmético: sin él, arrancar un kernel NUEVO con el MISMO
+  # número de incidencias que el anterior daba una firma idéntica y
+  # notify_state_changed devolvía 1, así que el usuario no recibía aviso de las
+  # incidencias de su kernel nuevo. Solo se notifica con kernel limpio hay
+  # First_boot, que no depende de la firma — con incidencias no la había, y esa
+  # es justo la clase de falso negativo que un verificador no puede permitirse.
+  printf 'ver=%s|perfil=%s|sched=%s/%s|journal=%s|fw=%s|sb=%s|iss=%s' \
+    "${CUR_VERSION:-?}" "${BASE_ISSUES:-0}" "${SCHED_EXPECTED:-?}" "${SCHED_RUNNING:-?}" \
     "${JCOUNT:-0}" "${FW_COUNT:-0}" "${SB_STATE:-?}" "${ISSUES:-0}"
 }
 

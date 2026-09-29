@@ -159,6 +159,14 @@ sched_actual() {
       printf '%s\n' "${s#SCHED_}"; return 0
     fi
   done
+  # SCHED_FAIR es el planificador por defecto de mainline (el que se está
+  # ejecutando si no hay ninguno de los anteriores). No se miraba, así que un
+  # kernel con vanilla se etiquetaba como "eevdf". Ese valor forma parte del
+  # NOMBRE del fichero de histórico (sched-bench-<uname -r>-<sched>.txt): una
+  # atribución equivocada queda ahí para siempre y arrastra todos los --resumen.
+  if grep -qm1 '^CONFIG_SCHED_FAIR=y' < <(zcat /proc/config.gz 2>/dev/null); then
+    printf 'fair\n'; return 0
+  fi
   printf 'eevdf\n'
 }
 
@@ -195,8 +203,17 @@ bucle >/dev/null   # calentar la caché del fichero: si no, se mide el disco
 t0=$(ms); bucle; t1=$(ms)
 un_hilo=$(( t1 - t0 ))
 
+# El brazo en paralelo tiene que hacer EL MISMO TRABAJO que el de un hilo:
+# LOAD_N procesos, cada uno ejecutando bucle() (que ya itera ITERS veces).
+# Antes era 'for _ in $(seq "$ITERS"); do bucle & ...' — ITERS procesos cada uno
+# con ITERS vueltas, o sea ITERS² pasadas frente a las ITERS de un_hilo. La
+# fila se etiquetaba con $LOAD_N (que el brazo ni siquiera usaba) y el histórico
+# se construía sobre el cociente de dos cantidades de trabajo distintas, así
+# que el banco concluía siempre "no escala en paralelo" sin importar la carga.
+# Con nproc=4 e ITERS=10 eran 10 procesos de 10 vueltas: justo el número de
+# núcleos, luego medía saturación y no escalado.
 t0=$(ms)
-for _ in $(seq "$ITERS"); do bucle & PIDS+=($!); done
+for _ in $(seq "$LOAD_N"); do bucle & PIDS+=($!); done
 wait "${PIDS[@]}"
 t1=$(ms)
 paralelo=$(( t1 - t0 ))

@@ -23,6 +23,9 @@
 #   CIZEN_UKI_ALLOW_MKINITCPIO_UKI=1     dejar que el preset de mkinitcpio
 #                                         también pueda escribir la UKI
 #                                         (default 0: la UKI es de este flujo)
+#   CIZEN_UKI_ALLOW_DEGRADED_INITRD=1    permitir sustituir una UKI que SÍ tiene
+#                                         .initrd por otra que no lo tiene
+#                                         (default 0: se niega)
 #   CIZEN_UKI_INITRAMFS            ruta del initramfs (default
 #                                         /boot/initramfs-<pkgbase>.img)
 #   CIZEN_UKI_PRESET_DIR           directorio de presets de mkinitcpio
@@ -235,6 +238,14 @@ find_uki_targets() {
 cizen_uki_claim_preset() {
   local preset image
   preset="${CIZEN_UKI_PRESET_DIR:-/etc/mkinitcpio.d}/${CIZEN_UKI_PKGBASE}.preset"
+  # El initramfs SIEMPRE sale de cizen_initramfs_path(), nunca de una ruta
+  # literal. Se sobreescribía más abajo con '/boot/initramfs-<pkgbase>.img' y esa
+  # constante acababa siendo la que se escribía como default_image= en el preset
+  # y la que se anunciaba: con CIZEN_UKI_INITRAMFS=/otra/ruta el preset quedaba
+  # apuntando a un initramfs DISTINTO del que se ha validado y embebido en la
+  # UKI, que es exactamente el desajuste .initrd↔initramfs que toda la
+  # validación de este fichero existe para impedir. El motor nunca tuvo este
+  # sobreescrito (réplica divergente).
   image="$(cizen_initramfs_path)"
 
   if [ "${CIZEN_UKI_ALLOW_MKINITCPIO_UKI:-0}" = "1" ]; then
@@ -242,7 +253,7 @@ cizen_uki_claim_preset() {
     return 0
   fi
 
-  "${SUDO[@]}" test -f "$preset" || {
+  "${SUDO[@]}" /usr/bin/test -f "$preset" || {
     info "Sin preset de mkinitcpio para ${CIZEN_UKI_PKGBASE}: nada que reclamar."
     return 0
   }
@@ -252,7 +263,7 @@ cizen_uki_claim_preset() {
   fi
 
   # El original se conserva una sola vez, para poder revertir a mano.
-  "${SUDO[@]}" test -f "$preset.cizen-orig" ||
+  "${SUDO[@]}" /usr/bin/test -f "$preset.cizen-orig" ||
     "${SUDO[@]}" cp -a -- "$preset" "$preset.cizen-orig" || true
 
   # 1) La UKI deja de ser cosa del preset. Se comenta con un marcador propio
@@ -263,8 +274,7 @@ cizen_uki_claim_preset() {
   # 2) Y el preset tiene que seguir produciendo ALGO, o mkinitcpio se queja de
   #    "No image or UKI specified" y el hook de pacman deja de hacer su parte.
   #    Que produzca el initramfs: esa es la división (preset = initramfs,
-  #    este flujo = UKI).
-  image="/boot/initramfs-${CIZEN_UKI_PKGBASE}.img"
+  #    este flujo = UKI). Usa $image, que viene de cizen_initramfs_path.
   if ! "${SUDO[@]}" grep -qE '^[[:space:]]*[A-Za-z0-9_]+_image=' "$preset"; then
     if "${SUDO[@]}" grep -qE '^[[:space:]]*#[[:space:]]*[A-Za-z0-9_]+_image=' "$preset"; then
       "${SUDO[@]}" sed -i -E \
@@ -521,7 +531,7 @@ cizen_initramfs_prepare() {
     info "CIZEN_INITRAMFS_REBUILD=0: no regenero el initramfs."
   elif ! command -v mkinitcpio >/dev/null 2>&1; then
     warn "mkinitcpio no está instalado: no puedo regenerar el initramfs."
-  elif ! "${SUDO[@]}" test -f "${CIZEN_UKI_PRESET_DIR:-/etc/mkinitcpio.d}/${CIZEN_UKI_PKGBASE}.preset"; then
+  elif ! "${SUDO[@]}" /usr/bin/test -f "${CIZEN_UKI_PRESET_DIR:-/etc/mkinitcpio.d}/${CIZEN_UKI_PKGBASE}.preset"; then
     warn "No hay preset de mkinitcpio para ${CIZEN_UKI_PKGBASE}: no regenero el initramfs."
   else
     log "Regenerando el initramfs (mkinitcpio -p ${CIZEN_UKI_PKGBASE})"
@@ -802,10 +812,19 @@ build_uki() {
   fi
 
   [ -n "$osrel_file" ] && rm -f "$osrel_file"
+  [ -n "${uname_file:-}" ] && rm -f "$uname_file"
+  [ -n "$out" ] && rm -f "$out"
 
+  # CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK: copiar el vmlinuz pelado no produce una
+  # UKI (sin stub, sin .cmdline/.osrel/.uname/.initrd) y systemd-boot no lo
+  # arranca. Además cizen_uki_verify_image, que se le aplica justo después,
+  # lo rechaza, con lo que este camino era inalcanzable. Se explica en voz alta
+  # en vez de dejar un interruptor que solo puede dejar el ESP roto. Réplica de
+  # la misma corrección en kernel-update.sh:build_cizen_uki.
   if [ "$CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK" = 1 ]; then
-    cp -f "$kernel" "$out"
-    return 0
+    warn "CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK=1 pero un vmlinuz sin stub no es una UKI:"
+    warn "  no tiene .cmdline/.osrel/.uname/.initrd y systemd-boot no puede arrancarlo."
+    warn "  No se escribe nada en el ESP. Instala ukify (systemd-ukify) o binutils."
   fi
 
   return 1
@@ -859,9 +878,9 @@ cleanup_uki_variants() {
       seen[$key]="$f"
       "${SUDO[@]}" rm -f -- "$f" 2>/dev/null || true
     done < <("${SUDO[@]}" find "$pfx$r" -maxdepth 5 -type f \
-                \( -name "${base}.efi" -o -name "${base}+*.efi" \
-                   -o -name "${base}.efi.cizen-prev" -o -name "${base}.efi.cizen-tmp" \
-                   -o -name "${base}+*.efi.cizen-prev" -o -name "${base}+*.efi.cizen-tmp" \) \
+                \( -iname "${base}.efi" -o -iname "${base}+*.efi" \
+                   -o -iname "${base}.efi.cizen-prev" -o -iname "${base}.efi.cizen-tmp" \
+                   -o -iname "${base}+*.efi.cizen-prev" -o -iname "${base}+*.efi.cizen-tmp" \) \
                 2>/dev/null || true)
   done
 }
@@ -891,9 +910,14 @@ cleanup_efi_bak_copies() {
     while IFS= read -r f; do
       [ -n "$f" ] || continue
       key="$("${SUDO[@]}" stat -c '%d:%i' -- "$f" 2>/dev/null || true)"
-      [ -n "$key" ] || continue
-      [ -n "${seen[$key]:-}" ] && continue
-      seen[$key]="$f"
+      # Un stat que falla NO salta el borrado: estos *.efi.bak son siempre de
+      # otro (este motor nunca escribe ese nombre) y hacen panic a go-uefi en
+      # 'sbctl verify' y en el hook sign-all de pacman. El stat solo sirve para
+      # deduplicar inodos del mismo fichero visto por dos puntos de montaje.
+      if [ -n "$key" ]; then
+        [ -n "${seen[$key]:-}" ] && continue
+        seen[$key]="$f"
+      fi
       log "Borrando copia huérfana del ESP: $f"
       "${SUDO[@]}" rm -f -- "$f" 2>/dev/null || true
     done < <("${SUDO[@]}" find "$pfx$r" -maxdepth 5 -type f -name '*.efi.bak' \
@@ -955,7 +979,7 @@ uki_has_sig_section() {
 uki_prev_stage() {
   local t
   for t in "$@"; do
-    if "${SUDO[@]}" test -f "$t"; then
+    if "${SUDO[@]}" /usr/bin/test -f "$t"; then
       "${SUDO[@]}" cp -f -- "$t" "$t.cizen-prev" 2>/dev/null || \
         warn "No pude respaldar la UKI anterior: $t"
     fi
@@ -966,7 +990,7 @@ uki_prev_stage() {
 uki_prev_restore() {
   local t r=0
   for t in "$@"; do
-    if "${SUDO[@]}" test -f "$t.cizen-prev"; then
+    if "${SUDO[@]}" /usr/bin/test -f "$t.cizen-prev"; then
       if "${SUDO[@]}" cp -f -- "$t.cizen-prev" "$t.cizen-tmp" && \
          "${SUDO[@]}" mv -f -- "$t.cizen-tmp" "$t"; then
         ok "UKI anterior restaurada (la nueva no se pudo firmar): $t"
@@ -1021,9 +1045,9 @@ sign_uki_targets() {
 
 # Claves sbctl ya generadas (sbctl create-keys). Firmar sin claves fallaría.
 sbctl_keys_present() {
-  "${SUDO[@]}" test -s /var/lib/sbctl/keys/db/db.key 2>/dev/null && \
-  "${SUDO[@]}" test -s /var/lib/sbctl/keys/PK/PK.key 2>/dev/null && \
-  "${SUDO[@]}" test -s /var/lib/sbctl/keys/KEK/KEK.key 2>/dev/null
+  "${SUDO[@]}" /usr/bin/test -s /var/lib/sbctl/keys/db/db.key 2>/dev/null && \
+  "${SUDO[@]}" /usr/bin/test -s /var/lib/sbctl/keys/PK/PK.key 2>/dev/null && \
+  "${SUDO[@]}" /usr/bin/test -s /var/lib/sbctl/keys/KEK/KEK.key 2>/dev/null
 }
 
 # Entradas de la BD de sbctl cuyo fichero ya no existe. Esas entradas son la
@@ -1042,7 +1066,7 @@ sbctl_stale_entries() {
     f="${f%\"}"; f="${f#\"}"          # quite comillas
     [ -n "$f" ] || continue
     [ "$f" = "$db" ] && continue
-    "${SUDO[@]}" test -e "$f" 2>/dev/null || printf '%s\n' "$f"
+    "${SUDO[@]}" /usr/bin/test -e "$f" 2>/dev/null || printf '%s\n' "$f"
   done < <(sed -n 's/^[[:space:]]*"\([^"]*\)"[[:space:]]*:[[:space:]]*{.*/\1/p' "$db" 2>/dev/null || true)
 }
 
@@ -1114,12 +1138,44 @@ resolve_sign_request() {
 
 DRY_RUN=0
 SIGN_REQUEST="${CIZEN_SIGN_UKI:-auto}"
+
+# v27.31.51: este bucle hacía `*) break`, así que un argumento desconocido
+# —`--help` entre ellos— salía del bucle, se ignoraba, y la REGENERACIÓN SE
+# LIGABA IGUAL. En una herramienta que reescribe el fichero del que arranca el
+# equipo, `cizen-uki-sync --help` devolvía una UKI nueva sobre el ESP. Ya está
+# pasado: al no poder firmar (sin TTY) dejó una UKI sin .initrd y sin firma
+# encima de la que sí arrancaba, y solo se salvó porque la copia .cizen-prev
+# seguía ahí. Ahora un argumento desconocido es un error, no un 'haz lo que
+# quieras con mi UKI'.
+uki_sync_usage() {
+  cat <<'EOF'
+Uso: cizen-uki-sync [--dry-run] [--sign|--no-sign]
+
+  (sin argumentos)  Regenera la UKI del pkgbase Cizen y la firma si hace falta.
+  --dry-run         No escribe nada en el ESP; solo informa.
+  --sign            Fuerza la firma aunque Secure Boot esté desactivado.
+  --no-sign         No firma, aunque Secure Boot esté activo.
+  -h, --help        Esto.
+
+Variables de entorno relevantes: CIZEN_UKI_NAME, CIZEN_UKI_PKGBASE,
+CIZEN_SIGN_UKI, CIZEN_UKI_ALLOW_DEGRADED_INITRD.
+EOF
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift ;;
     --sign) SIGN_REQUEST="yes"; shift ;;
     --no-sign) SIGN_REQUEST="no"; shift ;;
-    *) break ;;
+    -h|--help) uki_sync_usage; exit 0 ;;
+    *)
+      err "Argumento desconocido: $1"
+      err "Este script REGENERA la UKI: un argumento mal escrito no puede"
+      err "terminar cayendo en la regeneración por el camino equivocado."
+      echo
+      uki_sync_usage
+      exit 2
+      ;;
   esac
 done
 case "$SIGN_REQUEST" in
@@ -1218,6 +1274,34 @@ if ! cizen_uki_verify_image "$tmp" "$INITRAMFS_PATH"; then
   fatal "La UKI generada no supera la verificación de la sección .initrd: no la escribo en el ESP."
 fi
 
+# v27.31.51: no dejar que una UKI SIN initramfs pise a una que sí lo tenía.
+# Arriba la verificación solo avisa cuando no hay initramfs que validar, y
+# entonces la escritura continúa: si mkinitcpio falla (por lo que sea) y el
+# firmware nuevo sale sin .initrd, se cambia por un arranque degradado que
+# funcionaba. Con Secure Boot, si además la firma falla, eso es un equipo que no
+# arranca. Se necesita un opt-in explícito para hacerlo.
+uki_image_has_initrd() {
+  local uki="$1" hex
+  [ -s "$uki" ] || return 1
+  hex="$(objdump -h -- "$uki" 2>/dev/null | awk '$2 == ".initrd" { print $3; exit }')" || return 1
+  [ -n "$hex" ] || return 1
+  [ "$((16#$hex))" -gt 0 ] 2>/dev/null
+}
+
+if [ "$DRY_RUN" -eq 0 ] && [ "${CIZEN_UKI_ALLOW_DEGRADED_INITRD:-0}" != "1" ]; then
+  if ! uki_image_has_initrd "$tmp"; then
+    for t in "${targets[@]}"; do
+      if "${SUDO[@]}" /usr/bin/test -s "$t" && uki_image_has_initrd "$t"; then
+        fatal "La UKI que he generado NO lleva .initrd y la que hay en el ESP SÍ lo lleva."
+        fatal "  No la sustituyo: sería cambiar un arranque con initramfs por uno degradado"
+        fatal "  (sin /init, sin udev y sin keymap), y con Secure Boot sin firma no arranca."
+        fatal "  Arregla el initramfs y vuelve a lanzar esto, o fuerza el downgrade con"
+        fatal "  CIZEN_UKI_ALLOW_DEGRADED_INITRD=1 si es a propósito:  $t"
+      fi
+    done
+  fi
+fi
+
 cleanup_uki_variants
 
 # Las copias *.efi.bak del ESP van aparte: no son de este kernel ni las ha
@@ -1253,6 +1337,13 @@ fi
 # Firma de la UKI con sbctl (Secure Boot): tras escribir, se firma y verifica
 # cada objetivo. Con SB activo una UKI sin firmar no arrancaría: fail-safe.
 if [ "$DO_SIGN" = true ]; then
+  # ANTES de firmar: sanea la BD de sbctl. cleanup_uki_variants acaba de borrar
+  # las variantes +N, y eso deja entradas huérfanas; si una sobrevive, el hook
+  # 'sbctl sign-all' de pacman aborta con "does not exist" y tumba el -Syu
+  # entero. El motor ya lo hacía aquí (kernel-update.sh:cizen_uki_sign_targets);
+  # aquí el prune estaba solo al final, DESPUÉS de firmar, y ese era justo el
+  # orden que deja el problema para la siguiente transacción.
+  sbctl_prune_stale
   if ! sbctl_keys_present; then
     if secure_boot_active; then
       fatal "Secure Boot ACTIVO y sin claves sbctl generadas (sbctl create-keys/enroll-keys): no se puede firmar la UKI."

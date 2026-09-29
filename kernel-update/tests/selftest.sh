@@ -3511,10 +3511,11 @@ FAKE
   fi
 
   # g) v27.31.34: un comentario que pierde el '#' NO lo caza ni 'bash -n' ni
-  #    shellcheck. '# /boot/efi y /boot/EFI son el MISMO directorio' sin el '#'
-  #    es una ORDEN perfectamente válida ('/boot/efi' con argumentos), así que
-  #    pasa las dos revisiones estáticas y solo revienta al ejecutarse: aquí
-  #    abortó el sync entero en producción con 'line 165: /boot/efi: Is a
+  #    la revisión estática. La línea «# /boot/efi y /boot/EFI son el MISMO
+  #    directorio» sin el '#' inicial es una ORDEN perfectamente válida
+  #    ('/boot/efi' con argumentos), así que pasa las dos revisiones estáticas y
+  #    solo revienta al ejecutarse: aquí abortó el sync entero en producción con
+  #    'line 165: /boot/efi: Is a
   #    directory'. Deuda de v27.31.33 (§32.12).
   #    Humo de verdad: ejecutar el script. Con un suffix inexistente no hay
   #    kernel que buscar, así que debe morir con SU propio mensaje y solo con él.
@@ -4045,11 +4046,23 @@ else
 fi
 
 # notify: no marcar como entregada una notificación que no se envió.
+# El patrón no fija el nombre de la variable local de la versión (fue 'local',
+# que chocaba con el builtin, y ahora es 'local_ver'): lo que se comprueba es
+# que la llamada se guarda su rc y solo entonces se escribe LAST_FILE.
 if sed -n '/^notify_update() {/,/^}/p' "$NOTIFY_" | grep -q 'return "$rc"' \
-   && sed -n "/notify_update \"\$local\" \"\$remote\"/,/return 0/p" "$NOTIFY_" | grep -q 'if \[ "\$ok" = 0 \]'; then
+   && sed -n '/notify_update "\$/,/^[[:space:]]*return 0/p' "$NOTIFY_" | grep -q 'if \[ "\$ok" = 0 \]'; then
   rec ok "notify: solo se registra como notificada si notify-send entregó (rc=0)"
 else
   rec fail "notify: se registra como notificada aunque notify-send fallara"
+fi
+
+# notify: la versión local NO se puede llamar 'local' dentro de una función:
+# 'local remote local last_notified=""' deja una variable llamada 'local' (que
+# bash acepta, pero shellcheck marca como SC2316 error y confunde al que lea).
+if sed -n '/^main() {/,/^}/p' "$NOTIFY_" | grep -qE '^[[:space:]]*local [a-z_]*\blocal\b'; then
+  rec fail "notify: main() declara una variable llamada 'local' (SC2316)"
+else
+  rec ok "notify: main() no usa 'local' como nombre de variable"
 fi
 
 # rollback: si el archive del manifiesto no está, usar el *.tar.xz más reciente.
@@ -4171,13 +4184,37 @@ else
   fi
 fi
 
-# Übersicht del barrido en cizen-uki-sync: el fallback objcopy tiene que embeber
+# Barrido en cizen-uki-sync: el fallback objcopy tiene que embeber
 # .initrd (antes producía una UKI sin initrd que la verificación descartaba).
 if sed -n '/^build_uki() {/,/^}/p' "$UKISYNC" | grep -q -- '--add-section .initrd="\$initrd"'; then
   rec ok "sync: el fallback objcopy embeble .initrd (ya no sale una UKI sin initrd)"
 else
   rec fail "sync: el fallback objcopy no embeble .initrd -> cizen_uki_verify_image fatal"
 fi
+
+# v27.31.51: el motor tiene el mismo problema, y el test de arriba solo miraba la
+# copia de cizen-uki-sync. En build_cizen_uki() el initramfs se preparaba DENTRO
+# de la rama `if [ -n "$ukify_bin" ]`, así que sin ukify el fallback de objcopy
+# se encontraba con have_initrd=0 sin haberlo preparado: UKI sin initrd en el
+# equipo que precisamente no tiene ukify.
+_uki_body="$(sed -n '/^build_cizen_uki() {/,/^}/p' "$MOTOR")"
+_ord_prep="$(printf '%s\n' "$_uki_body" | grep -n 'cizen_initramfs_prepare' | head -1 | cut -d: -f1)"
+_ord_ukify="$(printf '%s\n' "$_uki_body" | grep -n 'if \[ -n "\$ukify_bin" \]' | head -1 | cut -d: -f1)"
+_ord_objcopy="$(printf '%s\n' "$_uki_body" | grep -n 'if \[ -n "\$stub" \] && command -v objcopy' | head -1 | cut -d: -f1)"
+_ord_calls="$(printf '%s\n' "$_uki_body" | grep -c 'cizen_initramfs_prepare')"
+if [ -n "$_ord_prep" ] && [ -n "$_ord_ukify" ] && [ -n "$_ord_objcopy" ] \
+   && [ "$_ord_prep" -lt "$_ord_ukify" ] && [ "$_ord_prep" -lt "$_ord_objcopy" ] \
+   && [ "$_ord_calls" -eq 1 ]; then
+  rec ok "motor: build_cizen_uki prepara el initramfs ANTES de elegir constructor (prepare L${_ord_prep} < ukify L${_ord_ukify} < objcopy L${_ord_objcopy})"
+else
+  rec fail "motor: el initramfs se prepara tarde o de más (prepare=${_ord_prep:-none} calls=$_ord_calls ukify=${_ord_ukify:-none} objcopy=${_ord_objcopy:-none}) -> fallback UKI sin initrd"
+fi
+if printf '%s\n' "$_uki_body" | grep -q -- '--add-section .initrd="\$initrd"'; then
+  rec ok "motor: el fallback objcopy embeble .initrd"
+else
+  rec fail "motor: el fallback objcopy no embeble .initrd"
+fi
+unset _uki_body _ord_prep _ord_ukify _ord_objcopy _ord_calls
 
 # manager: flip/backup solo consideran UKIs Cizen con patrón '.*suffix*.efi', no
 # el primer *.efi cualquiera (podía fijar oneshot al LTS).
@@ -4235,6 +4272,233 @@ else
   printf '  (sin perfiles/pgo-collect.sh en el árbol: se omiten las regresiones de v27.31.45)\n'
 fi
 unset PROFILE_ PGO_ ES_ DS_ DK_ DM_
+
+# --- v27.31.51 / perfil v5.16.1: poda de subsistemas verificada con Kconfig ---
+# El .config generado se comprobó aplicando el perfil entero con scripts/config
+# y normalizando con `make olddefconfig` sobre linux-7.2.8: ENABLE 35/35,
+# CRITICAL 13/13, DISABLE 303/303, 0 DISABLE_WARN, y -112 símbolos y/m.
+# Estas regresiones son la red de seguridad de esa verificación.
+# Ojo: PROFILE_ se ha borrado justo arriba con el unset del bloque v27.31.45,
+# así que esta sección vuelve a derivar la ruta con su propia variable.
+PROFV_="$(dirname "$MOTOR")/profiles/cizen-optiplex7050.conf"
+if [ -f "$PROFV_" ]; then
+  # Los símbolos se listan por RAÍZ: Kconfig cascada a los hijos y listarlos uno
+  # a uno los convierte en "RETIRED / símbolo inexistente" al validarlos.
+  for _root in XEN INTEL_TDX_HOST FTRACE NUMA_BALANCING ZSWAP_DEFAULT_ON \
+              TRACE_GPU_MEM PM_DEBUG; do
+    _n="$(_prof_sym "$PROFV_" DISABLE "$_root")"
+    if [ "$_n" -eq 1 ]; then
+      rec ok "perfil v5.16.1: raíz $_root en OPTS_DISABLE (cascada verificada con olddefconfig)"
+    else
+      rec fail "perfil v5.16.1: raíz $_root no está exactamente una vez en DISABLE (n=$_n)"
+    fi
+  done
+  unset _root _n
+
+  # XEN_PVH/KVM_INTEL_TDX cuelgan de sus raíces: listarlos sería ruido RETIRED.
+  for _child in XEN_PVH XEN_HYPERVISOR X86_XEN_HYPERVISOR KVM_INTEL_TDX \
+                FUNCTION_TRACER EVENT_TRACING PM_TRACE PM_SLEEP_DEBUG; do
+    _n="$(_prof_sym "$PROFV_" DISABLE "$_child")"
+    if [ "$_n" -eq 0 ]; then
+      rec ok "perfil v5.16.1: $_child NO se lista (lo apaga su raíz, sin ruido RETIRED)"
+    else
+      rec fail "perfil v5.16.1: $_child se lista en DISABLE además de su raíz (n=$_n)"
+    fi
+  done
+  unset _child _n
+
+  # v5.16.1: símbolos que NO existen en linux-7.2.8 (0 coincidencias en el árbol
+  # Kconfig*). Pedirlos solo generaba "CONFIG_x ya no existe en esta versión".
+  for _dead in PERF_GUEST_EVENTS MQ_IOSCHED_ADIOS; do
+    _n="$(_prof_sym "$PROFV_" DISABLE "$_dead")"
+    if [ "$_n" -eq 0 ]; then
+      rec ok "perfil v5.16.1: $_dead retirado (símbolo inexistente en 7.2.8)"
+    else
+      rec fail "perfil v5.16.1: $_dead sigue pedido aunque no exista en 7.2.8 (n=$_n)"
+    fi
+  done
+  unset _dead _n
+
+  # Secure Boot: MODULE_SIG_ALL salía =y solo por `default y`; se ancla.
+  _n="$(_prof_sym "$PROFV_" ENABLE MODULE_SIG_ALL)"
+  if [ "$_n" -eq 1 ]; then
+    rec ok "perfil v5.16.1: MODULE_SIG_ALL anclado en ENABLE (no depende del default de Kconfig)"
+  else
+    rec fail "perfil v5.16.1: MODULE_SIG_ALL no está anclado en ENABLE (n=$_n)"
+  fi
+  unset _n
+
+  # KVM_INTEL hace `select X86_FRED if X86_64` sin condiciones: es imposible
+  # apagarlo con KVM, y sin declararlo saldría un DISABLE_WARN en cada build.
+  if awk '/^[[:space:]]*#/ {next} /^declare -a EXPECTED_REBELS=\(/ {b=1;next} /^\)/ {b=0}
+         b && index($0,"\"X86_FRED\"") {n++} END{print n+0}' "$PROFV_" | grep -qx 1; then
+    rec ok "perfil v5.16.1: X86_FRED en EXPECTED_REBELS (lo selecciona KVM_INTEL)"
+  else
+    rec fail "perfil v5.16.1: X86_FRED no está en EXPECTED_REBELS (DISABLE_WARN eterno)"
+  fi
+
+  # Duplicados DENTRO de la misma array. add_unique() los absorbe sin avisar, así
+  # que un "PM_DEBUG" repetido no rompe la build: solo indica que la lista se
+  # está editando a ciegas. Salió uno de verdad al añadir el bloque v5.16.1.
+  for _arr in ENABLE DISABLE; do
+    _dups="$(awk -v blk="declare -a OPTS_$_arr=(" '/^[[:space:]]*#/ {next}
+                   index($0,blk)==1 {b=1;next} /^\)/ {b=0}
+                   b {for(i=1;i<=NF;i++){gsub(/"/,"",$i); if($i!="") print $i}}' "$PROFV_" \
+                 | sort | uniq -d | tr '\n' ' ')"
+    if [ -z "${_dups// /}" ]; then
+      rec ok "perfil v5.16.1: sin símbolos repetidos dentro de OPTS_$_arr"
+    else
+      rec fail "perfil v5.16.1: símbolos repetidos en OPTS_$_arr: $_dups"
+    fi
+  done
+  unset _arr _dups
+
+  # Invariante general: ningún símbolo puede estar a la vez en ENABLE y DISABLE.
+  # El motor aplicaría los dos scripts/config y ganaría el último, así que la
+  # validación nunca lo detectaría: solo se ve leyendo el perfil.
+  _enset=""
+  _nen=0
+  while read -r _s; do
+    [ -z "$_s" ] && continue
+    _nen=$((_nen+1)); _enset="$_enset|$_s|"
+  done < <(awk '/^[[:space:]]*#/ {next}
+                 /^declare -a OPTS_ENABLE=\(/ {b=1;next}
+                 /^\)/ {b=0}
+                 b {for(i=1;i<=NF;i++){gsub(/"/,"",$i); if($i!="") print $i}}' "$PROFV_")
+  _dups=""
+  while read -r _s; do
+    [ -z "$_s" ] && continue
+    case "$_enset" in *"|$_s|"*) _dups="$_dups $_s" ;; esac
+  done < <(awk '/^[[:space:]]*#/ {next}
+                 /^declare -a OPTS_DISABLE=\(/ {b=1;next}
+                 /^\)/ {b=0}
+                 b {for(i=1;i<=NF;i++){gsub(/"/,"",$i); if($i!="") print $i}}' "$PROFV_")
+  if [ -z "${_dups// /}" ]; then
+    rec ok "perfil v5.16.1: ningún símbolo en OPTS_ENABLE y OPTS_DISABLE a la vez ($_nen en ENABLE)"
+  else
+    rec fail "perfil v5.16.1: símbolos a la vez en ENABLE y DISABLE:$_dups"
+  fi
+  unset _enset _nen _dups _s
+fi
+unset PROFV_
+
+# Los frag se|sourcean con el .config: un CONFIG_ que no exista en Kconfig lo
+# descarta olddefconfig y genera un aviso de "símbolo no solicitado".
+FRAGD_="$(dirname "$MOTOR")/profiles/frags"
+if [ -d "$FRAGD_" ]; then
+  _badfrags=0
+  for _f in "$FRAGD_"/*.frag; do
+    [ -f "$_f" ] || continue
+    # Solo asignaciones: el frag documenta en un comentario POR QUÉ se retiró
+    # CONFIG_EXTRA_FIRMWARE_FILE, y ese comentario no debe contar como uso.
+    if grep -v '^[[:space:]]*#' "$_f" | grep -q 'CONFIG_EXTRA_FIRMWARE_FILE'; then
+      _badfrags=$((_badfrags+1))
+    fi
+  done
+  if [ "$_badfrags" -eq 0 ]; then
+    rec ok "perfil v5.16.1: ningún frag usa CONFIG_EXTRA_FIRMWARE_FILE (no es símbolo de Kconfig)"
+  else
+    rec fail "perfil v5.16.1: $_badfrags frag(s) con CONFIG_EXTRA_FIRMWARE_FILE (símbolo inexistente)"
+  fi
+  unset _badfrags _f FRAGD_
+fi
+
+# --- v27.31.51: sudo sin TTY, y `set -u` con local sin valor ---
+# Los tres fallos que aparecieron al ejecutar contra el sistema real, no contra
+# un mock: los tres hacen que un script LIMPIO se caiga cuando el allowlist de
+# sudoers cumple su parte y el ESP es root-only.
+{
+  # 1. `sudo test` / `sudo du` / `sudo ls` sin -n abren prompt SIEMPRE, aunque el
+  #    comando esté en el allowlist: el prompt ocurre antes de mirar la lista.
+  #    Sin eso `rollback --list` no corre en cron, en un agente o sin terminal.
+  #    Se comparan solo líneas de código: los comentarios DESCRIBEN el
+  #    `sudo -n test` que había antes, y si no se filtran el test pasa/falla
+  #    por su propia explicación.
+  _RB="$(dirname "$MOTOR")/kernel-update-rollback.sh"
+  if [ -f "$_RB" ] \
+     && ! grep -vE '^[[:space:]]*#' "$_RB" \
+          | grep -qE '^[[:space:]]*sudo[[:space:]]+(-n[[:space:]]+)?(test|ls|du|cat)[[:space:]]' \
+     && grep -qE '^[[:space:]]*_priv\(\)' "$_RB"; then
+    rec ok "rollback: las lecturas van por _priv (nada de 'sudo cmd' que pida TTY)"
+  else
+    rec fail "rollback: sigue usando 'sudo <cmd>' sin -n (pide contraseña para --list)"
+  fi
+
+  # 2. `sudo -n test` con `test` como builtin de bash: sudo no puede ejecutarlo
+  #    (no está en el PATH de secure_path) y falla con 127 aunque /usr/bin/test
+  #    sea ejecutable. Se usa la ruta absoluta.
+  _MB="$(dirname "$MOTOR")/kernel-update-manager.sh"
+  if [ -f "$_MB" ] \
+     && ! grep -vE '^[[:space:]]*#' "$_MB" \
+          | grep -qE 'sudo[[:space:]]+(-n[[:space:]]+)?test[[:space:]]'; then
+    rec ok "manager: no invoca 'sudo test' (builtin, no ejecutable por sudo)"
+  else
+    rec fail "manager: usa 'sudo test'; sudo no puede correr un builtin de bash"
+  fi
+
+  # 3. objdump/dd por sudo -n: sin ruta absoluta el allowlist NOPASSWD no casa
+  #    con el nombre desnudo y el parseo de .uname se cae en silencio.
+  if [ -f "$_MB" ] && grep -q '/usr/bin/objdump' "$_MB" && grep -q '/usr/bin/dd' "$_MB"; then
+    rec ok "manager: objdump y dd con ruta absoluta (casan con el allowlist)"
+  else
+    rec fail "manager: objdump/dd sin ruta absoluta; el allowlist NOPASSWD no casa"
+  fi
+
+  # 4. `set -u` + `local x` sin asignar = 'unbound variable'. list_archives
+  #    declaraba pkgpath y solo lo asignaba si el manifiesto traía pkgfile, así
+  #    que un manifiesto sin ese campo abortaba el `list` entero.
+  if [ -f "$_RB" ] && grep -qE 'local[^;]*pkgpath=""' "$_RB"; then
+    rec ok "rollback: pkgpath se inicializa (manifiesto sin pkgfile no aborta con set -u)"
+  else
+    rec fail "rollback: pkgpath sin inicializar; 'set -u' aborta si el manifiesto no trae pkgfile"
+  fi
+
+  # 5. sort -V y no sort: los archives se nombran por release, y con byte-sort
+  #    '7.2.10-cizen-v3' es MENOR que '7.2.9'. tail -n1 devolvía un kernel más
+  #    viejo que el que se iba a retirar.
+  if [ -f "$_RB" ] && grep -qE 'ls -1 "\$ROLLBACK_DIR"/\*\.tar\.xz.*\| *sort -V' "$_RB"; then
+    rec ok "rollback: los archives se ordenan con sort -V (7.2.10 > 7.2.9)"
+  else
+    rec fail "rollback: sin sort -V; el plan B puede restaurar un kernel más viejo"
+  fi
+
+  # 6. cizen-uki-sync hace `*) break` en el parseo de argumentos: un argumento
+  #    desconocido se ignoraba y la REGENERACIÓN se ligaba igual. Escribiendo
+  #    encima del fichero del que arranca el equipo: `cizen-uki-sync --help`
+  #    regeneraba la UKI de verdad.
+  _UK="$(dirname "$MOTOR")/cizen-uki-sync"
+  if [ -f "$_UK" ] \
+     && ! grep -qE '^[[:space:]]*\*\) break ;;' "$_UK" \
+     && grep -q -- '-h|--help' "$_UK"; then
+    rec ok "uki-sync: argumento desconocido es error, no cae en la regeneración"
+  else
+    rec fail "uki-sync: '*) break' hace que --help regenere y sobrescriba la UKI"
+  fi
+
+  # 7. La red que salva al equipo de una firma fallida (uki_prev_restore) se
+  #    apoyaba en `sudo test`, que es un builtin: sudo no lo encuentra en
+  #    secure_path, devolvía 127, el script creía que no había copia .cizen-prev
+  #    y se iba sin restaurar. UKI sin firmar + Secure Boot = no arranca.
+  if [ -f "$_UK" ] \
+     && ! grep -vE '^[[:space:]]*#' "$_UK" \
+          | grep -qE '\$\{SUDO\[@\]\}[[:space:]]+test[[:space:]]' \
+     && grep -qF '"${SUDO[@]}" /usr/bin/test -f "$t.cizen-prev"' "$_UK"; then
+    rec ok "uki-sync: la restauración de la UKI previa usa /usr/bin/test (no builtin)"
+  else
+    rec fail "uki-sync: uki_prev_restore usa 'sudo test'; la red anti-firma-fallida no dispara"
+  fi
+
+  # 8. Una UKI sin .initrd no debe poder sustituir a una que sí lo tiene: el
+  #    aviso de 'arranque degradado' salía, y la escritura continuaba igual.
+  if [ -f "$_UK" ] \
+     && grep -q 'CIZEN_UKI_ALLOW_DEGRADED_INITRD' "$_UK" \
+     && grep -q 'uki_image_has_initrd' "$_UK"; then
+    rec ok "uki-sync: no deja que una UKI sin .initrd pise a una que sí lo tiene"
+  else
+    rec fail "uki-sync: sin guard de initrd, un mkinitcpio fallido degrada el arranque"
+  fi
+  unset _RB _MB _UK
+}
 
 # --- resumen ---
 echo

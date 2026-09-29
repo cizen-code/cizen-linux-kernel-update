@@ -136,7 +136,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.50"
+SCRIPT_VERSION="27.31.51"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -298,11 +298,6 @@ SIGN_UKI_REASON=""
 SIGN_UKI_STATE_DIR="${CIZEN_SIGN_UKI_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/kernel-update}"
 SIGN_UKI_STATE_FILE="$SIGN_UKI_STATE_DIR/sign-uki.state"
 
-# Rama de kernel.org a seguir: stable (default) o longterm/LTS mayor.
-CIZEN_KERNEL_TRACK="${CIZEN_KERNEL_TRACK:-stable}"
-[ "$CIZEN_KERNEL_TRACK" = "longterm" ] || [ "$CIZEN_KERNEL_TRACK" = "lts" ] || [ "$CIZEN_KERNEL_TRACK" = "stable" ] \
-  || fatal "CIZEN_KERNEL_TRACK inválido: $CIZEN_KERNEL_TRACK (use stable, longterm o lts)."
-
 # Rollback dual-kernel: directorio (root) donde se archiva el kernel previo al instalar.
 ROLLBACK_DIR="${CIZEN_ROLLBACK_DIR:-/var/lib/kernel-update/rollback}"
 # Además del archive de ficheros, se preserva el PAQUETE del kernel instalado
@@ -364,6 +359,14 @@ err(){  printf '%s  ✗%s %s\n' "$R" "$N" "$*" >&2; }
 info(){ printf '%s  •%s %s\n' "$C" "$N" "$*"; }
 
 fatal(){ err "$*"; exit 1; }
+
+# Rama de kernel.org a seguir: stable (default) o longterm/LTS mayor.
+# Se valida AQUÍ y no junto al resto de variables porque necesita 'fatal', que
+# se define justo encima: llamarla antes daba 'fatal: command not found' (127)
+# y se tragaba la lista de valores válidos.
+CIZEN_KERNEL_TRACK="${CIZEN_KERNEL_TRACK:-stable}"
+[ "$CIZEN_KERNEL_TRACK" = "longterm" ] || [ "$CIZEN_KERNEL_TRACK" = "lts" ] || [ "$CIZEN_KERNEL_TRACK" = "stable" ] \
+  || fatal "CIZEN_KERNEL_TRACK inválido: $CIZEN_KERNEL_TRACK (use stable, longterm o lts)."
 
 # Reducir la prioridad de CPU/I/O del build para mantener el escritorio usable.
 # CIZEN_BUILD_PRIORITY=normal salta nice/ionice y compila a plena prioridad:
@@ -6535,7 +6538,7 @@ choose_base_config() {
 # en este Kconfig (renombrados/legacy).
 # ------------------------------------------------------------
 lite_missing_check() {
-  local _log="${1:-}" _line _m _tok _sym _n _in _gap="" _s
+  local _log="${1:-}" _line _m _tok _toks _sym _n _in _gap="" _s
   local _pm="${CIZEN_PROC_MODULES:-/proc/modules}"
   [ -s "$_log" ] || return 0
   declare -A _ctx=()
@@ -6547,9 +6550,19 @@ lite_missing_check() {
         ;;
       "module "*" did not have configs "*)
         _m="${_line#module }"; _m="${_m%% did not have configs*}"
-        for _tok in ${_line#*configs }; do
+        # Los símbolos van SEPARADOS POR ESPACIOS en la línea de localmodconfig.
+        # Con el IFS global del script (IFS=$'\n\t', línea 134) un
+        # 'for _tok in ${_line#*configs }' sin comillas NO parte por espacios:
+        # toda la cola se quedaba como un único token, '${_tok%%=*}' devolvía la
+        # cola entera (no hay '=') y _ctx se quedaba con UNA clave basura en
+        # lugar de los símbolos reales. El aviso que emite esta función —'el
+        # modo lite NO compilaría estos módulos'— nunca disparaba por esta vía.
+        # read -a con IFS=' ' aísla la división, igual que en podar-modulos.sh.
+        IFS=' ' read -r -a _toks <<< "${_line#*configs }" || true
+        for _tok in "${_toks[@]:-}"; do
           case "$_tok" in CONFIG_*) _ctx["${_tok%%=*}"]="$_m" ;; esac
         done
+        unset _toks
         ;;
       WARNING:*)
         _tok="${_line#WARNING: }"; _tok="${_tok%% *}"
@@ -7506,7 +7519,10 @@ validate_split_package_transition_metadata() {
     [ -n "${BUILD_MARKER:-}" ] && [ -f "$BUILD_MARKER" ] && [ "$item" -nt "$BUILD_MARKER" ] || continue
     base="$(basename -- "$item")"
     case "$base" in
-      *-headers-*.pkg.tar.zst|*-api-headers-*.pkg.tar.zst|*-debug-*.pkg.tar.zst) ;;
+      # '*-headers-*' ya cubre '*-api-headers-*' (el * anterior se come
+      # 'arch-linux-cizen-v3-api'), así que ese patrón era código muerto y
+      # hacía que shellcheck marcase el caso entero (SC2221/SC2222).
+      *-headers-*.pkg.tar.zst|*-debug-*.pkg.tar.zst) ;;
       *) continue ;;
     esac
 
@@ -7926,6 +7942,10 @@ write_verify_signature() {
 # ============================================================
 CIZEN_UKI_NAME="${CIZEN_UKI_NAME:-arch-${CIZEN_PKGBASE}.efi}"
 CIZEN_UKI_REQUIRED="${CIZEN_UKI_REQUIRED:-0}"
+# Lo pone cizen_uki_fail() en cuanto una vía del camino directo no puede
+# escribir el UKI. El run NO se aborta por eso (CIZEN_UKI_REQUIRED=0), pero el
+# resumen tiene que saberlo para no anunciar un UKI sincronizado que no lo está.
+CIZEN_UKI_SYNC_FAILED=false
 CIZEN_UKI_FORCE_DIRECT="${CIZEN_UKI_FORCE_DIRECT:-0}"
 CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK="${CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK:-0}"
 # Reparto de responsabilidades con mkinitcpio (v27.31.39), igual que en
@@ -7960,6 +7980,14 @@ CIZEN_INITRAMFS_REQUIRED="${CIZEN_INITRAMFS_REQUIRED:-0}"
 CIZEN_BOOT_TRIES="${CIZEN_BOOT_TRIES:-0}"
 
 cizen_uki_fail() {
+    # Toda vía de fallo del camino directo acaba aquí. Además del aviso, se
+    # REGISTRA el fallo: antes sync_cizen_efi devolvía 0 en todos sus errores
+    # (que es lo correcto para no matar el run, con CIZEN_UKI_REQUIRED=0) y el
+    # llamante imprimía 'ok UKI sincronizado' igualmente, así que un ESP
+    # inescribible o una UKI que no superaba la verificación terminaba en
+    # "ACTUALIZACIÓN COMPLETADA" con exit 0. El flag es lo que permite no
+    # mentir en el resumen.
+    CIZEN_UKI_SYNC_FAILED=true
     if [ "${CIZEN_UKI_REQUIRED}" = 1 ]; then
         fatal "$*"
     else
@@ -8570,6 +8598,12 @@ cizen_uki_verify_image() {
 build_cizen_uki() {
     local kernel="$1" cmdline_file="$2" out="$3"
     local cmdline_text ukify_bin="" stub s osrel_file rel
+    # v27.31.41 + fix del fallback objcopy: declaradas AQUÍ y no dentro de la
+    # rama de ukify, porque el fallback de objcopy (abajo) también las usa. Si
+    # no hay ukify, ese bloque nunca se ejecuta y referenciarlas daba
+    # 'unbound variable' con `set -u` en el único camino que las necesita.
+    local initrd="" have_initrd=0
+    local ucode_tmp="" ucode_dir="" cpuid_hex="" ucode_bin="" ucode_rev=""
 
     cmdline_text="$(<"$cmdline_file")"
 
@@ -8595,6 +8629,26 @@ build_cizen_uki() {
         ukify_bin="/usr/lib/systemd/ukify"
     fi
 
+    # El initramfs se regenera y valida AQUÍ, ANTES de elegir constructor, y no
+    # dentro de la rama de ukify: es la única puerta por la que pasa todo initrd
+    # que acabe en una UKI de este motor, y la necesita la vía de ukify Y la de
+    # objcopy. Estaba dentro de la rama de ukify, así que en un equipo SIN ukify
+    # el fallback de abajo se encontraba con have_initrd=0 —sin haberlo
+    # preparado nunca— y fabricaba una UKI sin initrd justo donde menos falta
+    # hacía. Antes se embebía el fichero que hubiera en /boot sin mirarlo.
+    if cizen_initramfs_prepare; then
+        initrd="$CIZEN_INITRAMFS_PATH"
+        have_initrd=1
+    elif [ "${CIZEN_INITRAMFS_REQUIRED:-0}" = "1" ]; then
+        rm -f "$osrel_file"
+        err "No hay initramfs válido y CIZEN_INITRAMFS_REQUIRED=1: no construyo la UKI."
+        return 1
+    else
+        # El diseño es que el equipo arranca igual sin initramfs (btrfs y
+        # el resto built-in; ver verify_build_tree()), pero nunca en silencio.
+        warn "Sin initramfs válido: la UKI saldrá sin initrd y el arranque será degradado."
+    fi
+
     if [ -n "$ukify_bin" ]; then
         local -a args=(
             "$ukify_bin" build
@@ -8610,27 +8664,6 @@ build_cizen_uki() {
         # es --uname, no --version (este último imprime la versión de ukify y sale).
         if [ -n "$rel" ]; then
             args+=(--uname="$rel")
-        fi
-        # El initramfs se regenera y valida AQUÍ: build_cizen_uki es la única
-        # puerta por la que pasa todo initrd que acabe en una UKI de este
-        # motor. Antes se embebía el fichero que hubiera en /boot sin mirarlo.
-        local initrd="" have_initrd=0
-        # v27.31.41: declaradas aquí, no dentro de la rama que las rellena. La
-        # limpieza de ucode_tmp va fuera del if, y con `set -u` declararla solo
-        # dentro de la rama del microcode revienta con "unbound variable" en el
-        # camino normal (CON initramfs), que es el que se usa siempre.
-        local ucode_tmp="" ucode_dir="" cpuid_hex="" ucode_bin="" ucode_rev=""
-        if cizen_initramfs_prepare; then
-            initrd="$CIZEN_INITRAMFS_PATH"
-            have_initrd=1
-        elif [ "${CIZEN_INITRAMFS_REQUIRED:-0}" = "1" ]; then
-            rm -f "$osrel_file"
-            err "No hay initramfs válido y CIZEN_INITRAMFS_REQUIRED=1: no construyo la UKI."
-            return 1
-        else
-            # El diseño es que el equipo arranca igual sin initramfs (btrfs y
-            # el resto built-in; ver verify_build_tree()), pero nunca en silencio.
-            warn "Sin initramfs válido: la UKI saldrá sin initrd y el arranque será degradado."
         fi
         if [ "$have_initrd" -eq 1 ]; then
             args+=(--initrd="$initrd")
@@ -8684,6 +8717,13 @@ build_cizen_uki() {
     done
 
     if [ -n "$stub" ] && command -v objcopy >/dev/null 2>&1; then
+        # El stub de systemd ya trae declaradas .initrd, .uname y .ucode, así
+        # que objcopy solo rellena esas que apliquen. Sin .initrd y sin .uname
+        # el resultado era una UKI que el propio cizen_uki_verify_image
+        # descartaba ("no supera la verificación de la sección .initrd") y que
+        # systemd-boot no puede arrancar. Es la misma lista que usa
+        # cizen-uki-sync:build_uki; las dos réplicas tienen que embeber lo mismo.
+        local uname_file=""
         local -a objargs=(
             --add-section .cmdline="$cmdline_file"
             --set-section-flags .cmdline=noload,readonly
@@ -8692,16 +8732,43 @@ build_cizen_uki() {
             --add-section .linux="$kernel"
             --set-section-flags .linux=noload,readonly
         )
+        if [ "$have_initrd" -eq 1 ] && [ -n "$initrd" ]; then
+            objargs+=(--add-section .initrd="$initrd")
+            objargs+=(--set-section-flags .initrd=noload,readonly)
+        fi
+        if [ -n "$rel" ]; then
+            uname_file="$(mktemp /tmp/cizen-uname.XXXXXX)" || uname_file=""
+            if [ -n "$uname_file" ]; then
+                printf '%s\n' "$rel" > "$uname_file"
+                objargs+=(--add-section .uname="$uname_file")
+                objargs+=(--set-section-flags .uname=noload,readonly)
+            fi
+        fi
+        if [ -n "$ucode_tmp" ]; then
+            objargs+=(--add-section .ucode="$ucode_tmp")
+            objargs+=(--set-section-flags .ucode=noload,readonly)
+        fi
         if objcopy "${objargs[@]}" "$stub" "$out"; then
             rm -f "$osrel_file"
+            [ -n "$uname_file" ] && rm -f "$uname_file"
             return 0
         fi
+        warn "objcopy no pudo ensamblar el stub; reintento sin él no procede."
     fi
     [ -n "$osrel_file" ] && rm -f "$osrel_file"
+    [ -n "${uname_file:-}" ] && rm -f "$uname_file"
+    [ -n "$out" ] && rm -f "$out"
 
+    # CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK: copiar el vmlinuz pelado al ESP no
+    # produce una UKI —no tiene stub, ni .cmdline, ni .osrel, ni .uname, ni
+    # .initrd— así que systemd-boot no lo puede arrancar. Peor: sync_cizen_efi
+    # pasa el artefacto por cizen_uki_verify_image, que lo rechaza, con lo que
+    # este camino era inalcanzable. Se deja de escribir por aquí y se dice por
+    # qué, en vez de dejar un interruptor que solo puede dejar el ESP roto.
     if [ "${CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK}" = 1 ]; then
-        cp -f "$kernel" "$out"
-        return 0
+        warn "CIZEN_UKI_ALLOW_RAW_KERNEL_FALLBACK=1 pero un vmlinuz sin stub no es una UKI:"
+        warn "  no tiene .cmdline/.osrel/.uname/.initrd y systemd-boot no puede arrancarlo."
+        warn "  No se escribe nada en el ESP. Instala ukify (systemd-ukify) o binutils."
     fi
 
     return 1
@@ -8977,12 +9044,21 @@ cizen_uki_sign_targets() {
 # El wizard de Secure Boot solo ofrece volver a firmar cuando esto dice que no,
 # así que un "no" erroneo es ruido y un "sí" erroneo es inocuo: por eso basta con
 # que uno de los dos indicadores (sección .sig o sbctl verify) lo confirmen.
+# ¿Están firmados los objetivos? 0 = sí. Basta con que UNO de los indicadores
+# lo confirme, y sale en el primero que acierta.
+# El docstring decía "verifica que TODOS" y el bucle hace lo contrario; el
+# código es el que se queda, por dos razones sobre los mismos datos:
+#   - el wizard solo ofrece volver a firmar cuando esto dice que no, así que un
+#     "no" erroneo es ruido y un "sí" erroneo es inocuo;
+#   - exigir los DOS indicadores (sección .sig Y sbctl verify) daría falsos
+#     negativos: en este host sbctl verify no encuentra la ESP (§33.6) y no
+#     puede ser un veredicto.
 cizen_uki_sign_targets_verify() {
     [ -n "$SBCTL_BIN" ] && [ "$#" -gt 0 ] || return 1
     local t
     for t in "$@"; do
         cizen_uki_has_sig_section "$t" && return 0
-        sudo sbctl verify "$t" >/dev/null 2>&1 && return 0
+        sudo "$SBCTL_BIN" verify "$t" >/dev/null 2>&1 && return 0
     done
     return 1
 }
@@ -9082,7 +9158,14 @@ resolve_sign_uki() {
             ;;
     esac
     if [ "$DO_SIGN_UKI" = true ]; then
-        secure_boot_guided_setup
+        # secure_boot_guided_setup devuelve 1 cuando el usuario NO genera las
+        # claves o cuando la cadena queda con pasos pendientes. Esa es una
+        # decisión suya, no un fallo del build (todo el contrato del wizard es
+        # 'warn y sigue'), pero al invocarla como comando suelto su 1 mataba
+        # el run bajo 'set -e' — y sin imprimir el resumen de pasos pendientes
+        # que explica el 1. Se traga el rc para que el veredicto sea el que
+        # escribe la propia función.
+        secure_boot_guided_setup || true
     fi
     return 0
 }
@@ -9818,7 +9901,13 @@ check_prerequisites
 # degrada a sin-BTF; se reconstruyen los arrays efectivos por si el BTF se
 # desactivó.
 if [ "$BTF_REQUESTED" = true ]; then
-  ensure_optional_pahole
+  # ensure_optional_pahole devuelve 1 cuando degrada a sin-BTF. Sin el '|| true'
+  # ese 1 era el último comando del cuerpo del 'if', así que bajo
+  # 'set -Eeuo pipefail' (línea 133) MATABABA la ejecución aquí: el aviso de
+  # "se desactiva BTF" salía y acto seguido moría el run entero, con el tmpfs
+  # montado y todo el trabajo previo tirado. Es un degrade documentado, no un
+  # fallo: su rc no debe matar el script.
+  ensure_optional_pahole || true
   build_effective_arrays
 fi
 
@@ -10388,9 +10477,14 @@ apply_cc_choice() {
 # con --tree cachyos (y con la release del fork si la versión pedida aún no está
 # publicada allí). Se explica y se pregunta; nunca se degrada en silencio.
 relaunch_with_version() { # $1=versión $2=scheduler $3=cc (opcional)
-  local -a a=()
+  local -a a=() cc=()
   local x skip=0
-  for x in ${ENGINE_ARGV[@]:-}; do
+  # ENGINE_ARGV siempre está definido (arriba: declare -a ENGINE_ARGV=("$@")):
+  # sin el ':-' y entre comillas no hay ni re-splitting ni pathname expansion.
+  # El '${arr[@]:-}' anterior inyectaba UN argumento vacío cuando el array
+  # estaba vacío (en bash '[@]:-' con array vacío da una palabra vacía), que
+  # exec pasaba al motor como un argumento fantasma.
+  for x in "${ENGINE_ARGV[@]}"; do
     [ "$skip" = 1 ] && { skip=0; continue; }
     case "$x" in
       --sched|--cc|--tree) skip=1; continue ;;
@@ -10400,9 +10494,10 @@ relaunch_with_version() { # $1=versión $2=scheduler $3=cc (opcional)
     [[ "$x" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] && continue
     a+=("$x")
   done
-  log "Relanzando: $ENGINE_SELF ${a[*]} $1 --tree cachyos --sched $2 ${3:+--cc $3} --no-ask-variant --no-ask-cc"
-  exec "$ENGINE_SELF" ${a[@]:-} "$1" --tree cachyos --sched "$2" \
-    ${3:+--cc "$3"} --no-ask-variant --no-ask-cc
+  [ -n "${3:-}" ] && cc=(--cc "$3")
+  log "Relanzando: $ENGINE_SELF ${a[*]-} $1 --tree cachyos --sched $2 ${cc[*]-} --no-ask-variant --no-ask-cc"
+  exec "$ENGINE_SELF" "${a[@]}" "$1" --tree cachyos --sched "$2" \
+    "${cc[@]}" --no-ask-variant --no-ask-cc
 }
 
 fork_release_guard() { # $1=scheduler elegido (vacío = vanilla)
@@ -11087,11 +11182,25 @@ UKI_SYNC_BIN="$(cizen_uki_sync_bin)"
 if [ -z "$UKI_SYNC_BIN" ]; then
   fatal "No encuentro cizen-uki-sync ni en $SCRIPT_DIR ni en el PATH."
 fi
+CIZEN_UKI_SYNC_FAILED=false
+UKI_SYNC_FAILED=false
 if ! sudo "$UKI_SYNC_BIN" "${UKI_SYNC_ARGS[@]}"; then
   warn "cizen-uki-sync falló; se reintenta la sincronización con el camino de generación directo del motor."
+  UKI_SYNC_FAILED=true
 fi
 ensure_cizen_efi_updated
-ok "UKI sincronizado"
+# El camino directo (ensure_cizen_efi_updated → sync_cizen_efi) nunca devuelve
+# error a propósito —con CIZEN_UKI_REQUIRED=0 degradar esCorrecto— así que su
+# veredicto viaja en CIZEN_UKI_SYNC_FAILED. Sin esto, un ESP inescribible o una
+# UKI rechazada por la verificación de .initrd terminaba en "ACTUALIZACIÓN
+# COMPLETADA" con exit 0 y el ESP con el UKI viejo (o ninguno).
+if [ "$UKI_SYNC_FAILED" = false ] && [ "$CIZEN_UKI_SYNC_FAILED" = false ]; then
+  ok "UKI sincronizado"
+else
+  warn "El UKI NO se ha sincronizado: el ESP conserva el UKI anterior."
+  warn "El paquete está instalado, pero el próximo arranque usará el UKi previo. Reintenta con:"
+  warn "  sudo $UKI_SYNC_BIN ${UKI_SYNC_ARGS[*]-}"
+fi
 if [ "$DO_SIGN_UKI" = true ]; then
   # El veredicto de la firma ya lo dio cizen-uki-sync: 'sbctl sign --save', que
   # no devuelve 0 si no firmó, más la comprobación de la sección .sig. Un
