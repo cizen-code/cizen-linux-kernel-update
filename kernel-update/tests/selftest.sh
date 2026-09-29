@@ -1344,6 +1344,18 @@ cachyos-7.2.80-1" fork_tagrel 7.2.8)" ]; then
   else
     rec fail "menú: opciones de build que no pasan por build_and_exec:$faltan"
   fi
+  # Y la etiqueta tiene que decirlo: "validar config" sin más prometía una
+  # validación corta y la opción compilaba (build de 33 min en 7.2.8). Se
+  # comprueba el texto de las dos, no la intención.
+  mentir=""
+  for n in 1 2; do
+    grep -E "^opt $n " "$MENU" | grep -q 'validar y compilar' || mentir="$mentir $n"
+  done
+  if [ -z "$mentir" ]; then
+    rec ok "menú: las opciones 1 y 2 dicen que compilan, no solo que validan"
+  else
+    rec fail "menú: la etiqueta de$mentir promete validar sin mencionar la compilación"
+  fi
   # El menú no puede tener ni las funciones ni los submenús: si vuelve a
   # preguntar aquí, el usuario ve la pregunta dos veces (una sin efecto).
   if ! grep -qE '^(ask_cc|ask_variant)\(\)' "$MENU" \
@@ -3000,6 +3012,43 @@ preserve_rollback_package
 [ -s "$ROOT/warn.log" ] \
   && rec fail "rollback: CIZEN_ROLLBACK_PKG=0 no desactiva la preservación" \
   || rec ok "rollback: CIZEN_ROLLBACK_PKG=0 desactiva la preservación del paquete"
+
+# prune_rollback_archives: el archive que prepare_rollback_archive acaba de dejar
+# es el del kernel EN EJECUCIÓN, y la regla de poda excluía siempre esa release.
+# Resultado real del build del 2026-09-29: se creaba y se podaba en la misma
+# pasada ("Rollback preparado: …/7.2.8-cizen-v3.tar.xz" y acto seguido "Pruning
+# archive de rollback antiguo: 7.2.8-cizen-v3.tar.xz"), así que el resumen
+# anunciaba un fichero inexistente y el manifiesto quedaba colgando.
+eval "$(extract prune_rollback_archives)"
+eval "$(extract rollback_manifest_unset)"
+RUNREL="$(uname -r)"
+printf 'viejo\n'   > "$ROLLBACK_DIR/$VERSION.tar.xz"
+printf 'sello\n'    > "$ROLLBACK_DIR/$VERSION.timestamp"
+printf 'vigente\n'  > "$ROLLBACK_DIR/$RUNREL.tar.xz"
+rollback_manifest_set archive "$RUNREL.tar.xz"
+prune_rollback_archives "$ROLLBACK_DIR/$RUNREL.tar.xz"
+[ -f "$ROLLBACK_DIR/$RUNREL.tar.xz" ] \
+  && rec ok "rollback: el archive del kernel en ejecución sobrevive al prune (lo protege quien lo dejó)" \
+  || rec fail "rollback: el prune borró el archive recién preparado (desaparece la red del build)"
+[ -f "$ROLLBACK_DIR/$VERSION.tar.xz" ] \
+  && rec fail "rollback: se acumularon dos archives de rollback" \
+  || rec ok "rollback: el archive viejo se poda aunque el nuevo esté protegido"
+[ "$(rollback_manifest_field archive)" = "$RUNREL.tar.xz" ] \
+  && rec ok "rollback: el manifiesto sigue apuntando al archive que sobrevive" \
+  || rec fail "rollback: el manifiesto perdió el archive superviviente ('$(rollback_manifest_field archive)')"
+
+# Y al revés: si el archive announcing el manifiesto es el que se poda, la clave
+# desaparece en vez de quedar apuntando a un fichero que ya no está.
+rollback_manifest_set archive "$VERSION.tar.xz"
+printf 'viejo\n' > "$ROLLBACK_DIR/$VERSION.tar.xz"
+printf 'otro\n'  > "$ROLLBACK_DIR/7.2.6.tar.xz"
+prune_rollback_archives "$ROLLBACK_DIR/$RUNREL.tar.xz"
+[ -z "$(rollback_manifest_field archive)" ] \
+  && rec ok "rollback: al podar el archive del manifiesto, la clave se limpia" \
+  || rec fail "rollback: el manifiesto sigue anunciando un archive podado ('$(rollback_manifest_field archive)')"
+grep -q '^archive=' "$ROLLBACK_MANIFEST" 2>/dev/null \
+  && rec fail "rollback: quedó una línea archive= en el manifiesto tras la poda" \
+  || rec ok "rollback: la línea archive= desaparece del manifiesto al podarse"
 rm -rf "$RB"; rm -f "$SRC"/*.pkg.tar.zst
 
 # krollback reinstala con pacman -U y regenera la UKI: si se queda en extraer

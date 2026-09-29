@@ -247,8 +247,14 @@ build_and_exec() {
 }
 
 echo "  ${W}Validación${N}"
-opt 1 "check"       "validar config · baja"
-opt 2 "checkfast"   "validar config · alta"
+# Las opciones 1 y 2 COMPILAN: pasan por build_and_exec como las de "Compilación"
+# (el propio selftest lo comprueba). La etiqueta solo decía "validar config", y
+# quien la elegía se comía un build de media hora creyendo que iba a validar
+# (§39.4 de Agente.md). La diferencia real con 3/4 es que, si la config no
+# valida, no se ofrece compilar; y responder "n" al "¿Desea continuar?" deja la
+# config validada y promovida sin compilar.
+opt 1 "check"       "validar y compilar · baja"
+opt 2 "checkfast"   "validar y compilar · alta"
 rule
 echo "  ${W}Compilación${N}"
 opt 3 "build"       "compilar + instalar · baja"

@@ -136,7 +136,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.49"
+SCRIPT_VERSION="27.31.50"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -7600,6 +7600,22 @@ rollback_manifest_set() {
   return 0
 }
 
+# Quita una clave del manifiesto. `rollback_manifest_set` no puede hacerlo: con
+# valor vacío hace `return 0` sin tocar nada (protección deliberada contra
+# vaciar claves por accidente), y un archive que se ha podado tiene que DEJAR de
+# anunciarse: si no, el manifiesto apunta a un fichero que ya no está y el
+# rollback resuelve contra él.
+rollback_manifest_unset() {
+  local key="$1" tmp
+  [ -f "$ROLLBACK_MANIFEST" ] || return 0
+  tmp="$ROLLBACK_DIR/.rollback.info.$$.tmp"
+  sudo cat -- "$ROLLBACK_MANIFEST" 2>/dev/null | grep -v "^${key}=" |
+    sudo tee "$tmp" >/dev/null 2>&1 || { sudo rm -f -- "$tmp" 2>/dev/null; return 1; }
+  sudo mv -f -- "$tmp" "$ROLLBACK_MANIFEST" 2>/dev/null || {
+    sudo rm -f -- "$tmp" 2>/dev/null; return 1; }
+  return 0
+}
+
 # ¿El archive de esta release es realmente el del kernel INSTALADO ahora?
 # Sin esta comprobación, un archive de la misma release pero de otro pkgrel (otro
 # scheduler) se daba por bueno: era un "rollback" a un kernel que ya no era el
@@ -7690,7 +7706,10 @@ prepare_rollback_archive() {
   # el manifiesto dice que es el mismo paquete; si no, se rehace.
   if [ -f "$ROLLBACK_DIR/$rel.tar.xz" ] && rollback_manifest_matches "$rel"; then
     info "Rollback ya existe para $rel ($(rollback_manifest_field pkgver)); se conserva."
-    prune_rollback_archives
+    # Se anuncia igual: si el archive existe, es la red de este build, y el
+    # resumen debe decir dónde está.
+    VERIFY_ROLLBACK_FILE="$ROLLBACK_DIR/$rel.tar.xz"
+    prune_rollback_archives "$ROLLBACK_DIR/$rel.tar.xz"
     return 0
   fi
 
@@ -7737,7 +7756,9 @@ prepare_rollback_archive() {
     warn "No se pudo crear el archive de rollback de $rel."
   fi
 
-  prune_rollback_archives
+  # El archive recién dejado se protege del prune: es el del kernel EN
+  # ejecución, que la regla de prune excluye siempre (ver prune_rollback_archives).
+  [ -n "$VERIFY_ROLLBACK_FILE" ] && prune_rollback_archives "$VERIFY_ROLLBACK_FILE"
   return 0
 }
 
@@ -7746,15 +7767,24 @@ prepare_rollback_archive() {
 # "anterior"); si todos coincidieran con el actual, se conserva el de mayor
 # versión. Nunca acumula más de uno.
 prune_rollback_archives() {
-  local running="" keep="" base="" candidate=""
+  local running="" keep="" base="" candidate="" protect="${1:-}"
   local -a archives=() keep_list=()
   shopt -s nullglob
   archives=("$ROLLBACK_DIR"/*.tar.xz)
   shopt -u nullglob
   [ "${#archives[@]}" -le 1 ] && return 0
 
+  # El archive protegido entra PRIMERO y sin filtros: es el del kernel en
+  # ejecución, que la regla de abajo excluye siempre. Sin esta excepción, el
+  # prune borraba en la misma pasada el archive que prepare_rollback_archive
+  # acababa de dejar, que es justo la red del build que se está instalando: el
+  # resumen anunciaba un "Rollback :" que ya no existía y el manifiesto quedaba
+  # apuntando a un fichero Podado.
+  [ -n "$protect" ] && [ -f "$protect" ] && keep_list+=("$protect")
+
   running="$(uname -r 2>/dev/null || true)"
   for keep in "${archives[@]}"; do
+    [ -n "$protect" ] && [ "$keep" = "$protect" ] && continue
     base="$(basename -- "$keep")"
     case "$base" in
       "$running.tar.xz") continue ;;
@@ -7774,7 +7804,13 @@ prune_rollback_archives() {
     base="$(basename -- "$keep")"
     log "Pruning archive de rollback antiguo: $base"
     sudo rm -f -- "$keep" "${keep%.tar.xz}.timestamp" 2>/dev/null || true
+    # Si el manifiesto apuntaba a este archive, deja de hacerlo: anunciar un
+    # fichero ausente hace que el rollback resuelva contra él.
+    if [ "$(rollback_manifest_field archive)" = "$base" ]; then
+      rollback_manifest_unset archive
+    fi
   done
+  return 0
 }
 
 # ============================================================
@@ -11182,7 +11218,7 @@ Build prio  : $BUILD_PRIORITY_LABEL$([ "$BUILD_PRIORITY_LABEL" != "máxima" ] &&
  Lite        : sí (único modo: solo se compilan los módulos en uso; localmodconfig)
  Firma UKI   : $([ "$DO_SIGN_UKI" = true ] && printf '%s' 'sí (sbctl)' || printf '%s' 'no')${SIGN_UKI_REASON:+ — $SIGN_UKI_REASON}
 ${SNAPSHOT_DESC:+ Snapshot   : $SNAPSHOT_DESC}
-${VERIFY_ROLLBACK_FILE:+ Rollback  : $VERIFY_ROLLBACK_FILE}
+$( [ -n "$VERIFY_ROLLBACK_FILE" ] && [ -f "$VERIFY_ROLLBACK_FILE" ] && printf ' Rollback  : %s' "$VERIFY_ROLLBACK_FILE")
 
  Tiempos:
    Descarga+extracción : $( [ -n "$P_DL" ] && fmt_time "$P_DL" || echo '—')

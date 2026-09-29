@@ -205,7 +205,7 @@ vuelve al comportamiento anterior (solo archive de ficheros).
 
 | Modo | Comando | Descripción |
 |------|---------|-------------|
-| check | `kernel-update.sh --check` | Valida la configuración; ofrece compilar después y elige la variante Vanilla/BORE al confirmar |
+| check | `kernel-update.sh --check` | Valida la configuración; ofrece compilar después y elige la variante Vanilla/BORE al confirmar. Si respondes `n` al "¿Desea continuar con la compilación?" **no** compila: promueve la config validada y sale con `CHECK EXITOSO` |
 | checkfast | `CIZEN_BUILD_PRIORITY=normal kernel-update.sh --check` | Ídem a plena prioridad (misma interactividad Vanilla/BORE) |
 | build | `kernel-update.sh` | Compila e instala |
 | buildfast | `CIZEN_BUILD_PRIORITY=normal kernel-update.sh` | Compila a plena prioridad |
@@ -575,6 +575,15 @@ estado**:
   factor y delta), no porque el número se mueva.
 - Al **quedarse en 0 incidencias** la notificación baja a severidad `normal`
   con icono `emblem-ok`: resolver no es una alarma.
+- El **cuerpo solo informa de lo que informa** (v27.31.50): etiquetas legibles
+  (`Perfil (símbolos)`, `Scheduler`, `Journal`…), sin ceros decorativos
+  (`Journal: 0` en un estado limpio no dice nada), el tiempo de arranque con un
+  decimal, el recuento de incidencias en el **título**, y como mucho 4 líneas de
+  diff. La comparación es sobre lo que **se muestra**, no sobre la firma cruda:
+  el scheduler pasa de `?/bore` a `bore/bore` cuando el build ya declara el
+  esperado, y eso no es un cambio de estado (antes se notificaba como
+  `Scheduler: BORE → BORE`). Sin firma previa no se lista estado: eso ya lo
+  cuenta la notificación de primer arranque.
 - El **primer arranque de un kernel nuevo** avisa siempre (eso sí es novedad).
 - `--no-notify` verifica y actualiza el estado **sin** lanzar notificación. Es
   lo que hay que usar para **sembrar la línea base** (si no, la primera

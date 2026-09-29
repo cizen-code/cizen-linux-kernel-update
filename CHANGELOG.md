@@ -1,3 +1,44 @@
+## [27.31.50] - 2026-09-29
+
+Cierra los tres hallazgos que salieron al leer el log del build de
+`7.2.8_cizen_v3-10` (§39 de `~/.agente/Agente.md`), más la recuperación de un
+cambio que vivía **solo en la copia instalada** de `kernel-update-verify.sh`.
+Estado: **425 ok, 0 fail** en selftest (los 6 tests nuevos fallan contra la
+v27.31.49 instalada), `bash -n` limpio en los 4 scripts tocados.
+
+- **El archive de rollback se poda a sí mismo.** `prepare_rollback_archive()`
+  deja el archive del kernel **en ejecución** y, en la misma función, llama a
+  `prune_rollback_archives()`, que excluía siempre esa release de los
+  candidatos. En el build del 2026-09-29 se vio en el log, en el mismo segundo:
+  `✓ Rollback preparado: …/7.2.8-cizen-v3.tar.xz (kernel en ejecución …)` y acto
+  seguido `⚠ Pruning archive de rollback antiguo: 7.2.8-cizen-v3.tar.xz`. Es
+  decir, la red de seguridad del build nuevo desaparecía en la pasada que la
+  creaba. Ahora `prune_rollback_archives` acepta el archive a **proteger** y lo
+  mete en la lista de candidatos antes que el filtro de la release en ejecución;
+  los demás se siguen podando ("nunca más de uno" se mantiene).
+- **El manifiesto dejaba de anunciar un archive inexistente.** Nuevo
+  `rollback_manifest_unset()` (`rollback_manifest_set` no puede: con valor vacío
+  hace `return 0` a propósito) y el prune llama a it cuando el fichero que borra
+  es el que el manifiesto nombra. Antes `rollback.info` quedaba con
+  `archive=7.2.8-cizen-v3.tar.xz` colgando y `resolve_archive()` caía al
+  `*.tar.xz` más reciente, que era **7.2.7**: un rollback a otro kernel.
+- **El resumen ya no anuncia un `Rollback :` inexistente**, y sí lo anuncia
+  cuando el archive ya existía y se conservó (antes esa rama no lo mostraba).
+- **Las opciones 1 y 2 del menú compilan** (van por `build_and_exec`, como
+  comprueba el selftest) pero se rotulaban `validar config · baja/alta`: quien
+  las elegía para validar se comía un build de 33 minutos. Ahora rotulan
+  `validar y compilar · baja/alta`, y el README aclara que la validación sin
+  compilar es responder `n` al "¿Desea continuar?" (`CHECK EXITOSO`).
+- **Recuperado `kernel-update-verify.sh` desde la copia instalada** (4,7 KB por
+  delante del repo desde el 2026-09-28, sin commitear: el repo era el que
+  estaba atrasado). Mejora el cuerpo de la notificación: etiquetas legibles
+  (`Perfil (símbolos)`, `Scheduler`…), fuera los ceros decorativos, tiempo de
+  arranque con un decimal, incidencias en el título, diff de 4 líneas como
+  máximo, y comparación sobre lo **mostrado** (el scheduler `?/bore → bore/bore`
+  ya no se notifica como `BORE → BORE`). Verificado con `--dry-run` en vivo.
+- **6 tests nuevos** (5 del prune/manifiesto y 1 de la etiqueta del menú), todos
+  en rojo contra la v27.31.49 instalada.
+
 ## [27.31.49] - 2026-09-29
 
 Dos correcciones de **presentación del resumen final**, encontradas leyendo el
