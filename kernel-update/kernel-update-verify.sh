@@ -757,51 +757,162 @@ notify_state_changed() {
   return 1
 }
 
-# Texto "quÃ© ha cambiado" para el cuerpo de la notificaciÃ³n: componente a
+# Valor de un componente dentro de una firma. Aísla el grep+sed que se
+# repetía en el diff: la firma es "clave=valor|clave=valor" y ningún valor
+# contiene "|", así que el corte es seguro.
+fp_field() { # $1 = firma, $2 = clave -> valor (vacío si no está)
+  [ -n "$1" ] || return 0
+  printf '%s' "$1" | grep -oE "(^|\|)${2}=[^|]*" | head -n1 | sed -E "s#^(\||)${2}=##"
+}
+
+# Etiqueta legible de cada componente: "Perfil: 2 -> 0" se lee; la clave
+# desnuda "perfil=2" es un volcado de la firma, no un mensaje para el usuario.
+notify_field_label() {
+  case "$1" in
+    # El número del perfil cuenta SÍMBOLOS de configuración que no cumplen
+    # (${#bad[@]} en profile_check), no un nivel ni un contador de arranques.
+    # Con la etiqueta a secas, "Perfil: 2 -> 0" al lado de un "Perfil: OK" se
+    # lee como dos cosas distintas y obliga a abrir el informe para saber qué
+    # cuenta. La unidad va en la etiqueta para que el número se entienda solo.
+    perfil)  printf 'Perfil (símbolos)' ;;
+    sched)   printf 'Scheduler' ;;
+    journal) printf 'Journal' ;;
+    fw)      printf 'Firmware' ;;
+    sb)      printf 'Secure Boot' ;;
+    iss)     printf 'Incidencias' ;;
+    *)       printf '%s' "$1" ;;
+  esac
+}
+
+# Cómo se muestra un valor. "sched" viene como "esperado/enEjecución": si
+# coinciden (lo normal) basta uno; si no, se dice cuál se esperaba, que es la
+# parte accionable. "sb" traía el texto entero de secureboot_check
+# ("yes (UKI firmada; SB HABILITADO)"), del que solo se usa el veredicto.
+notify_field_value() { # $1 = clave, $2 = valor crudo
+  case "$1" in
+    sched)
+      local e="${2%%/*}" r="${2##*/}"
+      if [ -z "$e" ] || [ "$e" = "?" ] || [ "$e" = "$r" ]; then
+        sched_label "$r"
+      else
+        printf '%s, esperado %s' "$(sched_label "$r")" "$(sched_label "$e")"
+      fi
+      ;;
+    sb)
+      case "$2" in
+        yes*) printf 'sí' ;;
+        no*)  printf 'no' ;;
+        *)    printf '%s' "$2" ;;
+      esac
+      ;;
+    *) printf '%s' "$2" ;;
+  esac
+}
+
+# Segundos con un solo decimal, sin depender de awk/locale (LC_ALL=C está
+# forzado en todo el script). Contexto para una notificación, no métrica: la
+# comparación fina se hace en el informe de consola, que sí lleva TOT_TXT.
+fmt_secs() { # $1 = segundos (entero o decimal)
+  local s="${1:-0}" int frac
+  case "$s" in ''|*[!0-9.]*) printf '%s' "$s"; return 0 ;; esac
+  int="${s%%.*}"; frac="${s#*.}"; frac="${frac}0"
+  printf '%s.%s' "${int:-0}" "${frac:0:1}"
+}
+
+# Texto "qué ha cambiado" para el cuerpo de la notificación: componente a
 # componente contra la firma guardada (sin columna "antes" la primera vez).
+# ASCII a propósito ("->", sin viñetas): este texto se lee de un vistazo y se
+# copia de un log, y los glifos Unicode se pierden al transcribirlo.
 notify_state_diff() {
   local prev cur key ov nv first=true
-  local -a keys=(perfil sched journal fw sb iss) lines=()
+  local -a keys=(perfil sched journal fw sb iss) changed=() show=() lines=()
   prev="$( [ -s "$NOTIFY_STATE" ] && head -n1 "$NOTIFY_STATE" || true )"
   cur="$(verify_state_fingerprint)"
+  # Sin firma previa no hay diff que mostrar: listar los seis componentes como
+  # si fueran todos nuevos es un volcado de estado, no un "qué ha cambiado", y
+  # ocupa más pantalla que la propia información de la notificación. El
+  # primer arranque ya tiene su propia notificación (notify_first_boot).
+  [ -n "$prev" ] || return 0
+
   for key in "${keys[@]}"; do
-    ov="$(printf '%s' "$prev" | grep -oE "(^|\|)${key}=[^|]*" | head -n1 | sed -E "s#^(\||)${key}=##")"
-    nv="$(printf '%s' "$cur"  | grep -oE "(^|\|)${key}=[^|]*" | head -n1 | sed -E "s#^(\||)${key}=##")"
-    [ "$ov" = "$nv" ] && continue
+    ov="$(fp_field "$prev" "$key")"
+    nv="$(fp_field "$cur" "$key")"
+    [ "$ov" = "$nv" ] || changed+=("$key")
+  done
+  [ "${#changed[@]}" -eq 0 ] && return 0
+
+  # El total (iss) se calla cuando no aporta nada sobre lo que ya dicen los
+  # componentes: con una sola causa, "Incidencias: 2 -> 0" al lado de
+  # "Perfil: 2 -> 0" repite el mismo número dos veces. Con varias causas, o
+  # con un total que ningún componente explica por sí solo, sí se muestra.
+  for key in "${changed[@]}"; do
+    if [ "$key" = iss ]; then
+      [ "${#changed[@]}" -gt 1 ] || continue
+      local k2 dup=0
+      for k2 in "${changed[@]}"; do
+        [ "$k2" = iss ] && continue
+        [ "$(fp_field "$cur" "$k2")" = "$(fp_field "$cur" iss)" ] && dup=1
+      done
+      [ "$dup" = 1 ] && continue
+    fi
+    show+=("$key")
+  done
+
+  for key in "${show[@]}"; do
+    ov="$(fp_field "$prev" "$key")"
+    nv="$(fp_field "$cur" "$key")"
+    # Se compara lo que SE MUESTRA, no la firma cruda: el scheduler pasa de
+    # "?/bore" a "bore/bore" (el build ya declara el esperado) y eso no es un
+    # cambio de estado, solo se ha completado un dato que faltaba. Con la
+    # firma cruda eso se notificaba como "Scheduler: BORE -> BORE".
+    local ovv nvv
+    ovv="$(notify_field_value "$key" "$ov")"
+    nvv="$(notify_field_value "$key" "$nv")"
+    [ "$ovv" = "$nvv" ] && continue
     if [ -z "$prev" ] || [ -z "$ov" ]; then
-      lines+=("  • $key: $nv")
+      lines+=("  $(notify_field_label "$key"): $nvv")
     else
-      lines+=("  • $key: $ov → $nv")
+      lines+=("  $(notify_field_label "$key"): $ovv -> $nvv")
     fi
   done
   [ "${#lines[@]}" -eq 0 ] && return 0
-  local ln
-  for ln in "${lines[@]}"; do
-    [ "$first" = true ] || printf '
-'
+
+  # Tope de líneas: el cuerpo de una notificación no es un informe, y una
+  # lista larga de componentes no cabe en pantalla ni aporta más.
+  if [ "${#lines[@]}" -gt 4 ]; then
+    lines=( "${lines[@]:0:3}" "  ... y $(( ${#lines[@]} - 3 )) más" )
+  fi
+
+  for nv in "${lines[@]}"; do
+    [ "$first" = true ] || printf '\n'
     first=false
-    printf '%s' "$ln"
+    printf '%s' "$nv"
   done
-  printf '
-'
+  printf '\n'
   return 0
 }
 
 notify_issues() {
-  local title body prof_txt
+  local title body prof_txt sev icon
   if [ "$PROFILE_OK" = 1 ]; then prof_txt="OK"; else prof_txt="FALLO"; fi
-  local diff sev icon
+  local diff
   diff="$(notify_state_diff)"
-  # Resolver no es una alarma: sin incidencias la notificación baja a normal y
-  # cambia el icono, para que un "todo verde" no parezca un problema.
+  # El nombre de la app ya es "Kernel Updater": repetir "Kernel Cizen:" en el
+  # título solo consume ancho. El número de incidencias sí va en el título,
+  # que es lo único que se lee sin desplegar el cuerpo.
   if [ "$ISSUES" -gt 0 ]; then
-    title="Kernel Cizen: $CUR_VERSION verificado con ${ISSUES} incidencias"
+    title="$CUR_VERSION: ${ISSUES} incidencia(s)"
     sev=critical; icon=dialog-warning
   else
-    title="Kernel Cizen: $CUR_VERSION sin incidencias"
+    title="$CUR_VERSION: sin incidencias"
     sev=normal; icon=emblem-ok
   fi
-  body="Perfil: $prof_txt | Boot: $TOT_TXT | Journal: $JCOUNT patrones | FW: $FW_COUNT"
+  # Solo los datos que informan. Un "Journal: 0 patrones | FW: 0" en un
+  # estado limpio no dice nada: el 0 ya es el resultado. El tiempo de boot se
+  # redondea a un decimal porque es contexto, no una métrica a comparar.
+  body="Perfil: $prof_txt | boot $(fmt_secs "${BT_TOT:-0}")s"
+  [ "${JCOUNT:-0}" -gt 0 ] && body="$body | journal $JCOUNT"
+  [ "${FW_COUNT:-0}" -gt 0 ] && body="$body | firmware $FW_COUNT"
   [ -n "$diff" ] && body="$body
 $diff"
   if [ "$DRY" = true ]; then
@@ -820,9 +931,12 @@ $diff"
 
 notify_first_boot() {
   local title body iss_txt
-  if [ "$ISSUES" -gt 0 ]; then iss_txt="$ISSUES incidencias"; else iss_txt="sin incidencias"; fi
-  title="Kernel Cizen $CUR_VERSION arrancado"
-  body="Verificación post-boot: $iss_txt | boot total $TOT_TXT"
+  if [ "$ISSUES" -gt 0 ]; then
+    iss_txt="$ISSUES incidencia(s)"; title="$CUR_VERSION arrancado: $iss_txt"
+  else
+    iss_txt="sin incidencias"; title="$CUR_VERSION arrancado"
+  fi
+  body="$iss_txt | boot $(fmt_secs "${BT_TOT:-0}")s"
   if [ "$DRY" = true ]; then
     echo "  (dry-run) Notificarías (primer arranque): $title — $body"
     return 0
