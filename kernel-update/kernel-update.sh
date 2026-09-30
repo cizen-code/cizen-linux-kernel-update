@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.31.47 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.31.52 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / XFS / systemd / KVM-libvirt / QEMU-OVMF
 #
@@ -136,7 +136,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.51"
+SCRIPT_VERSION="27.31.52"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -497,7 +497,7 @@ CIZEN_BUILD_MIN_TMPFS_MB="${CIZEN_BUILD_MIN_TMPFS_MB:-6144}"
 CIZEN_BUILD_MIN_MEM_BTF_MB="${CIZEN_BUILD_MIN_MEM_BTF_MB:-12288}"
 CIZEN_BUILD_MIN_TMPFS_BTF_MB="${CIZEN_BUILD_MIN_TMPFS_BTF_MB:-8192}"
 check_build_memory() {
-  local min_mem min_tmp min_tmp_used avail swapfree mem free_mb
+  local min_mem min_tmp min_tmp_used avail swapfree mem free_mb reusable tmpfs_on
   if [ "$BTF_REQUESTED" = true ]; then
     min_mem="${CIZEN_BUILD_MIN_MEM_BTF_MB}"; min_tmp="${CIZEN_BUILD_MIN_TMPFS_BTF_MB}"
   else
@@ -509,9 +509,19 @@ check_build_memory() {
   if [ "$mem" -lt "$min_mem" ]; then
     fatal "Memoria insuficiente para el build (BTF=$BTF_REQUESTED): MemAvailable+SwapFree=${mem} MB < ${min_mem} MB. Cierra aplicaciones o ajusta CIZEN_BUILD_MIN_MEM_MB (o _BTF_MB)."
   fi
+  # v27.31.52: se resuelve si el árbol es reutilizable UNA vez y se reutiliza el
+  # veredicto. Antes source_tree_reusable se llamaba hasta cuatro veces aquí
+  # (la del if, la del margen, y dos dentro del mensaje de fatal), y cada
+  # llamada revalidaba directorio, Makefile, testigo de extracción e identidad.
+  if source_tree_reusable; then reusable=sí; else reusable=no; fi
+  # El estado del tmpfs tampoco se pregunta dos veces (findmnt + head cada vez).
   if tmpfs_is_mounted; then
-    free_mb="$(df -Pk "$TMPFS_ROOT" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
-    [ -n "$free_mb" ] && free_mb=$((free_mb / 1024))
+    tmpfs_on=sí
+    free_mb="$(get_avail_mb "$TMPFS_ROOT")"
+  else
+    tmpfs_on=no
+  fi
+  if [ "$tmpfs_on" = sí ]; then
     if [ -n "$free_mb" ] && [ "$free_mb" -lt "$min_tmp" ]; then
       # El tmpfs guarda el árbol de la ejecución anterior: en vez de abortar, se
       # intenta liberar espacio (purgar artefactos regenerables del enlace del
@@ -520,25 +530,24 @@ check_build_memory() {
       # propio 7.2.7 (~4-5 GB) deja el tmpfs de 10G por debajo del mínimo BTF.
       info "tmpfs de build escaso (${free_mb} MB libres < ${min_tmp} MB mínimos); liberando espacio del árbol anterior…"
       liberate_tmpfs_space
-      free_mb="$(df -Pk "$TMPFS_ROOT" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
-      [ -z "$free_mb" ] || free_mb=$((free_mb / 1024))
+      free_mb="$(get_avail_mb "$TMPFS_ROOT")"
       # Si queda el árbol de esta versión se reutiliza: basta el margen
       # incremental de reutilización (2048 MB), el mismo que aplica
       # prepare_tmpfs_build para ese caso exacto. El margen de build completo
       # (min_tmp) solo se exige cuando no hay nada reutilizable y hay que
       # extraer un árbol nuevo desde cero.
-      if source_tree_reusable; then
+      if [ "$reusable" = sí ]; then
         min_tmp_used="$TMPFS_EXISTING_SRC_MIN_FREE_MB"
       else
         min_tmp_used="$min_tmp"
       fi
       if [ -z "$free_mb" ] || [ "$free_mb" -lt "$min_tmp_used" ]; then
-        fatal "Espacio libre insuficiente en el tmpfs de build ($TMPFS_ROOT): ${free_mb:-?} MB < ${min_tmp_used} MB (árbol reutilizable=$(source_tree_reusable && echo sí || echo no)). Tras purgar los artefactos regenerables sigue lleno: el desmontaje automático no ha podido (CIZEN_SMART_UMOUNT=0, CIZEN_KEEP_TMPFS=1 o tmpfs en uso); hazlo a mano (sudo umount $TMPFS_ROOT) o ajusta CIZEN_BUILD_MIN_TMPFS_MB (o _BTF_MB)."
+        fatal "Espacio libre insuficiente en el tmpfs de build ($TMPFS_ROOT): ${free_mb:-?} MB < ${min_tmp_used} MB (árbol reutilizable=$reusable). Tras purgar los artefactos regenerables sigue lleno: el desmontaje automático no ha podido (CIZEN_SMART_UMOUNT=0, CIZEN_KEEP_TMPFS=1 o tmpfs en uso); hazlo a mano (sudo umount $TMPFS_ROOT) o ajusta CIZEN_BUILD_MIN_TMPFS_MB (o _BTF_MB)."
       fi
       ok "Espacio del tmpfs liberado tras limpieza: ${free_mb} MB libres (mín ${min_tmp_used} MB)."
     fi
   fi
-  if tmpfs_is_mounted; then
+  if [ "$tmpfs_on" = sí ]; then
     ok "Build memory ok (BTF=$BTF_REQUESTED): MemAvailable+SwapFree=${mem} MB (mín ${min_mem} MB), tmpfs libre=${free_mb:-?} MB (mín ${min_tmp} MB)."
   else
     ok "Build memory ok (BTF=$BTF_REQUESTED): MemAvailable+SwapFree=${mem} MB (mín ${min_mem} MB), tmpfs de build no montado (lo monta prepare_tmpfs_build)."
@@ -982,6 +991,9 @@ do_rename() {
 
 load_rename_map() {
   RENAME_MAP=()
+  # v27.31.52: la caché de resolución es derivada de RENAME_MAP. Si el mapa se
+  # recarga, la caché queda obsoleta y hay que tirarla con él.
+  RESOLVED_SYMBOL=()
   [ -f "$RENAME_MAP_FILE" ] || return 0
   local line key val
   while IFS= read -r line || [ -n "$line" ]; do
@@ -996,18 +1008,39 @@ load_rename_map() {
 }
 
 resolve_symbol() {
+  local __r
+  resolve_symbol_into "$1" __r
+  printf '%s\n' "$__r"
+}
+
+# v27.31.52: variante SIN subshell y MEMOIZADA.
+# build_effective_arrays resuelve los ~420 símbolos del perfil, y la suya se
+# invoca 2-3 veces por run (una por parche aplicado + la final), así que eran
+# ~1.000-2.000 llamadas a `$(resolve_symbol ...)`. Cada $() es un fork completo
+# de bash para una función que solo lee un array asociativo y hace un printf: no
+# toca el disco, pero el coste de fork se paga miles de veces. Con printf -v el
+# resultado vuelve por la variable, y como depende solo de (símbolo,
+# RENAME_MAP) —que se carga una vez al inicio— se cachea: la segunda vez que
+# aparece un símbolo ya no se resuelve.
+declare -A RESOLVED_SYMBOL=()
+resolve_symbol_into() { # $1 = símbolo, $2 = variable destino
   local sym="$1" next
   local -A seen=()
-  while [ -n "${RENAME_MAP[$sym]:-}" ]; do
-    if [ -n "${seen[$sym]:-}" ]; then
-      warn "Ciclo detectado en RENAME_MAP para '$sym'; se detiene la resolución." >&2
-      break
-    fi
-    seen["$sym"]=1
-    next="${RENAME_MAP[$sym]}"
-    sym="$next"
-  done
-  printf '%s\n' "$sym"
+  if [ -z "${RESOLVED_SYMBOL[$sym]:-}" ]; then
+    while [ -n "${RENAME_MAP[$sym]:-}" ]; do
+      if [ -n "${seen[$sym]:-}" ]; then
+        warn "Ciclo detectado en RENAME_MAP para '$sym'; se detiene la resolución." >&2
+        break
+      fi
+      seen["$sym"]=1
+      next="${RENAME_MAP[$sym]}"
+      sym="$next"
+    done
+    RESOLVED_SYMBOL["$1"]="$sym"
+  else
+    sym="${RESOLVED_SYMBOL[$sym]}"
+  fi
+  printf -v "$2" '%s' "$sym"
 }
 
 if [ "$DO_LIST" = true ]; then
@@ -1551,66 +1584,36 @@ declare -A KCONFIG_SYMBOL_TYPE=()
 KCONFIG_TYPE_INDEX_BUILT=false
 KCONFIG_SYMBOL_INDEX_BUILT=false
 
-build_kconfig_symbol_index() {
-  [ "$KCONFIG_SYMBOL_INDEX_BUILT" = true ] && return 0
+# v27.31.52: UN SOLO recorrido del árbol para los DOS índices.
+# Antes había dos walks idénticos (`find $SRC -name 'Kconfig*'`) leyendo los mismos
+# ~6.000 ficheros: uno con grep para el nombre de los símbolos y otro con `cat`+awk
+# para su tipo. Sobre un árbol de 40k ficheros eso es el pase más caro de la fase de
+# configuración, y se repetía por cada parche aplicado. El awk emite ahora ambas
+# columnas de una vez (nombre TAB tipo) y los dos mapas se llenan en la misma pasada.
+build_kconfig_indexes() {
+  # Ambos flags se comprueban: la pasada los pone a true juntos, así que hoy la
+  # condición es equivalente a mirar solo el del símbolo, pero deja explícito que
+  # los dos índices comparten ciclo de vida y que basta invalidar uno (o los dos)
+  # desde kconfig_index_invalidate para forzar la reconstrucción.
+  [ "$KCONFIG_SYMBOL_INDEX_BUILT" = true ] && [ "$KCONFIG_TYPE_INDEX_BUILT" = true ] && return 0
 
-  local sym
+  local sym tipo
   # El pipeline interno puede devolver rc!=0 legítimamente: xargs parte la lista
-  # en varios lotes y un lote cuyo grep no encuentre ningún `config`/`menuconfig`
-  # sale con status 1. Con `set -Eeuo pipefail` (heredado por el subshell del
-  # process-substitution), el `find | xargs | grep | awk | sort` del pipeline entero
-  # reportaría error y el trap ERR del subshell dispararía `on_err` falsamente
-  # (salida "Error ... sort -u", índice ya construido pero abortado en apariencia).
-  # El índice se construye leyendo el stream: `|| true` absorbe ese rc legítimo sin
-  # enmascarar un fallo de ESCALADO (Kconfig no encontrado sigue dejando el índice vacío).
-  while IFS= read -r sym; do
-    [ -n "$sym" ] || continue
-    KCONFIG_SYMBOL_KNOWN["$sym"]=1
-  done < <(
-    find "$SRC" \( -name 'Kconfig' -o -name 'Kconfig.*' \) -print0 2>/dev/null |
-      xargs -0 -r grep -hoE '^[[:space:]]*(menuconfig|config)[[:space:]]+[A-Za-z0-9_]+' 2>/dev/null |
-      awk '{print $2}' |
-      sort -u || true
-  )
-
-  KCONFIG_SYMBOL_INDEX_BUILT=true
-}
-
-kconfig_symbol_known() {
-  local sym="$1"
-  build_kconfig_symbol_index
-  [ -n "${KCONFIG_SYMBOL_KNOWN[$sym]:-}" ]
-}
-
-# v27.31.28: el índice se cachea una sola vez por proceso, así que un parche que
-# añade símbolos Kconfig (BORE mete config SCHED_BORE en init/Kconfig y config
-# MIN_BASE_SLICE_NS en kernel/Kconfig.hz) llegaba al validador con el índice del
-# árbol SIN parchear. Resultado: "ENABLE: CONFIG_SCHED_BORE no existe en esta
-# versión" para un símbolo que existe, y un "--rename" que no arreglaba nada.
-# Cualquier cambio en el árbol tiene que tirar el índice.
-kconfig_index_invalidate() {
-  KCONFIG_SYMBOL_KNOWN=()
-  KCONFIG_TYPE_INDEX_BUILT=false
-  KCONFIG_SYMBOL_INDEX_BUILT=false
-}
-
-# Tipo Kconfig de un símbolo: bool | tristate | int | hex | string (vacío = bool,
-# que es el tipo por defecto de Kconfig si el bloque no lo declara).
-# v27.31.28: hace falta porque PATCH_SYMBOLS asumía que todo era booleano y
-# forzaba a "=y" símbolos que no lo son. MIN_BASE_SLICE_NS es `int` (lo declara
-# el parche BORE en kernel/Kconfig.hz): scripts/config le ponía CONFIG_...=y,
-# olddefconfig lo devolvía a su default y la validación se quedaba en 37/38
-# para siempre, sin decir de qué símbolo se trataba.
-build_kconfig_type_index() {
-  [ "$KCONFIG_TYPE_INDEX_BUILT" = true ] && return 0
-  local pair sym tipo
-  # v27.31.29: separador TAB y IFS explícito. El motor trabaja con IFS=$'\n\t',
+  # en varios lotes y un lote sin ningún `config` sale con status 1. Con
+  # `set -Eeuo pipefail` (heredado por el subshell del process-substitution), el
+  # pipeline entero reportaría error y el trap ERR del subshell dispararía `on_err`
+  # falsamente. El índice se construye leyendo el stream: `|| true` absorbe ese rc
+  # legítimo sin enmascarar un fallo de ESCALADO (Kconfig no encontrado deja ambos
+  # índices vacíos, que es el comportamiento correcto).
+  #
+  # v27.31.29: separador TAB e IFS explícito. El motor trabaja con IFS=$'\n\t',
   # así que un "read -r sym tipo" NO parte por el espacio: las claves acababan
   # siendo "MIN_BASE_SLICE_NS int" enteras, ninguna búsqueda por nombre encontraba
   # nada y TODOS los símbolos parecían booleanos (que es justo el bug que esto
   # iba a arreglar: el int de BORE volvía a la rama de forzar a "=y").
   while IFS=$'\t' read -r sym tipo; do
     [ -n "$sym" ] || continue
+    KCONFIG_SYMBOL_KNOWN["$sym"]=1
     KCONFIG_SYMBOL_TYPE["$sym"]="$tipo"
   done < <(
     find "$SRC" \( -name 'Kconfig' -o -name 'Kconfig.*' \) -print0 2>/dev/null |
@@ -1627,12 +1630,59 @@ build_kconfig_type_index() {
         END { if (sym != "") printf "%s\t%s\n", sym, tipo }
       ' 2>/dev/null | sort -u || true
   )
+
+  KCONFIG_SYMBOL_INDEX_BUILT=true
   KCONFIG_TYPE_INDEX_BUILT=true
 }
 
+build_kconfig_symbol_index() { build_kconfig_indexes; }
+build_kconfig_type_index()   { build_kconfig_indexes; }
+
+kconfig_symbol_known() {
+  local sym="$1"
+  build_kconfig_indexes
+  [ -n "${KCONFIG_SYMBOL_KNOWN[$sym]:-}" ]
+}
+
+# v27.31.28: el índice se cachea una sola vez por proceso, así que un parche que
+# añade símbolos Kconfig (BORE mete config SCHED_BORE en init/Kconfig y config
+# MIN_BASE_SLICE_NS en kernel/Kconfig.hz) llegaba al validador con el índice del
+# árbol SIN parchear. Resultado: "ENABLE: CONFIG_SCHED_BORE no existe en esta
+# versión" para un símbolo que existe, y un "--rename" que no arreglaba nada.
+# Cualquier cambio en el árbol tiene que tirar el índice.
+# v27.31.52: se vacían los DOS mapas. Antes solo se limpiaba KCONFIG_SYMBOL_KNOWN
+# y el flag de tipos se ponía a false dejando KCONFIG_SYMBOL_TYPE poblado: un
+# símbolo que un parche cambiara de bool a int conservaba su tipo viejo para
+# siempre, y uno retirado nunca desaparecía del mapa.
+kconfig_index_invalidate() {
+  KCONFIG_SYMBOL_KNOWN=()
+  KCONFIG_SYMBOL_TYPE=()
+  KCONFIG_TYPE_INDEX_BUILT=false
+  KCONFIG_SYMBOL_INDEX_BUILT=false
+}
+
+# Tipo Kconfig de un símbolo: bool | tristate | int | hex | string (vacío = bool,
+# que es el tipo por defecto de Kconfig si el bloque no lo declara).
+# v27.31.28: hace falta porque PATCH_SYMBOLS asumía que todo era booleano y
+# forzaba a "=y" símbolos que no lo son. MIN_BASE_SLICE_NS es `int` (lo declara
+# el parche BORE en kernel/Kconfig.hz): scripts/config le ponía CONFIG_...=y,
+# olddefconfig lo devolvía a su default y la validación se quedaba en 37/38
+# para siempre, sin decir de qué símbolo se trataba.
 kconfig_symbol_type() { # vacío = bool (el tipo por defecto de Kconfig)
-  build_kconfig_type_index
+  build_kconfig_indexes
   printf '%s' "${KCONFIG_SYMBOL_TYPE[$1]:-}"
+}
+
+# v27.31.52: variante SIN subshell. `kconfig_symbol_type` usa `printf`, así que
+# llamarla como "$(...)" crea un subshell donde el flag de memoización se fija y
+# se pierde al salir: el padre volvía a tener KCONFIG_TYPE_INDEX_BUILT=false y
+# la SIGUIENTE llamada reescanaba el árbol entero. Con PATCH_SYMBOLS de dos
+# entradas eso eran DOS recorridos completos de 40k ficheros por parche aplicado.
+# Con printf -v (que no abre subshell) el flag persiste y el índice se construye
+# UNA vez. Prefija "kconfig_" para no colisionar con kconfig_symbol_type.
+kconfig_symbol_type_into() { # $1 = símbolo, $2 = nombre de la variable destino
+  build_kconfig_indexes
+  printf -v "$2" '%s' "${KCONFIG_SYMBOL_TYPE[$1]:-}"
 }
 
 # v27.31.28: renombrado automático. Busca el símbolo más parecido entre los que
@@ -2071,28 +2121,31 @@ build_effective_arrays() {
   APPLIED_RENAMES=()
   SEEN_ENABLE=(); SEEN_DISABLE=(); SEEN_CRITICAL=()
 
+  # v27.31.52: resolve_symbol_into en vez de "$(resolve_symbol ...)": con 420
+  # símbolos por lista y esta función llamada varias veces por run, los $( )
+  # sumaban miles de forks de bash para leer un array. Ver resolve_symbol_into.
   for o in "${OPTS_ENABLE[@]}"; do
-    r="$(resolve_symbol "$o")"
+    resolve_symbol_into "$o" r
     [ "$r" != "$o" ] && APPLIED_RENAMES["$o"]="$r"
     add_unique enable "$r"
   done
   for o in "${OPTS_DISABLE[@]}"; do
-    r="$(resolve_symbol "$o")"
+    resolve_symbol_into "$o" r
     [ "$r" != "$o" ] && APPLIED_RENAMES["$o"]="$r"
     add_unique disable "$r"
   done
   for o in "${CRITICAL_OPTS[@]}"; do
-    r="$(resolve_symbol "$o")"
+    resolve_symbol_into "$o" r
     [ "$r" != "$o" ] && APPLIED_RENAMES["$o"]="$r"
     add_unique critical "$r"
   done
   for o in "${!OPTS_SETVAL[@]}"; do
-    r="$(resolve_symbol "$o")"
+    resolve_symbol_into "$o" r
     [ "$r" != "$o" ] && APPLIED_RENAMES["$o"]="$r"
     EFF_SETVAL["$r"]="${OPTS_SETVAL[$o]}"
   done
   for o in "${!OPTS_SETSTR[@]}"; do
-    r="$(resolve_symbol "$o")"
+    resolve_symbol_into "$o" r
     [ "$r" != "$o" ] && APPLIED_RENAMES["$o"]="$r"
     EFF_SETSTR["$r"]="${OPTS_SETSTR[$o]}"
   done
@@ -2584,7 +2637,12 @@ preflight_sudo() { # [1]="tras compilar" para el mensaje del segundo prompt
 # ============================================================
 get_avail_mb() {
   local dir="$1" kb
-  kb="$(df -Pk "$dir" | awk 'NR==2 {print $4}')"
+  # v27.31.52: `|| true` explícito. Con `set -Eeuo pipefail`, si $1 no existe (o
+  # df falla por lo que sea) la asignación de la línea siguiente devuelve el rc
+  # de df, el trap ERR dispara on_err y el run entero muere con un "Error N en
+  # línea" en lugar de con un mensaje de espacio. Devolver 0 fuerza al llamador a
+  # aplicar su margen y a dar SU mensaje, que es el que sabe qué margen exige.
+  kb="$(df -Pk "$dir" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
   echo $(( ${kb:-0} / 1024 ))
 }
 
@@ -2911,7 +2969,10 @@ reconcile_tmpfs_trees() {
 
   for dir in "${trees[@]}"; do
     [ -d "$dir" ] && [ -f "$dir/Makefile" ] || continue
-    id="$(tree_identity "$dir")"
+    # tree_identity_into, no "$(tree_identity ...)": el $() es un subshell que se
+    # lleva la memoria de la caché, así que la llamada de tree_usable_for de dos
+    # líneas más la habría vuelto a calcular entera (con su make kernelversion).
+    tree_identity_into "$dir" id
     ver="${id%%|*}"
     kind="${id#*|}"
     if tree_usable_for "$dir" "$VERSION" "$KERNEL_TREE"; then
@@ -2972,6 +3033,16 @@ reconcile_tmpfs_trees() {
 check_disk_space() {
   local min_mb=8192 avail_mb
 
+  # v27.31.52: el umbral de 8 GB es para lo que se VA A ESCRIBIR aquí: el tarball
+  # (~145 MB) más su .sig, más los .download-/.partial- de una descarga a medias.
+  # Nada de eso ocurre si el árbol de $VERSION ya está extraído y es reutilizable:
+  # el tarball ni se abre (get_tarball se salta) y cleanup_kernel_cache solo borra.
+  # Exigir 8 GB en un disco casi lleno abortaba runs que no necesitaban ni un KB
+  # de espacio, que es la forma más fácil de quejarse de algo que no estorba.
+  if source_tree_reusable; then
+    info "El árbol de $VERSION ya está en su sitio: el margen de espacio del cache persistente no aplica."
+    return 0
+  fi
   # El tarball se almacena en persistencia.
   avail_mb="$(get_avail_mb "$KERNEL_BUILD_ROOT")"
   if [ "$avail_mb" -lt "$min_mb" ]; then
@@ -3452,24 +3523,51 @@ source_tree_kind() {
 # anteriores de esta herramienta) se deduce del propio árbol. La versión del
 # directorio solo es un último recurso (un árbol recién extraído siempre tiene
 # Makefile y por tanto kernelversion legible).
-tree_identity() {
-  local dir="$1" meta ver kind
-  meta="$dir/$TREE_META_NAME"
-  if [ -f "$meta" ]; then
-    ver="$(sed -nE 's/^version=//p' "$meta" 2>/dev/null | head -n1 || true)"
-    kind="$(sed -nE 's/^kind=//p' "$meta" 2>/dev/null | head -n1 || true)"
-    if [ -n "$ver" ] && [ -n "$kind" ]; then
-      printf '%s|%s\n' "$ver" "$kind"
-      return 0
-    fi
+#
+# v27.31.52: se lee el testigo con el LECTOR DE SHELL en vez de `sed | head` (que
+# eran 4 procesos para un fichero de 3 líneas) y se MEMOIZA por directorio. Antes
+# tree_identity se llamaba 4-6 veces por run sobre los mismos 1-2 árboles: dos de
+# ellas dentro del MISMO bucle de reconcile_tmpfs_trees, que calculaba la
+# identidad para los mensajes y acto seguido se la volvía a pedir a
+# tree_usable_for. Con trees sin .cizen-tree, cada una era además un
+# `make -s kernelversion`, que no es trivial en un árbol de 40k ficheros.
+declare -A TREE_IDENTITY=()
+tree_identity_into() { # $1 = dir, $2 = nombre de la variable que recibe "<ver>|<kind>"
+  local dir="$1" __vn="$2"
+  local meta ver kind
+  if [ -n "${TREE_IDENTITY[$dir]:-}" ]; then
+    printf -v "$__vn" '%s' "${TREE_IDENTITY[$dir]}"
+    return 0
   fi
-  ver="$(make -C "$dir" -s kernelversion 2>/dev/null || true)"
+  meta="$dir/$TREE_META_NAME"
+  ver=""; kind=""
+  if [ -f "$meta" ]; then
+    local _l
+    while IFS= read -r _l || [ -n "$_l" ]; do
+      case "$_l" in
+        version=*) [ -n "$ver" ] || ver="${_l#version=}" ;;
+        kind=*)    [ -n "$kind" ] || kind="${_l#kind=}" ;;
+      esac
+    done < "$meta" 2>/dev/null || true
+    unset _l
+  fi
+  if [ -z "$ver" ]; then
+    ver="$(make -C "$dir" -s kernelversion 2>/dev/null || true)"
+  fi
   if [ -z "$ver" ]; then
     ver="$(basename -- "$dir")"
     ver="${ver#linux-}"
     ver="${ver#cachyos-}"
   fi
-  printf '%s|%s\n' "$ver" "$(source_tree_kind "$dir")"
+  [ -n "$kind" ] || kind="$(source_tree_kind "$dir")"
+  TREE_IDENTITY["$dir"]="$ver|$kind"
+  printf -v "$__vn" '%s' "$ver|$kind"
+}
+
+tree_identity() { # $1 = dir  (envuelve a tree_identity_into; úsala con $() solo
+  local __id                    # si no necesitas el valor en el padre)
+  tree_identity_into "$1" __id
+  printf '%s\n' "$__id"
 }
 
 # ¿Sirve el árbol $1 para compilar la versión $2 de tipo $3? $3 vacío o con un
@@ -3491,7 +3589,7 @@ tree_usable_for() {
   # tmpfs, no dentro del árbol, para no interferir con la extracción ni con el
   # renombrado del tarball del fork.
   [ ! -f "$TMPFS_ROOT/.cizen-extracting-$ver_want" ] || return 1
-  id="$(tree_identity "$dir")"
+  tree_identity_into "$dir" id
   ver="${id%%|*}"
   kind="${id#*|}"
   [ "$ver" = "$ver_want" ] || [[ "$ver" == "$ver_want"-* ]] || return 1
@@ -3512,14 +3610,21 @@ source_tree_reusable() {
 
 # Testigo de identidad del árbol recién extraído, para que la reconciliación
 # del tmpfs de la siguiente ejecución no tenga que deducirlo del Makefile.
+# v27.31.52: acepta la versión ya calculada como $2. extract_tarball acaba de
+# leerla con `make -s kernelversion` dos líneas antes; sin esto, write_tree_meta
+# la volvía a pedir en un tercer make sobre el mismo árbol recién extraído.
 write_tree_meta() {
-  local dir="$1" kver
-  kver="$(make -C "$dir" -s kernelversion 2>/dev/null || true)"
+  local dir="$1" kver="${2:-}" kkind
+  [ -n "$kver" ] || kver="$(make -C "$dir" -s kernelversion 2>/dev/null || true)"
+  kkind="$(source_tree_kind "$dir")"
   {
     printf 'version=%s\n' "${kver:-$VERSION}"
-    printf 'kind=%s\n' "$(source_tree_kind "$dir")"
+    printf 'kind=%s\n' "$kkind"
     printf 'ts=%s\n' "$(date +%s)"
   } > "$dir/$TREE_META_NAME" 2>/dev/null || true
+  # La identidad recién escrita es la definitiva: se siembra la caché para que
+  # nadie tenga que releer el testigo (ni el Makefile) otra vez en esta run.
+  TREE_IDENTITY["$dir"]="${kver:-$VERSION}|$kkind"
 }
 
 extract_tarball() {
@@ -3576,7 +3681,7 @@ extract_tarball() {
     rm -rf "$SRC"
     return 1
   fi
-  write_tree_meta "$SRC"
+  write_tree_meta "$SRC" "$kver"
   rm -f "$TMPFS_ROOT/.cizen-extracting-$VERSION" 2>/dev/null || true
 }
 
@@ -6131,13 +6236,17 @@ ALT_EOF
 # símbolos Kconfig para que build_effective_arrays los fuerce a =y y los marque
 # como rebeldes esperados. BORE mantiene además BORE_ENABLED (resumen y firma).
 apply_patch_register() {
-  local p="$1" s
+  local p="$1" s _stype
   PATCHES_APPLIED+=("$p")
   for s in "${PATCH_SYMBOLS[@]:-}"; do
     # Solo los booleanos se fuerzan a =y. Un símbolo int/hex/string al que se le
     # pone "=y" no es un valor válido: olddefconfig lo revierte a su default y
     # el validador lo cuenta como activación no satisfecha para siempre.
-    case "$(kconfig_symbol_type "$s")" in
+    # v27.31.52: kconfig_symbol_type_into, no "$(kconfig_symbol_type ...)": el
+    # $( ) es un subshell que se lleva el flag de memoización del índice, así
+    # que cada símbolo de PATCH_SYMBOLS reescanaba el árbol de 40k ficheros.
+    kconfig_symbol_type_into "$s" _stype
+    case "$_stype" in
       bool|tristate|"")
         PATCH_ENABLE_ALL+=("$s")
         PATCH_REBEL_ALL+=("$s")
@@ -6154,9 +6263,9 @@ apply_patch_register() {
   # Símbolos retirados por el parche (dependen de !SCHED_ALT): build_effective_
   # arrays los quita de CRITICAL/SETVAL/ENABLE (no son posibles de habilitar).
   for s in "${PATCH_RETIRED_SYMBOLS[@]:-}"; do
-    [ -n "$s" ] && PATCH_RETIRED_ALL+=("$s")
+    [ -n "$s" ] &&     PATCH_RETIRED_ALL+=("$s")
   done
-  unset s
+  unset s _stype
   if [ "$p" = "bore" ]; then
     BORE_ENABLED=true
   fi
@@ -6358,6 +6467,12 @@ apply_user_patches() {
     fi
   done
   [ "$n" -gt 0 ] && ok "Parches de usuario: $n aplicado(s)."
+  # v27.31.52: un `patch -p1` REAL acaba de cambiar el árbol, así que el índice de
+  # símbolos/tipos Kconfig quedó describiendo el árbol ANTERIOR. apply_patch_plugin
+  # ya invalidaba en su rama; aquí faltaba, y el síntoma era que un parche de
+  # usuario que añade `config FOO` se reportaba después como "no existe en esta
+  # versión" (el validador y lite_missing_check lo ignoraban en silencio).
+  [ "$n" -gt 0 ] && kconfig_index_invalidate
   return 0
 }
 
@@ -6424,6 +6539,11 @@ apply_cachy_misc_single() {
         if patch -p1 -d "$SRC" < "$tmp" >/dev/null 2>&1; then
           ok "CachyOS misc: $item aplicado (rama $br, $cand)."
           applied=1
+          # v27.31.52: el árbol cambió, así que el índice Kconfig es obsoleto. Este
+          # es el segundo `patch -p1` real que lo dejaba describing el árbol
+          # anterior; los símbolos que este parche acaba de meter se re-escanean
+          # una sola vez al primer kconfig_symbol_known posterior.
+          kconfig_index_invalidate
           while IFS= read -r __symdef; do
             [ -n "$__symdef" ] || continue
             CACHY_MISC_SYMBOLS+=("$__symdef")
@@ -6570,27 +6690,50 @@ lite_missing_check() {
         ;;
     esac
   done < "$_log"
+  # v27.31.52: los tres datos que esta función consultaba en bucle para CADA
+  # símbolo se leen UNA vez. Antes, por cada entrada de _ctx (que en una sesión
+  # con mucho hardware vale con facilidad cientos) se relía /proc/modules, se re-leía el
+  # .config completo (~180 KB) con un grep, se recorría EFF_DISABLE entero y se
+  # hacía un `grep -rq` RECURSIVO SOBRE TODO EL ÁRBOL DE 40k FICHEROS. Ese último
+  # es el que domina: es un paseo completo del árbol por símbolo, sin caché. La
+  # pregunta que responde ("¿existe este símbolo en el Kconfig?") es exactamente
+  # la que responde kconfig_symbol_known, que ya tiene el índice en memoria
+  # (construido una vez, invalidado por parche).
+  local -A _loaded_mods=() _base_cfg=()
+  local _l
+  while IFS= read -r _l; do
+    [ -n "$_l" ] || continue
+    _loaded_mods["${_l%% *}"]=1
+  done < "$_pm" 2>/dev/null || true
+  while IFS= read -r _l; do
+    case "$_l" in
+      CONFIG_*=y|CONFIG_*=m) _base_cfg["${_l%%=*}"]=1 ;;
+    esac
+  done < "$SRC/.config" 2>/dev/null || true
+  local -A _eff_disable_set=()
+  local _e
+  for _e in "${EFF_DISABLE[@]:-}"; do [ -n "$_e" ] && _eff_disable_set["$_e"]=1; done
+  build_kconfig_indexes
+  unset _l _e
   for _s in "${!_ctx[@]}"; do
     _m="${_ctx[$_s]}"
     # Módulo asociado no cargado → no es pérdida real (el allowlist conserva
     # módulos que el kernel funcionando nunca compiló; su ausencia es el estado
     # actual). Sin módulo asociado ("WARNING: CONFIG_X is required") se evalúa.
-    if [ -n "$_m" ] && ! grep -qE "^${_m}( |$)" "$_pm" 2>/dev/null; then
+    if [ -n "$_m" ] && [ -z "${_loaded_mods[$_m]:-}" ]; then
       continue
     fi
     # Símbolo heredado =y/=m de la config base → se compila igual
-    if grep -qE "^${_s}=(y|m)$" "$SRC/.config" 2>/dev/null; then
+    if [ -n "${_base_cfg[$_s]:-}" ]; then
       continue
     fi
     _n="${_s#CONFIG_}"
     _in=0
     # Desactivado a propósito (OPTS_DISABLE / REBELS) → decisión del usuario
-    for _e in "${EFF_DISABLE[@]}"; do [ "$_e" = "$_n" ] && _in=1 && break; done
+    [ -n "${_eff_disable_set[$_n]:-}" ] && _in=1
     if [ "$_in" = 0 ] && [ -z "${EXPECTED_REBEL_SET[$_n]:-}" ]; then
       # Símbolo ausente de este Kconfig (renombrado/legacy) → no aplicable
-      if ! grep -rq '^[[:space:]]*\(config\|menuconfig\) '"$_n"'$' --include='Kconfig*' "$SRC" 2>/dev/null; then
-        _in=1
-      fi
+      kconfig_symbol_known "$_n" || _in=1
     fi
     [ "$_in" = 1 ] && continue
     _gap="$_gap ${_m:-$_n}"
@@ -6737,11 +6880,21 @@ load_config_state() {
 }
 
 config_symbol_state() {
-  local sym="$1"
-  if [ -n "${CONFIG_STATE[$sym]+x}" ]; then
-    printf '%s\n' "${CONFIG_STATE[$sym]}"
+  local __s
+  config_symbol_state_into "$1" __s
+  printf '%s\n' "$__s"
+}
+
+# v27.31.52: variante SIN subshell. validate_config la llama una vez por cada
+# símbolo de las cinco listas efectivas (~800 en este perfil) y lo hacía con
+# `$(config_symbol_state ...)`: un fork por símbolo para leer una clave de un
+# array asociativo. Con printf -v desaparece el fork; el valor sale idéntico
+# (incluido el "missing" de un símbolo que .config no menciona).
+config_symbol_state_into() { # $1 = símbolo, $2 = variable destino
+  if [ -n "${CONFIG_STATE[$1]+x}" ]; then
+    printf -v "$2" '%s' "${CONFIG_STATE[$1]}"
   else
-    printf '%s\n' "missing"
+    printf -v "$2" '%s' "missing"
   fi
 }
 
@@ -6752,25 +6905,48 @@ run_kconfig_audit() {
 
   log "Detectando símbolos nuevos antes de olddefconfig..."
   NEWCONFIG_OUTPUT="$(make "${KCONFIG_CC_OPTS[@]}" listnewconfig 2>&1 || true)"
-  if printf '%s\n' "$NEWCONFIG_OUTPUT" | grep -qE '^CONFIG_|^# CONFIG_'; then
-    # Con parches/BTF activos, sus símbolos aparecerán aquí como nuevos (los
+  # v27.31.52: se recorre la salida UNA vez y se decide con contadores, en vez de
+  # grepearla hasta cuatro veces (aquí dos, y otras dos en validate_config).
+  # NEWCONFIG_OUTPUT es una cadena que puede traer cientos de líneas; hacerla
+  # recorrer por un pipe cada vez es trabajo tirado, y encima el `grep -vE` de
+  # los símbolos de parche recorría la cadena una vez más por cada línea.
+  local __has_new=0 __has_other_new=0 __nl
+  local -A __new_names=()
+  while IFS= read -r __nl; do
+    case "$__nl" in
+      CONFIG_*=*|"# CONFIG_"*" is not set")
+        __has_new=1
+        if [[ "$__nl" =~ ^#?\ CONFIG_([A-Za-z0-9_]+) ]]; then
+          __new_names["${BASH_REMATCH[1]}"]=1
+        fi
+        ;;
+    esac
+  done <<< "$NEWCONFIG_OUTPUT"
+  unset __nl
+  if [ "$__has_new" = 1 ]; then
+    # Con parches/BTF activos, sus símbolos aparecen aquí como nuevos (los
     # introduce el parche). Son esperados; se auditán en la validación vía
     # EXPECTED_REBEL_SET. Aquí solo se informa si hay OTROS.
     if [ "${#PATCH_KCONFIG_FILTER[@]}" -gt 0 ]; then
-      local __fs __name_regex=""
-      for __fs in "${!PATCH_KCONFIG_FILTER[@]}"; do
-        [ -n "$__name_regex" ] && __name_regex="$__name_regex|"
-        __name_regex="$__name_regex$__fs"
+      for __nl in "${!__new_names[@]}"; do
+        if [ -z "${PATCH_KCONFIG_FILTER[$__nl]:-}" ]; then
+          __has_other_new=1
+          break
+        fi
       done
-      unset __fs
-      if printf '%s\n' "$NEWCONFIG_OUTPUT" | grep -vE "CONFIG_($__name_regex)" | grep -qE '^CONFIG_|^# CONFIG_'; then
-        warn "Se detectaron símbolos nuevos/pendientes (además de los de parches/BTF)."
-      fi
-      unset __name_regex
+      unset __nl
     else
-      warn "Se detectaron símbolos nuevos/pendientes."
+      __has_other_new=1
+    fi
+    if [ "$__has_other_new" = 1 ]; then
+      if [ "${#PATCH_KCONFIG_FILTER[@]}" -gt 0 ]; then
+        warn "Se detectaron símbolos nuevos/pendientes (además de los de parches/BTF)."
+      else
+        warn "Se detectaron símbolos nuevos/pendientes."
+      fi
     fi
   fi
+  unset __has_new __has_other_new __new_names
 
   log "Normalizando con olddefconfig..."
   OLDCONFIG_OUTPUT="$(make "${KCONFIG_CC_OPTS[@]}" olddefconfig 2>&1)" || {
@@ -6800,7 +6976,7 @@ validate_config() {
 
   # 1) Activaciones normales
   for opt in "${EFF_ENABLE[@]}"; do
-    state="$(config_symbol_state "$opt")"
+    config_symbol_state_into "$opt" state
     if [ "$state" = y ] || [ "$state" = m ]; then
       enable_ok=$((enable_ok + 1))
     elif [ "$state" = n ]; then
@@ -6814,7 +6990,7 @@ validate_config() {
 
   # 2) Críticos: únicos y nunca ignorables con --force
   for opt in "${EFF_CRITICAL[@]}"; do
-    state="$(config_symbol_state "$opt")"
+    config_symbol_state_into "$opt" state
     if [ "$state" = y ] || [ "$state" = m ]; then
       critical_ok=$((critical_ok + 1))
     else
@@ -6829,7 +7005,7 @@ validate_config() {
   # propia arquitectura. Se informa como WARNING y nunca bloquea la build.
   # Los requisitos funcionales se validan exclusivamente mediante CRITICAL_OPTS.
   for opt in "${EFF_DISABLE[@]}"; do
-    state="$(config_symbol_state "$opt")"
+    config_symbol_state_into "$opt" state
     case "$state" in
       n|missing)
         disable_ok=$((disable_ok + 1))
@@ -6855,7 +7031,7 @@ validate_config() {
 
   # 4) SETVAL
   for opt in "${!EFF_SETVAL[@]}"; do
-    state="$(config_symbol_state "$opt")"
+    config_symbol_state_into "$opt" state
     if [ "$state" = "${EFF_SETVAL[$opt]}" ]; then
       setval_ok=$((setval_ok + 1))
     else
@@ -6864,37 +7040,45 @@ validate_config() {
     fi
   done
 
-  # 5) SETSTR (compara la línea exacta para conservar comillas)
+  # 5) SETSTR (conservando las comillas del valor)
+  # v27.31.52: se consulta CONFIG_STATE en vez de lanzar un `grep -Fxq` sobre
+  # .config por cada símbolo. load_config_state ya dejó el valor completo
+  # (con sus comillas) en el array: para un CONFIG_X la línea de .config es
+  # `CONFIG_X="valor"`, así que basta comprobar que el valor cacheado sea
+  # exactamente `"<valor>"`. Un símbolo no listado en .config tampoco puede
+  # satisfacer la comprobación, y su estado en CONFIG_STATE es "missing".
   for opt in "${!EFF_SETSTR[@]}"; do
-    local expected_line="CONFIG_${opt}=\"${EFF_SETSTR[$opt]}\""
-    if grep -Fxq "$expected_line" .config; then
+    config_symbol_state_into "$opt" state
+    if [ "$state" = "\"${EFF_SETSTR[$opt]}\"" ]; then
       setstr_ok=$((setstr_ok + 1))
     else
-      HARD_DISABLE_FAIL+=("SETSTR CONFIG_$opt esperado=\"${EFF_SETSTR[$opt]}\"")
+      HARD_DISABLE_FAIL+=("SETSTR CONFIG_$opt esperado=\"${EFF_SETSTR[$opt]}\" (real=$state)")
       fatal_count=$((fatal_count + 1))
     fi
   done
 
   # 6) Nuevos símbolos: listnewconfig es la referencia oficial de migración.
-  if printf '%s\n' "$NEWCONFIG_OUTPUT" | grep -qE '^CONFIG_|^# CONFIG_'; then
-    while IFS= read -r line; do
-      [[ "$line" =~ ^CONFIG_[A-Z0-9_]+= ]] || [[ "$line" =~ ^#\ CONFIG_[A-Z0-9_]+\ is\ not\ set ]] || continue
-      local new_sym=""
-      if [[ "$line" =~ ^CONFIG_([A-Za-z0-9_]+)= ]]; then
-        new_sym="${BASH_REMATCH[1]}"
-      elif [[ "$line" =~ ^#\ CONFIG_([A-Za-z0-9_]+)\ is\ not\ set$ ]]; then
-        new_sym="${BASH_REMATCH[1]}"
-      else
-        continue
-      fi
-      if [ -n "${EXPECTED_REBEL_SET[$new_sym]:-}" ]; then
-        continue
-      fi
-      NEW_OPTS+=("$line")
-    done <<< "$NEWCONFIG_OUTPUT"
-    if [ "${#NEW_OPTS[@]}" -gt 0 ]; then
-      warning_count=$((warning_count + ${#NEW_OPTS[@]}))
+  # v27.31.52: un SOLO recorrido de NEWCONFIG_OUTPUT. Antes se grepeaba la cadena
+  # para decidir si había algo (`printf | grep -qE`) y luego se volcaba entera
+  # en un `while read` para recorrerla: dos pasadas, y la primera solo servía
+  # de guarda. Ahora el recorrido decide por sí solo.
+  while IFS= read -r line; do
+    [[ "$line" =~ ^CONFIG_[A-Z0-9_]+= ]] || [[ "$line" =~ ^#\ CONFIG_[A-Z0-9_]+\ is\ not\ set ]] || continue
+    local new_sym=""
+    if [[ "$line" =~ ^CONFIG_([A-Za-z0-9_]+)= ]]; then
+      new_sym="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ ^#\ CONFIG_([A-Za-z0-9_]+)\ is\ not\ set$ ]]; then
+      new_sym="${BASH_REMATCH[1]}"
+    else
+      continue
     fi
+    if [ -n "${EXPECTED_REBEL_SET[$new_sym]:-}" ]; then
+      continue
+    fi
+    NEW_OPTS+=("$line")
+  done <<< "$NEWCONFIG_OUTPUT"
+  if [ "${#NEW_OPTS[@]}" -gt 0 ]; then
+    warning_count=$((warning_count + ${#NEW_OPTS[@]}))
   fi
 
   # 7) No se genera reporte persistente: la salida relevante se muestra en consola.
@@ -7005,7 +7189,10 @@ report_config_diff() {
   done < <(zcat /proc/config.gz 2>/dev/null)
 
   local -a changed=() added=() removed=()
-  local oldsym newsym runstate newstate newname
+  # v27.31.52: fuera `newsym`/`newstate`, declarados pero nunca leídos (los bucles
+  # de nuevos/retirados usan `sym` y el de cambiados `oldsym`); shellcheck lo
+  # señalaba como SC2034.
+  local oldsym runstate newname
 
   # Cambiados: el símbolo existe en el kernel en ejecución y el perfil lo cambió.
   # Si el perfil renombró el símbolo (APPLIED_RENAMES[old]=new), se compara el
@@ -7175,7 +7362,14 @@ absorb_rebels_to_profile() {
 
 verify_build_tree() {
   [ -f .config ] || fatal "No existe .config antes de compilar."
-  [ "$(make -s kernelversion)" = "$VERSION" ] || fatal "La versión del árbol no coincide con $VERSION."
+  # v27.31.52: se compara contra la versión que extract_tarball YA leyó del mismo
+  # árbol y guardó en TREE_IDENTITY. Este `make -s kernelversion` era el quinto
+  # make sobre el mismo árbol en una run (3466/3517/3539/3573 y ahora este),
+  # cada uno parseando los Makefiles de todo el árbol.
+  # local: sin esto el nombre se filtra al ambito global y shellcheck avisa (SC2154).
+  local __vid
+  tree_identity_into "$SRC" __vid
+  [ "${__vid%%|*}" = "$VERSION" ] || fatal "La versión del árbol no coincide con $VERSION."
 
   # Estos cuatro símbolos deben quedar compilados DIRECTAMENTE en el kernel
   # (=y, nunca módulo) porque el arranque de este equipo depende de una UKI
@@ -7187,12 +7381,13 @@ verify_build_tree() {
   local -a boot_critical=(X86_NATIVE_CPU BTRFS_FS DRM_I915 KVM_SMM)
   local sym resolved state
   for sym in "${boot_critical[@]}"; do
-    resolved="$(resolve_symbol "$sym")"
-    state="$(config_symbol_state "$resolved")"
+    resolve_symbol "$sym" resolved          # sin $(): el subshell perdía caches
+    config_symbol_state "$resolved" state
     if [ "$state" != y ]; then
       fatal "Falta CONFIG_${resolved}=y (crítico para el arranque sin initramfs de este equipo; estado actual: $state)"
     fi
   done
+  unset __vid
 }
 
 prepare_package_identity_override() {
@@ -7616,6 +7811,61 @@ rollback_manifest_set() {
   return 0
 }
 
+# v27.31.52: escritura por lotes. rollback_manifest_set es un read-modify-write
+# COMPLETO por clave: `sudo cat` + `sudo tee` + `sudo mv` y además un segundo
+# `sudo cat | grep` para decidir si la clave ya existía. preserve_rollback_package
+# la llamaba 6 veces seguidas con 6 claves distintas, así que el mismo manifiesto
+# de 8 líneas se releía, reescribía y reescribía seis veces: ~30 ejecuciones de
+# sudo, cada una pidiendo timestamp, para escribir lo mismo que cabía en una.
+# Aquí se lee UNA vez, se aplican todas las claves en memoria y se escribe UNA vez,
+# de forma atómica (tmp + mv), igual que antes pero sin el cuadrático.
+rollback_manifest_set_many() {
+  local -a kv=("$@")
+  [ "${#kv[@]}" -gt 0 ] || return 0
+  sudo mkdir -p -- "$ROLLBACK_DIR" 2>/dev/null || return 0
+  local tmp line k v _i _found
+  local -A _new=()
+  # El tope es `_i + 1 < ${#kv[@]}` y no `_i < ${#kv[@]}`: con un número IMPAR de
+  # argumentos, el índice del valor no existe y con `set -u` eso es
+  # "variable sin asignar", que el trap ERR convierte en muerte del script. La
+  # pareja suelta final se ignora en vez de reventar la build.
+  for ((_i = 0; _i + 1 < ${#kv[@]}; _i += 2)); do
+    k="${kv[$_i]}"; v="${kv[$((_i + 1))]}"
+    [ -n "$k" ] || continue
+    [ -n "$v" ] || continue
+    _new["$k"]="$v"
+  done
+  [ "${#_new[@]}" -gt 0 ] || return 0
+  tmp="$ROLLBACK_DIR/.rollback.info.$$.tmp"
+  # 1) volcado de las líneas existentes, sustituyendo (o respetando) cada clave
+  {
+    if [ -f "$ROLLBACK_MANIFEST" ]; then
+      while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] || continue
+        case "$line" in
+          *=*)
+            k="${line%%=*}"
+            if [ -n "${_new[$k]:-}" ]; then
+              printf '%s=%s\n' "$k" "${_new[$k]}"
+              unset '_new[$k]'
+            else
+              printf '%s\n' "$line"
+            fi
+            ;;
+          *) printf '%s\n' "$line" ;;
+        esac
+      done < <(sudo cat -- "$ROLLBACK_MANIFEST" 2>/dev/null || cat -- "$ROLLBACK_MANIFEST" 2>/dev/null)
+    fi
+    # 2) las claves que no estaban en el manifiesto, al final
+    for k in "${!_new[@]}"; do
+      printf '%s=%s\n' "$k" "${_new[$k]}"
+    done
+  } | sudo tee "$tmp" >/dev/null 2>&1 || { sudo rm -f -- "$tmp" 2>/dev/null; return 1; }
+  sudo mv -f -- "$tmp" "$ROLLBACK_MANIFEST" 2>/dev/null || {
+    sudo rm -f -- "$tmp" 2>/dev/null; return 1; }
+  return 0
+}
+
 # Quita una clave del manifiesto. `rollback_manifest_set` no puede hacerlo: con
 # valor vacío hace `return 0` sin tocar nada (protección deliberada contra
 # vaciar claves por accidente), y un archive que se ha podado tiene que DEJAR de
@@ -7678,16 +7928,27 @@ preserve_rollback_package() {
     sudo rm -f -- "$tmp" 2>/dev/null
     warn "No se pudo dejar el paquete preservado en $ROLLBACK_DIR/$name."; return 0; }
 
-  rollback_manifest_set pkgbase "$CIZEN_PKGBASE"
-  rollback_manifest_set pkgver "$pkgver"
-  rollback_manifest_set release "${VERSION}${LOCALVERSION_SUFFIX}"
-  rollback_manifest_set sched "$(effective_scheduler)"
-  rollback_manifest_set pkgfile "$name"
-  rollback_manifest_set ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  # El archive (si lo hay) describes OTRO momento del mismo kernel en marcha; se
+  # v27.31.52: las seis claves en UNA escritura (antes: seis read-modify-write
+  # completos del mismo manifiesto, ~30 sudo).
+  rollback_manifest_set_many \
+    pkgbase "$CIZEN_PKGBASE" \
+    pkgver  "$pkgver" \
+    release "${VERSION}${LOCALVERSION_SUFFIX}" \
+    sched   "$(effective_scheduler)" \
+    pkgfile "$name" \
+    ts      "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # El archive (si lo hay) describe OTRO momento del mismo kernel en marcha; se
   # desvincula para que el manifiesto no lo presente como parte de este paquete.
-  [ -f "$ROLLBACK_DIR/${VERSION}${LOCALVERSION_SUFFIX}.tar.xz" ] ||
-    rollback_manifest_set archive ""
+  #
+  # v27.31.52: era `rollback_manifest_set archive ""`, que NO HACÍA NADA: la
+  # primera línea de esa función es `[ -n "$value" ] || return 0`, así que un
+  # valor vacío salía sin tocar el fichero. El manifiesto se quedaba anunciando
+  # un archive que corresponde a otro build —justo lo que el comentario de arriba
+  # dice querer evitar— y, como el prune posterior borra ese .tar.xz, acababa
+  # apuntando a un fichero inexistente. Para desincular está rollback_manifest_unset.
+  if [ ! -f "$ROLLBACK_DIR/${VERSION}${LOCALVERSION_SUFFIX}.tar.xz" ]; then
+    rollback_manifest_unset archive
+  fi
 
   # Solo se conserva el ÚLTIMO paquete: "actual + previo". Los anteriores se van
   # (cada uno son ~100 MB y volver a ellos casi nunca es lo que se quiere). La
@@ -7760,8 +8021,8 @@ prepare_rollback_archive() {
       # El manifiesto ata el archive al paquete del que salió. Sin esto no se
       # puede distinguir "el kernel anterior" de "otro build de la misma
       # release" (bore vs bmq), que es justo lo que un rollback necesita saber.
-      rollback_manifest_set archive "$rel.tar.xz"
-      rollback_manifest_set archive_rel "$rel"
+      # v27.31.52: ambas claves en una sola escritura del manifiesto.
+      rollback_manifest_set_many archive "$rel.tar.xz" archive_rel "$rel"
       ok "Rollback preparado: $ROLLBACK_DIR/$rel.tar.xz (kernel en ejecución $rel)"
     else
       sudo rm -f -- "$tmp" 2>/dev/null
@@ -7854,7 +8115,19 @@ create_btrfs_snapshot() {
     return 0
   fi
 
-  sudo mkdir -p -- "$tmp/$SNAPSHOT_SUBVOL" 2>/dev/null
+  # v27.31.52: este mkdir estaba SIN `|| true` siendo el ÚNICO comando sin
+  # protección de toda la función (todo lo demás es soft-fail). Si fallaba
+  # disparaba on_err → exit, y las dos líneas siguientes —el umount y el rmdir—
+  # nunca llegaban a ejecutarse: el btrfs top-level quedaba MONTADO en
+  # /tmp/cizen-snap.XXXXXX para el resto de la sesión, con su subvolumen visible
+  # y sin ningún proceso que lo desmonte. Ahora el fallo es blando, igual que
+  # el resto de la función.
+  if ! sudo mkdir -p -- "$tmp/$SNAPSHOT_SUBVOL" 2>/dev/null; then
+    sudo umount "$tmp" >/dev/null 2>&1 || true
+    rmdir -- "$tmp" 2>/dev/null || true
+    warn "No se pudo crear $SNAPSHOT_SUBVOL en el btrfs top-level; snapshot omitido."
+    return 0
+  fi
   snapname="kernel-$VERSION-$(date +%Y%m%d-%H%M%S)"
   dst="$tmp/$SNAPSHOT_SUBVOL/@$snapname"
   if sudo btrfs subvolume snapshot -r / "$dst" >/dev/null 2>&1; then
@@ -10072,10 +10345,29 @@ ok "tmpfs de compilación verificado (montaje + exec efectivo)"
 # SRC y BUILD_MARKER ya apuntan al tmpfs objetivo; no es necesario reasignarlos.
 
 # Tarball/extracción
-get_tarball "$TARBALL" "$URL" || fatal "No se pudo obtener un tarball válido."
+# v27.31.52: get_tarball se salta cuando el árbol ya está en su sitio y es
+# reutilizable. Antes se llamaba SIEMPRE antes que extract_tarball, y su trabajo
+# es caro: `xz -t` sobre el tarball entero (~145 MB) más la verificación GPG
+# (`xz -cd | gpg --verify`), que lo DESCOMPRIME entero otra vez. Son varios
+# segundos de CPU quemados, en cada run, para un fichero que en un árbol
+# reutilizable no se abre nunca: $TARBALL solo se usa dentro de extract_tarball
+# (tar -xf) y DESPUÉS de su propio retorno temprano por reutilización. Es
+# seguro saltarlo: si el árbol se reutiliza, no se lee un solo byte del tarball,
+# así que no hay nada que verificar. extract_tarball lo exigirá en cuanto necesite
+# el fichero de verdad.
+if source_tree_reusable; then
+  info "Árbol de $VERSION ya presente y reutilizable: se omite la descarga y la verificación GPG del tarball."
+else
+  get_tarball "$TARBALL" "$URL" || fatal "No se pudo obtener un tarball válido."
+fi
 extract_tarball || fatal "No se pudo preparar el árbol de fuentes."
 
 cd "$SRC"
+# Red de seguridad del índice Kconfig: si algo lo consultó antes de que existiera
+# el árbol, se cacheó un índice VACÍO que ninguna invalidación posterior tocaría
+# (las de apply_patch_plugin solo corren si hay parches). Aquí el árbol existe y
+# está parcheado; se empieza de cero.
+kconfig_index_invalidate
 ok "Fuentes listas: $SRC"
 T_DL="$(date +%s)"
 
@@ -10122,7 +10414,7 @@ apply_config_requests || fatal "Falló scripts/config al aplicar el perfil."
 apply_config_fragments || fatal "Falló scripts/config al aplicar los frags."
 
 # ============================================================
-# Preparar firmware DMC para i915 (v27.32.0)
+# Preparar firmware DMC para i915 (v27.31.52)
 # El firmware i915/kbl_dmc_ver1_04.bin puede venir comprimido como .zst en
 # linux-firmware. CONFIG_EXTRA_FIRMWARE lo incluye en el kernel built-in, pero
 # requiere el archivo descomprimido en /lib/firmware/. Este paso lo descomprime
@@ -10623,6 +10915,50 @@ if [ -n "${CIZEN_PGO_PROFILE:-}" ]; then
   MAKE_CC_OPTS+=("CLANG_AUTOFDO_PROFILE=$CIZEN_PGO_PROFILE")
   info "PGO AutoFDO activo: con $CIZEN_PGO_PROFILE (la build incluirá -fprofile-sample-use)."
 fi
+# v27.31.52: lector de contadores de `ccache -s`. ccache no ofrece salida JSON ni
+# una opción --print-estadísticas estable, así que hay que parsear el texto.
+#
+# El bug que arregla: el resumen anterior usaba
+#     grep -E '^(Hits|Direct hits|Preprocessed cache hits|Misses|cache size|Files in cache|Uncacheable)'
+# y en ccache 4.14 eso captura 1 línea de 7. Dos motivos, ambos verificados
+# contra la salida real de la máquina:
+#   1) el ancla '^' no casa con la indentación: en 4.14 "Hits:" y "Misses:"
+#      vienen con 2 espacios y "Direct:"/"Preprocessed:" con 4, así que el
+#      patrón solo alcanzaba "Uncacheable calls:" (la única sin indentar);
+#   2) los nombres de las etiquetas cambiaron: 4.14 dice "Direct:" y
+#      "Preprocessed:", no "Direct hits"/"Preprocessed cache hits"; tampoco
+#      existen "Files in cache" ni "cache size" (es "Cache size (GB)").
+# Resultado: el informe daba 54% de aciertos y solo enseñaba la línea de
+# "uncacheable".
+#
+# Se devuelve el PRIMER número de la PRIMERA línea que casa. En 4.x "Hits:"
+# aparece dos veces (estadísticas de llamadas y otra vez bajo "Local storage");
+# para el total de la build interesa la primera.
+# Se busca la etiqueta EXACTA ("Hits:", "Misses:", "Uncacheable calls:"), no una
+# subcadena, y se devuelve el número de la PRIMERA que casa. Las dos reglas
+# importan y las dos están probadas contra salidas reales:
+#  - coincidencia exacta: en ccache 3.x el desglose se llama "Direct hits:" y
+#    "Preprocessed hits:", así que buscar la subcadena "hits" devolvía 120 (el
+#    primer Direct) en vez de 200 (el total de la línea "Hits:");
+#  - primera coincidencia: en 4.x "Hits:" aparece dos veces, la de estadísticas
+#    de llamadas y otra bajo "Local storage:"; para el total de la build
+#    interesa la primera.
+ccache_read_counter() {
+  local key="$1" v
+  v="$(ccache -s 2>/dev/null | awk -v k="$key" '
+    {
+      line=$0
+      sub(/^[[:space:]]+/,"",line)
+      if(line !~ /:/) next
+      label=substr(line,1,index(line,":")-1)
+      gsub(/[[:space:]]+$/,"",label)
+      if(tolower(label)!=tolower(k)) next
+      rest=substr(line, index(line,":")+1)
+      if(match(rest,/[0-9]+/)){ print substr(rest,RSTART,RLENGTH); exit }
+    }' 2>/dev/null || true)"
+  case "${v:-}" in ''|*[!0-9]*) echo 0 ;; *) echo "$v" ;; esac
+}
+
 if command -v ccache >/dev/null 2>&1; then
   export CCACHE_DIR="${CCACHE_DIR:-$HOME/.cache/ccache}"
   # Tuning (no destructivo, silencioso):
@@ -10642,6 +10978,9 @@ if command -v ccache >/dev/null 2>&1; then
   # de compilación, evitando que uname -a muestre una fecha artificial.
   # La reproducibilidad temporal puede activarse explícitamente desde el
   # entorno si el usuario exporta KBUILD_BUILD_TIMESTAMP antes de ejecutar.
+  # v27.31.52: se toma una foto de los contadores ANTES de compilar para poder
+  # reportar el delta de ESTA build. Ver ccache_read_counter.
+  CCACHE_BEFORE="$(ccache_read_counter hits) $(ccache_read_counter misses) $(ccache_read_counter uncacheable)"
   ok "ccache activo: $CCACHE_DIR (CC/HOSTCC=$CC_LAUNCHER; timestamp de build real)"
 else
   warn "ccache no instalado; compilación normal."
@@ -10741,23 +11080,48 @@ done < <(find "$SRC" -maxdepth 1 -type f -name "$CIZEN_PKGBASE-*.pkg.tar.zst" -p
 unset __oldpkg
 sudo_keepalive_start
 build_rc=0
-# Cgroup dedicado para la compilación: systemd-run --scope coloca make en un
+# Cgroup dedicado para la compilación: systemd-run coloca make en un
 # scope propio con CPUWeight/IOWeight según la prioridad configurada (normal =
 # peso 100/100; low = 30/1, dando la CPU a ~todo el sistema). Si systemd-run
 # no existe o el probe de delegación cgroup falla, se degrada a nice/ionice.
+#
+# v27.31.52: se prueban DOS niveles de systemd antes de rendirse.
+# El probe usaba solo `systemd-run --scope` (scope de sistema) y, cuando ese
+# D-Bus no responde, caía directamente a nice/ionice. Medido en esta máquina:
+#   - scope de SISTEMA -> "Failed to start transient scope unit: Connection
+#     timed out" (probe fallido)
+#   - scope de USUARIO -> OK, el proceso entra en
+#     .../user-1000.slice/user@1000.service/app.slice/<unit>.scope
+# Eso significa que el build se estaba ejecutando con nice -n 10 + ionice -c 3
+# pese a existir la opción buena. La diferencia NO es cosmética: con CPUWeight=30
+# la build solo cede cuando el escritorio realmente pide CPU; con nice 10 cede
+# ante CUALQUIER proceso de nice 0 (packagekit, updatedb, tracker…), que es
+# justo de donde sale el 20-40% de sobrecoste que documenta el bloque de arriba.
 SCOPE_RUNNER=()
 if command -v systemd-run >/dev/null 2>&1 && [ -d /sys/fs/cgroup ]; then
   case "$BUILD_PRIORITY" in
     normal) cpu_w=100; io_w=100 ;;
     *)      cpu_w=30;  io_w=1 ;;
   esac
-  if systemd-run --scope --quiet --unit="cizen-probe-$$.scope" \
-       --property="CPUWeight=$cpu_w" --property="IOWeight=$io_w" true 2>/dev/null; then
-    SCOPE_RUNNER=(systemd-run --scope --quiet --unit="k-update-${TS}-build.scope" \
-      --property="CPUWeight=$cpu_w" --property="IOWeight=$io_w")
-    info "Compilación en scope cgroup dedicado (CPUWeight=$cpu_w, IOWeight=$io_w)."
-  else
-    warn "systemd-run --scope no puede delegar el cgroup; se intentan los nice/ionice clásicos."
+  # Se intenta el scope de sistema y, si su D-Bus no contesta, el de usuario.
+  # El prefijo se monta como array (no `$scope_mode` sin comillas) para que un
+  # valor vacío no se convierta en un argumento fantasma.
+  for scope_mode in "" "--user"; do
+    [ "${#SCOPE_RUNNER[@]}" -eq 0 ] || break
+    if [ -n "$scope_mode" ]; then declare -a scope_arg=(--user); else declare -a scope_arg=(); fi
+    if systemd-run "${scope_arg[@]}" --scope --quiet --unit="cizen-probe-$$.scope" \
+         --property="CPUWeight=$cpu_w" --property="IOWeight=$io_w" true 2>/dev/null; then
+      SCOPE_RUNNER=(systemd-run "${scope_arg[@]}" --scope --quiet --unit="k-update-${TS}-build.scope" \
+        --property="CPUWeight=$cpu_w" --property="IOWeight=$io_w")
+      if [ -n "$scope_mode" ]; then
+        info "Compilación en scope cgroup de USUARIO (CPUWeight=$cpu_w, IOWeight=$io_w): el scope de sistema no delegaba, así que no se aplica nice/ionice."
+      else
+        info "Compilación en scope cgroup de sistema (CPUWeight=$cpu_w, IOWeight=$io_w)."
+      fi
+    fi
+  done
+  if [ "${#SCOPE_RUNNER[@]}" -eq 0 ]; then
+    warn "systemd-run no puede delegar el cgroup ni por sistema ni por usuario; se caen los nice/ionice clásicos (~20-40% de build más lento)."
   fi
 fi
 # Sin scope cgroup (systemd-run ausente, sin delegación o probe fallido): en
@@ -10827,12 +11191,27 @@ if [ "$CIZEN_PKG_BACKEND" = "arch" ]; then
   validate_split_package_transition_metadata
 fi
 
+# v27.31.52: el KERNELRELEASE del build se resuelve UNA vez. Había tres sitios
+# (check_installed_release_generic, module_sign_installed y la auditoría LUKS/FDE)
+# lanzando `make -C $SRC -s kernelrelease` por separado, cada uno con su propio
+# `|| echo "$VERSION-cizen-v3"` de respaldo: tres subshells y tres make, y si
+# alguno fallaba de forma distinta los tres reportaban un release diferente para
+# el MISMO build. El release no cambia durante la ejecución (el árbol ya está
+# configurado), así que se calcula una vez y se reparte.
+kernel_release() {
+  if [ -z "${KERNEL_RELEASE:-}" ]; then
+    KERNEL_RELEASE="$(make -C "$SRC" -s kernelrelease 2>/dev/null || echo "$VERSION-cizen-v3")"
+  fi
+  printf '%s\n' "$KERNEL_RELEASE"
+}
+KERNEL_RELEASE=""
+
 # Backends sin pacman: abortar si el release resultante ya está instalado en
 # /usr/lib/modules (definida ANTES de la rama que la usa: llamarla después
 # rompería el flujo no-arch con "command not found").
 check_installed_release_generic() {
   local rel
-  rel="$(make -C "$SRC" -s kernelrelease 2>/dev/null || echo "$VERSION-cizen-v3")"
+  rel="$(kernel_release)"
   if [ -d "/usr/lib/modules/$rel" ]; then
     warn "El release $rel ya está instalado en /usr/lib/modules."
     if [ "$FORCE" = true ]; then
@@ -11069,7 +11448,7 @@ module_sign_installed() {
   command -v openssl >/dev/null 2>&1 || { warn "module-sign: falta openssl; se omite la firma."; return 0; }
   [ -x "$SRC/scripts/sign-file" ] || { warn "module-sign: no hay scripts/sign-file en $SRC; se omite."; return 0; }
   local rel key crt der n f
-  rel="$(make -C "$SRC" -s kernelrelease 2>/dev/null || echo "$VERSION-cizen-v3")"
+  rel="$(kernel_release)"
   key="$CIZEN_MODULE_SIGN_DIR/kernel-signing.key"
   crt="$CIZEN_MODULE_SIGN_DIR/kernel-signing.crt"
   der="$CIZEN_MODULE_SIGN_DIR/kernel-signing.der"
@@ -11152,7 +11531,7 @@ case "$CIZEN_PKG_BACKEND" in
     if ! sudo make -C "$SRC" modules_install; then
       fatal "modules_install falló (backend $CIZEN_PKG_BACKEND)."
     fi
-    rel__cgeb="$(make -C "$SRC" -s kernelrelease 2>/dev/null || echo "$VERSION-cizen-v3")"
+    rel__cgeb="$(kernel_release)"
     uname_m="$(uname -m | sed 's/x86_64/x86/;s/aarch64/arm64/;s/i686/x86/')"
     uname_arch="$(uname -m)"
     if [ "$uname_arch" = "x86_64" ] || [ "$uname_arch" = "i686" ]; then bzfile="arch/x86/boot/bzImage"; else bzfile="arch/$uname_m/boot/Image"; fi
@@ -11260,9 +11639,40 @@ fmt_time() { # segundos -> "Xm Ys" (o solo "Ys" si <60)
   if [ "$m" -gt 0 ]; then printf '%dm %ds' "$m" "$s"; else printf '%ds' "$s"; fi
 }
 
+# v27.31.52: el resumen de ccache pasa a ser el DELTA de esta build, no el
+# acumulado de toda la vida. El acumulado es lo que hacía inútil el dato: con
+# 81012 llamadas históricas, saber que el total va por 54% no dice nada sobre
+# si el kernel que acabas de compilar salió de la caché. Lo que importa es
+# cuántos hits/misses Ha generado ESTA ejecución, y eso sale de restar la foto
+# tomada antes de compilar (CCACHE_BEFORE).
 CCACHE_STATS=""
 if [ -n "${CCACHE_DIR:-}" ] && command -v ccache >/dev/null 2>&1; then
-  CCACHE_STATS="$(ccache -s 2>/dev/null | grep -E '^(Hits|Direct hits|Preprocessed cache hits|Misses|cache size|Files in cache|Uncacheable)' | sed 's/^ */  /' || true)"
+  read -r _cb_h _cb_m _cb_u <<< "${CCACHE_BEFORE:-0 0 0}"
+  _ca_h="$(ccache_read_counter hits)"
+  _ca_m="$(ccache_read_counter misses)"
+  _ca_u="$(ccache_read_counter uncacheable)"
+  _d_h=$(( _ca_h - ${_cb_h:-0} )); _d_m=$(( _ca_m - ${_cb_m:-0} )); _d_u=$(( _ca_u - ${_cb_u:-0} ))
+  # Un delta negativo solo puede venir de un `ccache -z` manual concurrente; se
+  # satura a 0 en vez de imprimir porcentajes absurdos.
+  [ "$_d_h" -ge 0 ] 2>/dev/null || _d_h=0
+  [ "$_d_m" -ge 0 ] 2>/dev/null || _d_m=0
+  [ "$_d_u" -ge 0 ] 2>/dev/null || _d_u=0
+  _tot=$(( _d_h + _d_m ))
+  if [ "$_tot" -gt 0 ]; then
+    _pct=$(( _d_h * 100 / _tot ))
+  else
+    _pct=0
+  fi
+  CCACHE_STATS="esta build: ${_d_h} hits / ${_d_m} misses (${_pct}% de acierto)"
+  [ "$_d_u" -gt 0 ] && CCACHE_STATS+=", ${_d_u} no cacheables"
+  CCACHE_STATS+="
+  acumulado: $(ccache -s 2>/dev/null | awk '/^[[:space:]]*Cache size/ {gsub(/^[[:space:]]+/,""); print; exit}')"
+  # Si una reconstrucción incremental apenas toca la caché, el build tardó
+  # casi lo mismo que en frío: conviene decirlo, con el número delante.
+  if [ "$_tot" -gt 100 ] && [ "$_pct" -lt 20 ]; then
+    CCACHE_STATS+="
+  AVISO: solo ${_pct}% de acierto; esta build apenas ha reutilizado la caché (comportamiento de build en frío)."
+  fi
 fi
 
 sudo_keepalive_stop

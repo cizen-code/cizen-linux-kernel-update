@@ -1,3 +1,109 @@
+## [27.31.52] - 2026-09-30
+
+Rendimiento y correctitud del motor. Todo lo que se toca aquí se verificó
+ejecutándolo, no solo leyendo: `bash -n` limpio, **0 hallazgos de nivel error en
+ShellCheck**, **459 ok, 0 fail** en selftest, y cuatro bancos de pruebas nuevos
+(índices Kconfig, contadores de ccache, selector de scope y manifiesto de
+rollback) que se quedan en `/tmp` porque replicar aquí su andamiaje no compensa.
+Dos sospechas que parecían grandes resultaron **falsas al medirlas** y no se
+tocaron: `compiler_check=content` de ccache (clang aquí es un driver de 178 KB,
+2.798 s vs 2.799 s) y la configuración de acierto de ccache (probada, acierta
+con normalidad).
+
+### El build iba con nice/ionice sin que nadie lo supiera
+
+El probe de `systemd-run` solo probaba el scope **de sistema**. Medido aquí: ese
+D-Bus responde *"Connection timed out"*, así que todas las builds caían a
+`nice -n 10` + `ionice -c 3` — el sobrecoste que el propio script documenta como
+**20-40%** — mientras que `systemd-run --user --scope` sí funciona y admite las
+mismas `CPUWeight`/`IOWeight`. Ahora se prueban los dos niveles antes de rendirse.
+No es cosmético: con `CPUWeight=30` la build cede solo cuando el escritorio pide
+CPU; con `nice 10` cede ante **cualquier** proceso de nice 0 (packagekit,
+updatedb, tracker). Las tres ramas quedan probadas con shims, incluida la
+degradación a nice/ionice si fallan ambas.
+
+### El resumen de ccache no mostraba los aciertos
+
+`grep -E '^(Hits|Direct hits|...)'` capturaba **1 línea de 7**. Dos motivos, los
+dos verificados contra la salida real de ccache 4.14: el ancla `^` no casa con la
+indentación (`  Hits:`, `    Direct:`) y los nombres de etiqueta cambiaron
+(`Direct hits:` → `Direct:`). Con 54% de aciertos acumulados, el informe solo
+enseñaba la línea de *uncacheable*. Nuevo `ccache_read_counter` con coincidencia
+**exacta** de etiqueta —necesaria porque en el formato 3.x el desglose se llama
+`Direct hits:` y buscar la subcadena devolvía el parcial en vez del total— y el
+resumen pasa a dar el **delta de esta build**, que es el único dato accionable,
+con aviso si el acierto baja del 20%.
+
+### Miles de subshells que no hacía falta abrir
+
+`resolve_symbol` y `config_symbol_state` se llamaban siempre como
+`"$(...)"`, así que la memoización se fijaba **dentro** de un subshell que se
+perdía al salir: el padre volvía a calcular y a cachear lo mismo. Con ~800
+símbolos por lista eso son miles de forks de bash para leer una clave de un array
+asociativo. Variantes `*_into` con `printf -v` (que no abre subshell) para
+`build_effective_arrays` y `validate_config`; `load_rename_map` invalida la caché
+porque deriva de `RENAME_MAP`. Igual con `kernelrelease`, que se resolvía **tres
+veces** con tres `make` y tres `|| echo` de respaldo independientes: si uno
+fallaba de forma distinta, los tres reportaban un release distinto para el mismo
+build.
+
+### Índices Kconfig: la mitad de los pases y sin autoengaño
+
+`build_kconfig_symbol_index` y `build_kconfig_type_index` eran **dos recorridos
+idénticos** de los ~6.000 `Kconfig*` del árbol; ahora un `find` y un `awk` que
+emite nombre TAB tipo y llena los dos mapas de una pasada. Y
+`kconfig_index_invalidate` vacía **los dos** mapas: antes solo limpiaba
+`KCONFIG_SYMBOL_KNOWN`, de modo que un símbolo que un parche cambiara de `bool` a
+`int` conservaba su tipo viejo para siempre, y uno retirado nunca desaparecía.
+
+`lite_missing_check` hacía, **por cada símbolo**, un `grep -rq` recursivo sobre
+todo el árbol de 40k ficheros. Los tres datos que consultaba en bucle (módulos
+cargados, `.config`, `EFF_DISABLE`) se leen ahora una vez y la pregunta "¿existe
+este símbolo en el Kconfig?" la responde el índice que ya está en memoria.
+
+### Fallos reales, no solo lentitud
+
+- **`rollback_manifest_set_many` reventaba con un número impar de argumentos**:
+  `kv[$((_i+1))]` con `set -u` es "variable sin asignar", que el `trap ERR`
+  convierte en muerte del script. El tope pasa a ser `_i + 1 < ${#kv[@]}` y la
+  pareja suelta se ignora. No lo disparaba ningún llamador actual.
+- **Fuga de montaje btrfs**: un `sudo mkdir` era el único comando sin `|| true`
+  de toda `create_btrfs_snapshot`; si fallaba, las dos líneas de `umount`+`rmdir`
+  no llegaban a ejecutarse y el top-level se quedaba montado en
+  `/tmp/cizen-snap.XXXXXX` para el resto de la sesión.
+- **`get_avail_mb` podía matar la run**: si `df` fallaba, la asignación devolvía
+  su rc, `trap ERR` saltaba y se moría con "Error N en línea" en vez de con el
+  mensaje de espacio. Ahora satura a 0 para que sea el llamador el que aplique su
+  margen.
+- **El tarball se verificaba sin usarse**: `get_tarball` (`xz -t` sobre ~145 MB
+  más una verificación GPG que lo descomprime entero) se llamaba siempre, aunque
+  un árbol reutilizable no abre un solo byte del fichero. Se salta, y
+  `extract_tarball` lo exigirá en cuanto lo necesite de verdad.
+- **`rollback_manifest_set archive ""` no hacía nada**: la función descartaba el
+  valor vacío, así que la clave se quedaba apuntando a un archive viejo. Ahora se
+  desvincula con `rollback_manifest_unset`, y las seis claves del paquete se
+  escriben en **una** operación en vez de seis read-modify-write encadenados.
+- `check_build_memory` preguntaba `source_tree_reusable` hasta **cuatro veces**
+  y `tmpfs_is_mounted` otras dos, revalidando directorio, Makefile, testigo e
+  identidad en cada una; ahora decide una vez y reutiliza el veredicto.
+- `verify_build_tree` iba a por un quinto `make` sobre el mismo árbol; compara
+  contra la versión que `extract_tarball` ya tenía resuelta.
+
+### Decisiones de alcance
+
+El salto de `get_tarball` se dejó **dentro** de un `if source_tree_reusable` en
+vez de cambiar la firma de `extract_tarball`: si el árbol dejase de ser
+reutilizable entre la comprobación y la extracción, se degrada a un `fatal`
+explícito (tar ausente), no a una corrupción silenciosa. Y las dos sospechas de
+ccache del primer párrafo se documentan **medidas y descartadas**, para que nadie
+las reintente como si fueran hallazgos.
+
+Tampoco se tocaron los defaults deliberados del perfil: Clang automático,
+ThinLTO, `CIZEN_CFLAGS_OLEVEL=inherit` y la heurística de `JOBS` (que en esta
+máquina da 4 = número de CPU). `CIZEN_BUILD_PRIORITY=low` se mantiene: el
+default sacrifica velocidad por tener el escritorio usable, y eso es una decisión
+del usuario, no un bug. Lo que se arregla es que el coste fuese **invisible**.
+
 ## [27.31.51] - 2026-09-29
 
 Revisión a fondo de la suite (motor, UKI, manager, rollback, verify, helpers y
