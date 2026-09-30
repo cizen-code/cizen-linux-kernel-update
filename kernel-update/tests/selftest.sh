@@ -160,6 +160,12 @@ extract_fn() { # $1 = nombre de función
   extract tree_usable_for
   extract source_tree_reusable
   extract write_tree_meta
+  # v27.31.54: estado de parches del árbol. extract_tarball entra porque el
+  # defecto que corrigió era SU reutilización silenciosa de un árbol parcheado.
+  extract tree_patches_list
+  extract tree_record_patch
+  extract tree_clean_reusable
+  extract extract_tarball
   extract reconcile_tmpfs_trees
   extract get_mem_available_mb
   extract unmount_tmpfs_build
@@ -208,6 +214,11 @@ declare -A RENAME_MAP=() RESOLVED_SYMBOL=()
 # "/tmp/.../linux-7.2.7" como expresión aritmética y falla con "error de
 # sintaxis aritmética", devolviendo identidad vacía.
 declare -A TREE_IDENTITY=()
+# El motor declara TREE_META_NAME al cargarse, pero las funciones se extraen a un
+# fns.sh aparte, así que hay que declararla a mano aquí: apply_patch_register
+# llama a tree_record_patch, que la consulta, y con `set -u` leerla sin asignar
+# tumba el arnés. Solo se usa a partir de la sección de estado de parches.
+TREE_META_NAME=".cizen-tree"
 
 printf '%s\n' "== bore_branch_from_version =="
 [ "$(bore_branch_from_version 7.2.6)" = "7.2" ] && rec ok "7.2.6 -> 7.2" || rec fail "7.2.6 -> 7.2"
@@ -2453,12 +2464,15 @@ sudo() { # stub: registra la llamada y "desmonta" de verdad (baja un montaje)
   return 0
 }
 
-_mktree() { # $1=versión $2=tipo -> crea el árbol con su testigo
-  local d="$TMPFS_ROOT/linux-$1" k="$2"
+_mktree() { # $1=versión $2=tipo [$3=estado de parches|"legacy" para omitir la clave]
+  local d="$TMPFS_ROOT/linux-$1" k="$2" p="${3-none}"
   mkdir -p "$d/kernel/sched"
   : > "$d/Makefile"; : > "$d/kernel/Makefile"
   [ "$k" = "cachyos" ] && : > "$d/kernel/sched/poc_selector.c"
   printf 'version=%s\nkind=%s\n' "$1" "$k" > "$d/$TREE_META_NAME"
+  # "legacy" = testigo escrito por una versión de la herramienta que no
+  # declaraba el estado de parches (v27.31.54 y anteriores).
+  [ "$p" = "legacy" ] || printf 'patches=%s\n' "$p" >> "$d/$TREE_META_NAME"
   printf '%s' "$d"
 }
 SRC="$(_mktree 7.2.7 cachyos)"
@@ -2490,6 +2504,220 @@ else
   rec fail "árbol sin testigo mal identificado: $(tree_identity "$SRC")"
 fi
 VERSION=7.2.7; KERNEL_TREE=cachyos
+
+printf '%s\n' "== estado de parches del árbol (v27.31.54) =="
+# El fallo que motivó esto: la identidad del árbol era solo "<ver>|<tipo>". Un
+# vanilla al que la ejecución anterior le aplicó BORE seguía siendo
+# "<7.2.8>|vanilla", así que la run siguiente lo reutilizaba y compilaba con el
+# parche mientras anunciaba "vanilla" (y el menú ofrecía SCHED_BORE).
+#
+# Esta sección mueve el estado global (VERSION, KERNEL_TREE, SRC) que las
+# secciones siguientes heredan: la de reconcile_tmpfs_trees NO los reasigna en
+# su primer test, así que sin restaurarlos acabaría creyendo que el build es
+# vanilla 7.2.8 e invirtiendo todas sus expectativas. Se guarda y se devuelve
+# igual que los stubs del subshell de más abajo.
+_SAVED_VERSION="$VERSION"; _SAVED_TREE="$KERNEL_TREE"; _SAVED_SRC="$SRC"
+_SAVED_NOTE="${TREE_FORCE_NOTE:-}"
+
+# Árbol recién extraído: limpio y reutilizable.
+rm -rf "$TMPFS_ROOT"; mkdir -p "$TMPFS_ROOT"; : > "$MOUNTED_FLAG"
+SRC="$(_mktree 7.2.8 vanilla)"; VERSION=7.2.8; KERNEL_TREE=vanilla
+[ "$(tree_patches_list "$SRC")" = "" ] \
+  && rec ok "árbol recién extraído (patches=none): limpio" \
+  || rec fail "un árbol recién extraído no se lee como limpio: $(tree_patches_list "$SRC")"
+tree_clean_reusable "$SRC" 7.2.8 vanilla \
+  && rec ok "árbol limpio: reutilizable" \
+  || rec fail "un árbol limpio debería ser reutilizable"
+
+# Testigo heredado (sin la clave) y árbol sin testigo: no se puede probar que
+# estén limpios, así que NO se reutilizan. Es el mismo criterio que el resto del
+# motor: si no se puede probar algo, no se da por bueno.
+SRC="$(_mktree 7.2.8 vanilla legacy)"
+[ "$(tree_patches_list "$SRC")" = "unknown" ] \
+  && rec ok "testigo heredado sin la clave patches: unknown" \
+  || rec fail "testigo heredado mal leído: $(tree_patches_list "$SRC")"
+! tree_clean_reusable "$SRC" 7.2.8 vanilla \
+  && rec ok "testigo heredado: no se reutiliza sin poder probar que está limpio" \
+  || rec fail "un árbol de estado desconocido se reutilizó"
+SRC="$TMPFS_ROOT/linux-7.2.8-sinte"; mkdir -p "$SRC/kernel/sched"
+: > "$SRC/Makefile"; : > "$SRC/kernel/Makefile"
+[ "$(tree_patches_list "$SRC")" = "unknown" ] \
+  && rec ok "árbol sin testigo: unknown" \
+  || rec fail "árbol sin testigo mal leído: $(tree_patches_list "$SRC")"
+
+# El caso real: se aplica BORE y el árbol deja de ser limpio.
+SRC="$(_mktree 7.2.8 vanilla)"; VERSION=7.2.8; KERNEL_TREE=vanilla
+tree_record_patch bore
+[ "$(tree_patches_list "$SRC")" = "bore" ] \
+  && rec ok "tras aplicar bore, el testigo lo declara" \
+  || rec fail "bore no quedó registrado: $(tree_patches_list "$SRC")"
+! tree_clean_reusable "$SRC" 7.2.8 vanilla \
+  && rec ok "árbol parcheado con bore: NO se reutiliza como vanilla limpio" \
+  || rec fail "un vanilla con BORE se seguiría reutilizando: el fallo original"
+# La decisión es "no heredar un estado que este build no ha pedido", no "descartar
+# los árboles parcheados siempre". Que el árbol lleve BORE y el build ALSO Acabar
+# pidiendo BORE es un caso LEGÍTIMO; que no lo pida, no. El punto ciego era que,
+# hasta v27.31.54, el motor no miraba en absoluto este estado.
+
+# Idempotencia y acumulación, sin perder el resto del testigo.
+tree_record_patch bore
+[ "$(tree_patches_list "$SRC")" = "bore" ] \
+  && rec ok "registrar dos veces el mismo parche no lo duplica" \
+  || rec fail "parche duplicado: $(tree_patches_list "$SRC")"
+tree_record_patch pds
+[ "$(tree_patches_list "$SRC")" = "bore,pds" ] \
+  && rec ok "dos parches distintos se acumulan" \
+  || rec fail "acumulación incorrecta: $(tree_patches_list "$SRC")"
+if grep -qx "version=7.2.8" "$SRC/$TREE_META_NAME" \
+   && grep -qx "kind=vanilla" "$SRC/$TREE_META_NAME"; then
+  rec ok "reescribir patches= conserva version y kind del testigo"
+else
+  rec fail "reescribir patches= rompió el resto del testigo: $(tr '\n' ' ' < "$SRC/$TREE_META_NAME")"
+fi
+# Un testigo heredado al que se le registra un parche queda ya verificable.
+SRC="$(_mktree 7.2.8 vanilla legacy)"; tree_record_patch bore
+[ "$(tree_patches_list "$SRC")" = "bore" ] \
+  && rec ok "testigo heredado: al registrar un parche queda con estado conocido" \
+  || rec fail "no se pudo registrar sobre un testigo heredado: $(tree_patches_list "$SRC")"
+
+# El gancho de verdad: no basta con que tree_record_patch funcione, tiene que
+# estar LLAMADA desde apply_patch_register, que es por donde pasan los dos
+# caminos de éxito (parche recién aplicado y parche que ya venía del árbol
+# conservado). Si se desconecta, el registro sigue siendo correcto en las
+# pruebas unitarias y el fallo vuelve en producción, que es donde estaba.
+SRC="$(_mktree 7.2.8 vanilla)"
+unset PATCH_SYMBOLS
+PATCHES_APPLIED=(); PATCH_ENABLE_ALL=(); PATCH_REBEL_ALL=(); PATCH_VALUE_SYMBOLS=()
+apply_patch_register bore
+if [ "$(tree_patches_list "$SRC")" = "bore" ]; then
+  rec ok "apply_patch_register deja el árbol marcado como parcheado (gancho conectado)"
+else
+  rec fail "apply_patch_register NO registró el parche en el árbol: $(tree_patches_list "$SRC")"
+fi
+PATCHES_APPLIED=(); PATCH_ENABLE_ALL=(); PATCH_REBEL_ALL=(); PATCH_VALUE_SYMBOLS=()
+apply_patch_register foo
+if [ "$(tree_patches_list "$SRC")" = "bore,foo" ]; then
+  rec ok "varios parches registrados en orden"
+else
+  rec fail "acumulación por apply_patch_register: $(tree_patches_list "$SRC")"
+fi
+PATCHES_APPLIED=(); PATCH_ENABLE_ALL=(); PATCH_REBEL_ALL=(); PATCH_VALUE_SYMBOLS=()
+unset PATCH_SYMBOLS
+
+# El registro no puede fallar la build: sin árbol o sin testigo no se rompe nada.
+SRC="/nonexistent/arbol"; tree_record_patch bore \
+  && rec ok "registrar sin árbol no es un error" || rec fail "registrar sin árbol falló"
+SRC="$(_mktree 7.2.8 vanilla)"; rm -f "$SRC/$TREE_META_NAME"
+tree_record_patch bore \
+  && rec ok "registrar sin testigo no es un error" || rec fail "registrar sin testigo falló"
+
+# extract_tarball en el caso del fallo: un árbol vanilla con BORE encima NO se
+# reutiliza, se descarta y se vuelve a extraer, avisando del motivo real.
+#
+# Todo esto va en un subshell a propósito. extract_tarball arrastra make, tar y
+# source_tree_valid, y redefinirlas aquí las filtra a las secciones siguientes
+# (las de reconcile_tmpfs_trees, que vuelven a redefinir ok/warn/log pero no
+# findmnt/sudo): el síntoma es una cascada de fallos que no tienen nada que ver
+# con este cambio. El veredicto se escribe a fichero y se puntúa fuera.
+VEREDICTO="$ROOT/et.veredicto"; : > "$VEREDICTO"
+rm -rf "$TMPFS_ROOT"; mkdir -p "$TMPFS_ROOT"; : > "$MOUNTED_FLAG"
+VERSION=7.2.8; KERNEL_TREE=vanilla; TARBALL="$ROOT/linux-7.2.8.tar.xz"
+: > "$TARBALL"
+(
+  cleanup_old_source_trees() { :; }
+  make() { # el Makefile de pruebas responde la versión sin hacer nada real
+    local a; for a in "$@"; do
+      [ "$a" = kernelversion ] && { printf '7.2.8\n'; return 0; }
+    done; return 0
+  }
+  tar() { # simula la extracción: aparece el árbol limpio donde toca
+    local -a a=("$@") i cdir=""
+    for ((i = 0; i < ${#a[@]}; i++)); do
+      [ "${a[$i]}" = "-C" ] && cdir="${a[$((i + 1))]}"
+    done
+    mkdir -p "$cdir/linux-7.2.8/kernel/sched"
+    : > "$cdir/linux-7.2.8/Makefile"; : > "$cdir/linux-7.2.8/kernel/Makefile"
+    return 0
+  }
+  WARNS="$ROOT/et.warn"
+  warn() { printf 'WARN:%s\n' "$*" >> "$WARNS"; }
+  ok()  { printf 'OK:%s\n' "$*" >> "$WARNS"; }
+  log() { printf 'LOG:%s\n' "$*" >> "$WARNS"; }
+  err() { printf 'ERR:%s\n' "$*" >> "$WARNS"; }
+
+  # 1) El fallo original: vanilla con BORE encima.
+  : > "$WARNS"; rm -rf "$TMPFS_ROOT"; mkdir -p "$TMPFS_ROOT"
+  SRC="$(_mktree 7.2.8 vanilla bore)"
+  extract_tarball
+  if grep -q "conserva el parche bore de una ejecución anterior" "$WARNS" \
+     && ! grep -q "^OK:Reutilizando" "$WARNS" \
+     && ! grep -q "^ERR:" "$WARNS" \
+     && grep -qx "patches=none" "$SRC/$TREE_META_NAME"; then
+    echo "sucio ok" >> "$VEREDICTO"
+  else
+    echo "sucio fail $(tr '\n' ' ' < "$WARNS")" >> "$VEREDICTO"
+  fi
+
+  # 2) Un árbol limpio sí se reutiliza, sin volver a extraer.
+  : > "$WARNS"; rm -rf "$TMPFS_ROOT"; mkdir -p "$TMPFS_ROOT"
+  SRC="$(_mktree 7.2.8 vanilla)"
+  extract_tarball
+  if grep -q "^OK:Reutilizando" "$WARNS" && ! grep -q "^LOG:Extrayendo" "$WARNS"; then
+    echo "limpio ok" >> "$VEREDICTO"
+  else
+    echo "limpio fail $(tr '\n' ' ' < "$WARNS")" >> "$VEREDICTO"
+  fi
+
+  # 3) El estado desconocido (testigo heredado) también fuerza reextracción,
+  #    pero con su propio motivo en el aviso.
+  : > "$WARNS"; rm -rf "$TMPFS_ROOT"; mkdir -p "$TMPFS_ROOT"
+  SRC="$(_mktree 7.2.8 vanilla legacy)"
+  extract_tarball
+  if grep -q "no declara su estado de parches" "$WARNS" \
+     && ! grep -q "^OK:Reutilizando" "$WARNS" && ! grep -q "^ERR:" "$WARNS"; then
+    echo "desconocido ok" >> "$VEREDICTO"
+  else
+    echo "desconocido fail $(tr '\n' ' ' < "$WARNS")" >> "$VEREDICTO"
+  fi
+) 2>/dev/null
+# El veredicto viaja como "<caso> <ok|fail> [detalle]". El ok/fail va en su
+# propio campo a propósito: en un intento anterior el detalle iba pegado al
+# nombre ("sucio fail: ...") y el `read caso` se llevaba "sucio", que es
+# justamente el caso bueno, así que los cuatro escenarios se puntuaban como
+# correctos MIENTRAS el motor estaba mutado. Un arnés que no puede fallar no
+# prueba nada: por eso el token va separado.
+while read -r caso vered detalle; do
+  case "$caso" in
+    sucio)       d="extract_tarball descarta el vanilla con BORE, lo dice y vuelve a extraer limpio" ;;
+    limpio)      d="extract_tarball sigue reutilizando un árbol limpio" ;;
+    desconocido) d="extract_tarball no hereda un árbol de estado desconocido" ;;
+    *)           d="escenario inesperado '$caso'" ;;
+  esac
+  case "$vered" in
+    ok)   rec ok "$d" ;;
+    fail) rec fail "$d -> ${detalle:-sin detalle}" ;;
+    *)    rec fail "$d -> veredicto ilegible: '${vered:-vacio}'" ;;
+  esac
+done < "$VEREDICTO"
+# Si el subshellmurió antes de emitir veredictos, estos cuatro tests NO existen
+# y la sección entera pasa sin comprobar nada. Se cuenta lo que se esperaba.
+_esperados=3
+_emitidos="$(grep -c ' ok$' "$VEREDICTO" 2>/dev/null || echo 0)"
+_totales_v="$(grep -c '' "$VEREDICTO" 2>/dev/null || echo 0)"
+[ "$_totales_v" -eq "$_esperados" ] \
+  && rec ok "los $_esperados escenarios de extract_tarball emitieron veredicto (ninguno se coló sin comprobar)" \
+  || rec fail "solo emitieron $_totales_v de $_esperados veredictos: el subshell no llegó al final"
+# La puerta de get_tarball debe usar "reutilizable Y limpio": si el árbol se va a
+# descartar, extract_tarball necesitará $TARBALL y no puede saltarse la descarga.
+if grep -q 'if tree_clean_reusable "\$SRC" "\$VERSION" "\$KERNEL_TREE"; then' "$MOTOR"; then
+  rec ok "la descarga del tarball se exige también cuando el árbol está parcheado (hace falta para reextraer)"
+else
+  rec fail "la puerta de get_tarball no comprueba que el árbol esté limpio: se reextraería sin tarball"
+fi
+# Estado global de vuelta a como estaba, para las secciones siguientes.
+VERSION="$_SAVED_VERSION"; KERNEL_TREE="$_SAVED_TREE"; SRC="$_SAVED_SRC"
+TREE_FORCE_NOTE="$_SAVED_NOTE"
+unset _SAVED_VERSION _SAVED_TREE _SAVED_SRC _SAVED_NOTE VEREDICTO
 
 printf '%s\n' "== reconcile_tmpfs_trees: purga y desmontaje inteligente =="
 # El caso real del usuario: hay un vanilla 7.2.8 en el tmpfs y se va a

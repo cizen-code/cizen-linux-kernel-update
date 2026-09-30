@@ -1,3 +1,62 @@
+## [27.31.54] - 2026-09-30
+
+Un árbol de fuentes parcheado ya no se hereda como si fuera limpio. Lo cazó el
+usuario en una build de verdad.
+
+El síntoma era raro, la causa era de fondo: **la identidad de un árbol era solo
+`<versión>|<tipo>`**. Un vanilla 7.2.8 al que una ejecución anterior le aplicó
+BORE seguía siendo `<7.2.8>|vanilla`, así que la siguiente run lo reutilizaba sin
+mirar dentro. El resultado fue una build anunciada como *vanilla* que compilaba
+con BORE, y un símbolo en el resumen (`SCHED_BORE: y → n`) que no era el que
+esperaba: el resolvedor de nombres lo ofrecía como equivalente de `SCHED_BMQ`
+precisamente porque el residuo del parche lo hacía parecer presente en un árbol
+que no lo llevaba. El árbol reutilizado tenía 39 menciones de `CONFIG_SCHED_BORE`
+en `kernel/sched/fair.c`; el tarball firmado, 0.
+
+- **`patches=` en el testigo `.cizen-tree`**: `none` en un árbol recién extraído, o
+  la lista de los aplicados. Es el estado que faltaba.
+- **Un árbol con parches no se reutiliza como árbol limpio.** `extract_tarball` lo
+  descarta, lo dice nombrando el parche que sobra, y vuelve a extraer. El aviso
+  importa tanto como el descarte: un "se va a reextraer" genérico deja al usuario
+  sin saber por qué.
+- **"No se puede probar" no es "está limpio".** Un testigo heredado (sin la clave,
+  de versiones anteriores) o un árbol sin testigo dan `unknown` y **no** se
+  reutilizan. Cuesta una reextracción única, y a partir de ahí el árbol sale con
+  `patches=none`. Es el mismo criterio que el resto del motor: si no se puede
+  probar algo, no se da por bueno.
+- **La descarga del tarball se exige también con un árbol sucio.** Si se saltaba,
+  la reextracción se quedaría sin fichero del que tirar (o con el de otra versión
+  que hubiera en caché). `get_tarball` ahora exige *reutilizable **y** limpio*.
+- `apply_patch_register` es el punto donde queda anotado el parche, porque es por
+  donde pasan los **dos** caminos de éxito: el que acaba de aplicarlo y el que
+  encuentra el parche ya puesto en el árbol conservado. Anotarlo en
+  `apply_patch_plugin` habría dejado fuera el segundo.
+
+`tree_usable_for` **no** cambia: la consultan ocho sitios para saltar trabajo
+(márgenes de disco, evitar el tarball…) y un árbol ya parcheado en esta misma run
+es perfectamente válido ahí. Lo que no puede es heredarse a la siguiente. Por eso
+el filtro vive en `tree_clean_reusable`, en `extract_tarball`, que se llama **una
+sola vez por run** y antes de aplicar nada.
+
+Verificado: `bash -n` limpio, **0 errores en ShellCheck**, **513 ok, 0 fail** en
+selftest contra el motor del repo (20 tests nuevos). Los siete mutantes —cada
+parte del arreglo por separado— los detecta el banco.
+
+**Un fallo del propio banco, que es lo relevante de esta entrada.** Los tres
+escenarios de `extract_tarball` se puntúan desde un subshell que escribe
+veredictos a fichero, y el `while read` leía el primer campo para elegir la
+descripción. La rama de fallo escribía `sucio fail: …`, así que el primer campo
+era `sucio`: el mismo nombre que el escenario **correcto**. Los tres se puntuaban
+como buenos con el motor mutado, y dos de las siete mutaciones pasaban
+desapercibidas. Lo mismo con el estado global: la sección dejaba
+`VERSION=7.2.8`/`KERNEL_TREE=vanilla` y la de `reconcile_tmpfs_trees` no los
+reasigna en su primer test, así que invertía sus cinco expectativas. Ahora los
+veredictos llevan el `ok`/`fail` en su propio campo, los stubs van en subshell, y
+el estado global se guarda y se devuelve. Se añadió además un test que **cuenta
+los veredictos emitidos**: si el subshell muere antes de terminar, los escenarios
+dejan de existir y la sección pasa sin comprobar nada, que es la forma más
+silenciosa de tener un banco que no prueba.
+
 ## [27.31.53] - 2026-09-30
 
 PGO con perfil AutoFDO sale del internaje: era posible usarlo, pero había que

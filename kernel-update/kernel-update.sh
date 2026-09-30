@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.31.53 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.31.54 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / XFS / systemd / KVM-libvirt / QEMU-OVMF
 #
@@ -149,7 +149,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.53"
+SCRIPT_VERSION="27.31.54"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -3655,6 +3655,11 @@ write_tree_meta() {
   {
     printf 'version=%s\n' "${kver:-$VERSION}"
     printf 'kind=%s\n' "$kkind"
+    # Estado de parches del árbol: "none" en un árbol recién extraído, o la
+    # lista de los aplicados. Es lo que permite NO reutilizar como "limpio"
+    # un árbol que una ejecución anterior dejó parcheado (ver
+    # tree_patches_list).
+    printf 'patches=%s\n' "none"
     printf 'ts=%s\n' "$(date +%s)"
   } > "$dir/$TREE_META_NAME" 2>/dev/null || true
   # La identidad recién escrita es la definitiva: se siembra la caché para que
@@ -3662,25 +3667,133 @@ write_tree_meta() {
   TREE_IDENTITY["$dir"]="${kver:-$VERSION}|$kkind"
 }
 
+# v27.31.54: estado de parches que lleva un árbol, leído del testigo .cizen-tree.
+# Imprime la lista de parches aplicados separada por comas: VACÍO = el árbol es
+# limpio y se puede reutilizar tal cual; "unknown" = NO se puede probar que sea
+# limpio.
+#
+# Por qué existe: la identidad del árbol era solo "<versión>|<tipo>". Un árbol
+# vanilla al que una ejecución anterior le aplicó BORE seguía siendo
+# "<7.2.8>|vanilla", así que la siguiente run lo reutilizaba y la compilación
+# llevaba el parche sin que nadie lo dijera: se anunciaba "vanilla" y el menú
+# de configuración ofrecía en su lugar el símbolo SCHED_BORE. Lo que faltaba no
+# era la versión ni el tipo, era el ESTADO del árbol.
+#
+# "unknown" se trata como no limpio a propósito (mismo criterio que el resto del
+# motor: si no se puede probar algo, no se da por bueno). Cubre dos casos: los
+# árboles extraídos por versiones anteriores de la herramienta, que no
+# escribían esta clave, y los que no tienen testigo. Cuesta una reextracción
+# única, y a partir de ahí el árbol ya sale con patches=none.
+tree_patches_list() { # $1 = dir del árbol
+  local meta="$1/$TREE_META_NAME" _l pats="" found=false
+  if [ ! -f "$meta" ]; then
+    printf 'unknown'
+    return 0
+  fi
+  while IFS= read -r _l || [ -n "$_l" ]; do
+    case "$_l" in
+      patches=*)
+        found=true
+        pats="${_l#patches=}"
+        ;;
+    esac
+  done < "$meta" 2>/dev/null || true
+  unset _l
+  if [ "$found" = false ]; then
+    printf 'unknown'
+    return 0
+  fi
+  [ "$pats" = "none" ] && pats=""
+  printf '%s' "$pats"
+}
+
+# Un árbol está reutilizable SOLO si además de ser de la versión y el tipo
+# correctos se puede probar que está limpio. Se mantiene aparte de
+# tree_usable_for a propósito: esa la consultan ocho sitios para SALTAR trabajo
+# (márgenes de disco, évite el tarball…), y un árbol ya parcheado en ESTA misma
+# run es perfectamente válido ahí; lo que no vale es heredarlo a la siguiente.
+tree_clean_reusable() { # $1 = dir, $2 = versión, $3 = tipo
+  local patches
+  tree_usable_for "$1" "$2" "$3" || return 1
+  patches="$(tree_patches_list "$1")"
+  [ -z "$patches" ]
+}
+
+# Registra un parche aplicado en el testigo del árbol, para que una ejecución
+# posterior sepa que ese árbol ya no es limpio. Idempotente: registrar dos veces
+# el mismo parche no lo duplica. Se invoca desde apply_patch_register, que es el
+# punto por el que pasan los DOS caminos de éxito (parche recién aplicado y
+# parche que ya venía del árbol conservado).
+tree_record_patch() { # $1 = nombre del parche
+  local p="$1" cur _l meta
+  [ -n "$p" ] || return 0
+  # El registro es un extra: si no hay árbol o no hay testigo, se sale sin ruido
+  # (nunca debe tumbar una build por no poder anotar el estado).
+  [ -n "${SRC:-}" ] && [ -d "$SRC" ] || return 0
+  meta="$SRC/$TREE_META_NAME"
+  [ -f "$meta" ] && [ -w "$meta" ] || return 0
+  cur="$(tree_patches_list "$SRC")"
+  case "$cur" in
+    unknown) cur="" ;;  # testigo heredado: se le añade la clave
+  esac
+  if [ -z "$cur" ]; then
+    printf 'patches=%s\n' "$p" >> "$meta" 2>/dev/null || true
+    return 0
+  fi
+  # Idempotente: registrar dos veces el mismo parche no lo duplica. Se
+  # reescribe el testigo conservando TODAS las claves que no sean patches=, en
+  # su orden original (así no se depende de conocer las demás de antemano).
+  case ",$cur," in
+    *",$p,"*) return 0 ;;
+  esac
+  if {
+    while IFS= read -r _l || [ -n "$_l" ]; do
+      case "$_l" in patches=*) continue ;; esac
+      printf '%s\n' "$_l"
+    done < "$meta"
+    printf 'patches=%s\n' "$cur,$p"
+  } > "$meta.cizen" 2>/dev/null; then
+    mv -f "$meta.cizen" "$meta" 2>/dev/null || rm -f "$meta.cizen" 2>/dev/null
+  else
+    rm -f "$meta.cizen" 2>/dev/null
+  fi
+}
+
 extract_tarball() {
-  local _top extract_top kver
+  local _top extract_top kver _dirty=""
   cleanup_old_source_trees
 
   if source_tree_reusable; then
-    ok "Reutilizando el árbol de fuentes: $SRC ($VERSION, $KERNEL_TREE${TREE_FORCE_NOTE:+, $TREE_FORCE_NOTE})"
-    return 0
+    _dirty="$(tree_patches_list "$SRC")"
+    if [ -z "$_dirty" ]; then
+      ok "Reutilizando el árbol de fuentes: $SRC ($VERSION, $KERNEL_TREE${TREE_FORCE_NOTE:+, $TREE_FORCE_NOTE})"
+      return 0
+    fi
   fi
-
+  
   if source_tree_valid; then
-    # Red de seguridad: reconcile_tmpfs_trees ya habrá descartado este árbol
-    # antes del chequeo de espacio, pero si se llega aquí (p. ej. el árbol se
-    # creó entre medias) se descarta igualmente: reutilizar un árbol de otro
-    # tipo o de otra versión compilaría el kernel equivocado sin avisar.
-    kver="$(make -C "$SRC" -s kernelversion 2>/dev/null || true)"
-    if [ "$kver" = "$VERSION" ] || [[ "$kver" == "$VERSION"-* ]]; then
-      warn "El árbol conservado es $(source_tree_kind "$SRC") y este build compila $KERNEL_TREE${TREE_FORCE_NOTE:+ ($TREE_FORCE_NOTE)}; se descarta y se vuelve a extraer $VERSION."
+    if [ -n "$_dirty" ]; then
+      # v27.31.54: el árbol es de la versión y el tipo correctos, pero NO es
+      # un árbol limpio. Reutilizarlo compilaría con el parche de la ejecución
+      # anterior mientras el motor anuncia este build como "$KERNEL_TREE"
+      # limpio: se descartaría en silencio, que es justo el fallo que motivó
+      # este registro.
+      if [ "$_dirty" = "unknown" ]; then
+        warn "El árbol conservado de $VERSION no declara su estado de parches (lo extrajo una versión anterior de la herramienta); no se puede probar que esté limpio, así que se descarta y se vuelve a extraer $VERSION."
+      else
+        warn "El árbol conservado de $VERSION conserva el parche $_dirty de una ejecución anterior y este build compila sobre un árbol limpio; se descarta y se vuelve a extraer $VERSION."
+      fi
     else
-      warn "El árbol existente es ${kver:-?} y este build compila $VERSION; se descarta y se vuelve a extraer."
+      # Red de seguridad: reconcile_tmpfs_trees ya habrá descartado este árbol
+      # antes del chequeo de espacio, pero si se llega aquí (p. ej. el árbol se
+      # creó entre medias) se descarta igualmente: reutilizar un árbol de otro
+      # tipo o de otra versión compilaría el kernel equivocado sin avisar.
+      kver="$(make -C "$SRC" -s kernelversion 2>/dev/null || true)"
+      if [ "$kver" = "$VERSION" ] || [[ "$kver" == "$VERSION"-* ]]; then
+        warn "El árbol conservado es $(source_tree_kind "$SRC") y este build compila $KERNEL_TREE${TREE_FORCE_NOTE:+ ($TREE_FORCE_NOTE)}; se descarta y se vuelve a extraer $VERSION."
+      else
+        warn "El árbol existente es ${kver:-?} y este build compila $VERSION; se descarta y se vuelve a extraer."
+      fi
     fi
     rm -rf "$SRC"
   fi
@@ -3694,27 +3807,27 @@ extract_tarball() {
   # fork CachyOS/linux extrae cachyos-X.Y.Z-N. Si el árbol esperado no quedó
   # donde debe, se mueve el directorio extraído a $SRC.
   if ! source_tree_valid; then
-    _top="$(tar -tf "$TARBALL" 2>/dev/null | head -n1)"
-    extract_top="${_top%%/*}"
-    if [ -n "$extract_top" ] && [ "$extract_top" != "$(basename -- "$SRC")" ] \
-       && [ -d "$(dirname "$SRC")/$extract_top" ] \
-       && [ -f "$(dirname "$SRC")/$extract_top/Makefile" ]; then
-      log "Reubicando árbol extraído ($extract_top) a $SRC"
-      mv -- "$(dirname "$SRC")/$extract_top" "$SRC"
-    fi
+  _top="$(tar -tf "$TARBALL" 2>/dev/null | head -n1)"
+  extract_top="${_top%%/*}"
+  if [ -n "$extract_top" ] && [ "$extract_top" != "$(basename -- "$SRC")" ] \
+     && [ -d "$(dirname "$SRC")/$extract_top" ] \
+     && [ -f "$(dirname "$SRC")/$extract_top/Makefile" ]; then
+    log "Reubicando árbol extraído ($extract_top) a $SRC"
+    mv -- "$(dirname "$SRC")/$extract_top" "$SRC"
+  fi
   fi
 
   if ! source_tree_valid; then
-    err "Extracción incompleta: falta $SRC/Makefile"
-    rm -rf "$SRC"
-    return 1
+  err "Extracción incompleta: falta $SRC/Makefile"
+  rm -rf "$SRC"
+  return 1
   fi
 
   kver="$(make -C "$SRC" -s kernelversion 2>/dev/null || true)"
   if [ "$kver" != "$VERSION" ] && [[ "$kver" != "$VERSION"-* ]]; then
-    err "La versión del árbol extraído no coincide con $VERSION (obtenida: '${kver:-?}')"
-    rm -rf "$SRC"
-    return 1
+  err "La versión del árbol extraído no coincide con $VERSION (obtenida: '${kver:-?}')"
+  rm -rf "$SRC"
+  return 1
   fi
   write_tree_meta "$SRC" "$kver"
   rm -f "$TMPFS_ROOT/.cizen-extracting-$VERSION" 2>/dev/null || true
@@ -6273,6 +6386,13 @@ ALT_EOF
 apply_patch_register() {
   local p="$1" s _stype
   PATCHES_APPLIED+=("$p")
+  # v27.31.54: queda constancia en el testigo del árbol de que ya no es
+  # limpio. Se hace aquí, y no en apply_patch_plugin, porque este es el punto
+  # por el que pasan los DOS caminos de éxito (parche recién aplicado y parche
+  # que ya venía del árbol conservado). Sin esto, un árbol parcheado que una
+  # ejecución deja a medias vuelve a entrar en la siguiente como si fuera
+  # limpio.
+  tree_record_patch "$p"
   for s in "${PATCH_SYMBOLS[@]:-}"; do
     # v27.31.52: `continue` en el símbolo vacío, y no solo por higiene. El idioma
     # "${ARR[@]:-}" itera UNA vez con cadena vacía cuando el array está vacío, así
@@ -10407,8 +10527,14 @@ ok "tmpfs de compilación verificado (montaje + exec efectivo)"
 # seguro saltarlo: si el árbol se reutiliza, no se lee un solo byte del tarball,
 # así que no hay nada que verificar. extract_tarball lo exigirá en cuanto necesite
 # el fichero de verdad.
-if source_tree_reusable; then
-  info "Árbol de $VERSION ya presente y reutilizable: se omite la descarga y la verificación GPG del tarball."
+#
+# v27.31.54: la condición pasa a ser "reutilizable Y limpio". Si el árbol está
+# parcheado de una ejecución anterior, extract_tarball lo va a descartar y
+# reextraer, así que necesita $TARBALL: saltarse get_tarball aquí dejaría la
+# extracción sin fichero del que tirar, o peor, con el tarball de otra versión
+# que hubiera quedado en la caché.
+if tree_clean_reusable "$SRC" "$VERSION" "$KERNEL_TREE"; then
+  info "Árbol de $VERSION ya presente, reutilizable y limpio: se omite la descarga y la verificación GPG del tarball."
 else
   get_tarball "$TARBALL" "$URL" || fatal "No se pudo obtener un tarball válido."
 fi
