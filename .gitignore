@@ -11,7 +11,23 @@
 *.sign
 *.pkg.tar.zst
 build/
+
+# Configs sueltos: los linux-*.config que no son semilla Cizen (temporales de
+# menú, restos de pruebas) se ignoran aquí abajo.
 linux-*.config
+#
+# PERO la semilla Cizen sí se versiona. Antes (hasta v27.31.52) estaba toda la
+# línea ignorada, y eso era un error de criterio: promote_base_config escribe
+# CONFIG_DIR/linux-$VERSION-cizen-v3.config al final de cada build, y ese
+# fichero es la SEMILLA del siguiente (choose_base_config -> find_latest_cizen_
+# config). No era un artefacto desechable sino estado que se carrying-forward.
+# Con todo ignorado, un git clean -xfd o un clon nuevo lo perdía en silencio y
+# la siguiente build caía al fallback /proc/config.gz, o sea el config del
+# kernel arrancado y no el afinado: un kernel materialmente distinto, sin ningún
+# aviso de que se había perdido el ajuste.
+# Se versiona solo la semilla que genera el motor; el patrón es cerrado a
+# propósito (version + sufijo -cizen-v3) para no arrastrar configs de terceros.
+!kernel-update/profiles/linux-*-cizen-v3.config
 
 # Estado del notificador
 ~/.local/state/kernel-update/

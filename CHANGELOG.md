@@ -2,11 +2,14 @@
 
 Rendimiento y correctitud del motor. Todo lo que se toca aquí se verificó
 ejecutándolo, no solo leyendo: `bash -n` limpio, **0 hallazgos de nivel error en
-ShellCheck**, **459 ok, 0 fail** en selftest, y cuatro bancos de pruebas nuevos
-(índices Kconfig, contadores de ccache, selector de scope y manifiesto de
-rollback) que se quedan en `/tmp` porque replicar aquí su andamiaje no compensa.
-Dos sospechas que parecían grandes resultaron **falsas al medirlas** y no se
-tocaron: `compiler_check=content` de ccache (clang aquí es un driver de 178 KB,
+ShellCheck** (y dos menos que antes: `newsym` y `newstate`, ya sin uso), **467
+ok, 0 fail** en selftest contra el motor del repo, **466 ok, 0 fail** contra el
+instalado (la diferencia es el propio test de coherencia repo↔instalado, que solo
+corre apuntando al repo), y cuatro bancos de pruebas nuevos (índices Kconfig,
+contadores de ccache, selector de scope y manifiesto de rollback) que se quedan
+en `/tmp` porque replicar aquí su andamiaje no compensa. Dos sospechas que
+parecían grandes resultaron **falsas al medirlas** y no se tocaron:
+`compiler_check=content` de ccache (clang aquí es un driver de 178 KB,
 2.798 s vs 2.799 s) y la configuración de acierto de ccache (probada, acierta
 con normalidad).
 
@@ -61,6 +64,42 @@ todo el árbol de 40k ficheros. Los tres datos que consultaba en bucle (módulos
 cargados, `.config`, `EFF_DISABLE`) se leen ahora una vez y la pregunta "¿existe
 este símbolo en el Kconfig?" la responde el índice que ya está en memoria.
 
+### El self-test llevaba una versión por detrás, y por eso daba un falso positivo
+
+El fallo que abrió esta versión (`_stype: variable sin asignar`) **no era del
+motor**: era del arnés. `extract_fn` extrae del motor las funciones que cada test
+ejercita, de una lista escrita a mano, y la lista se quedó en la versión
+anterior. No incluía ninguna de las cinco que esta versión añadió
+(`kconfig_symbol_type_into`, `resolve_symbol_into`, `tree_identity_into`,
+`rollback_manifest_set_many`, `rollback_manifest_unset`).
+
+Hasta aquí el arnés se salvaba por accidente: el motor las llamaba dentro de
+`$( )`, y un subshell se traga el rc 127 de "orden no encontrada" y devuelve
+cadena vacía. Al pasarlas a llamada directa —el cambio que evita miles de
+subshells— el error aflora, y con `set -u` tumba el test entero. Encima faltaban
+las globales que esas leen (`KCONFIG_*`, `RENAME_MAP`, `RESOLVED_SYMBOL`,
+`TREE_IDENTITY`); esta última indexa por ruta, así que sin `declare -A` bash
+evalúa `/tmp/.../linux-7.2.7` como expresión aritmética y devuelve la identidad
+vacía.
+
+Dos bugs **reales** salieron a la luz al arreglar esto:
+
+- `for s in "${PATCH_SYMBOLS[@]:-}"` itera **una vez con cadena vacía** cuando el
+  array está vacío, así que un parche sin símbolos metía literalmente `""` en
+  `PATCH_ENABLE_ALL` y `PATCH_REBEL_ALL`. Era invisible porque
+  `"${PATCH_ENABLE_ALL[*]:-}"` devuelve `""` tanto para un array vacío como para
+  uno con un único elemento vacío. Ahora se salta con `continue`, con un test que
+  mira el **número** de elementos, que sí distingue los dos casos.
+- El test del flujo pedía `SCHED_BORE` y `MIN_BASE_SLICE_NS` los dos en
+  `ENABLE`, y pasaba **por el motivo equivocado**: el tipo salía vacío (el mismo
+  bug de arriba) y el `case` caía en la rama `""`. `min_base_slice_ns` es un int y
+  `"=y"` no le valdría — `olddefconfig` se lo revierte —, así que va a
+  `PATCH_VALUE_SYMBOLS`.
+
+También se portablearon del arnés instalado los cuatro tests de PGO, que vivían
+solo en `/usr/local/bin` y no en el repo: el rescate del store de vmlinux se
+había instalado sin una sola prueba que lo cubriera.
+
 ### Fallos reales, no solo lentitud
 
 - **`rollback_manifest_set_many` reventaba con un número impar de argumentos**:
@@ -88,6 +127,38 @@ este símbolo en el Kconfig?" la responde el índice que ya está en memoria.
   identidad en cada una; ahora decide una vez y reutiliza el veredicto.
 - `verify_build_tree` iba a por un quinto `make` sobre el mismo árbol; compara
   contra la versión que `extract_tarball` ya tenía resuelta.
+
+### La semilla de configuración estaba sin versionar, y no era un artefacto
+
+`.gitignore` traía `linux-*.config` desde hacía tiempo, y con razón aparente: el
+motor **escribe** `CONFIG_DIR/linux-$VERSION-cizen-v3.config` al terminar cada
+build (`promote_base_config`, y también en la salida de `--check`). Por eso
+parece una salida desechable.
+
+El detalle es que ese mismo fichero es la **entrada** del build siguiente:
+`choose_base_config` → `find_latest_cizen_config` elige la semilla de versión
+`<=` a la objetivo y la copia a `.config`. No es un artefacto, es estado que se
+arrastra hacia adelante. Con la línea entera ignorada, un `git clean -xfd` o un
+clon nuevo lo borraba **en silencio**, y la siguiente build caía al fallback
+`/proc/config.gz`: el config del kernel arrancado, no el afinado. El resultado es
+un kernel materialmente distinto, y lo único que aparecía en pantalla era un
+`warn` de "no se encontró configuración Cizen" que en una build no interactiva
+pasa desapercibido.
+
+Ahora la semilla **sí se versiona** (`.gitignore` mantiene `linux-*.config`
+para configs sueltos y añade una excepción cerrada a
+`kernel-update/profiles/linux-*-cizen-v3.config`, que es exactamente el patrón
+que genera el motor). Dos avisos sobre lo que esto implica:
+
+- Cada build reescribe el fichero de **su** versión, así que el árbol de trabajo
+  solo se marca sucio si el config deriva de verdad. No hay ruido por mtime.
+- El repo acumula una semilla por versión. Las viejas ya no sirven para nada
+  (`find_latest_cizen_config` solo acepta versión `<=` a la objetivo), así que se
+  pueden podar cuando molesten; conservar la última es lo habitual.
+
+Escaneados antes de publicarlos: sin rutas de home, sin IPs ni correos, sin
+claves. Lo único identificable es `CONFIG_DEFAULT_HOSTNAME="archlinux"`, que es
+el default de la distro, y `CONFIG_LOCALVERSION="-cizen-v3"`, que ya era público.
 
 ### Decisiones de alcance
 
