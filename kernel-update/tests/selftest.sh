@@ -129,6 +129,17 @@ extract_fn() { # $1 = nombre de función
   extract patch_markers_hit
   extract apply_patch_register
   extract apply_patch_plugin
+  # v27.31.52: las variantes SIN subshell que ahora llaman las funciones de
+  # arriba. No son opcionales: `apply_patch_register` llama a
+  # kconfig_symbol_type_into y `build_effective_arrays` a resolve_symbol_into de
+  # forma DIRECTA, así que si el arnés no las define el "orden no encontrada"
+  # aborta con `set -u` en vez de degradarse. Antes iban dentro de `$( )`, que se
+  # tragaba el 127 y devolvía vacío, y por eso nunca se notó que faltaban.
+  extract kconfig_symbol_type
+  extract kconfig_symbol_type_into
+  extract build_kconfig_indexes
+  extract resolve_symbol
+  extract resolve_symbol_into
   extract _sched_alt_rtmutex_futex_fixup
   extract add_unique
   extract build_effective_arrays
@@ -142,6 +153,7 @@ extract_fn() { # $1 = nombre de función
   extract source_tree_valid
   extract source_tree_kind
   extract tree_identity
+  extract tree_identity_into
   extract tmpfs_is_mounted
   extract tmpfs_umount_all
   extract auto_add_ntsync_patch
@@ -157,6 +169,12 @@ extract_fn() { # $1 = nombre de función
   extract installed_pkgver
   extract rollback_manifest_field
   extract rollback_manifest_set
+  # v27.31.52: preserve_rollback_package escribe las seis claves con
+  # rollback_manifest_set_many y desvincula el archive con rollback_manifest_unset.
+  # Sin estas dos, el "orden no encontrada" se tragaba el manifiesto entero y
+  # rollback_manifest_field devolvía "" para pkgfile y sched.
+  extract rollback_manifest_set_many
+  extract rollback_manifest_unset
   extract rollback_manifest_matches
   extract preserve_rollback_package
 } > "$ROOT/fns.sh"
@@ -177,6 +195,19 @@ BORE_ENABLED=false
 declare -a PATCHES_APPLIED=()
 declare -a PATCH_ENABLE_ALL=()
 declare -a PATCH_REBEL_ALL=()
+# v27.31.52: estado global que las variantes sin subshell leen directamente.
+# El motor lo declara con `declare -A`/`=false` al cargarse, pero aquí las
+# funciones se extraen a un fns.sh aparte, así que hay que declararlo a mano
+# (igual que BORE_ENABLED): con `set -u` leer una global no declarada es
+# "variable sin asignar" y tumba el arnés.
+declare -A KCONFIG_SYMBOL_KNOWN=() KCONFIG_SYMBOL_TYPE=()
+KCONFIG_TYPE_INDEX_BUILT=false
+KCONFIG_SYMBOL_INDEX_BUILT=false
+declare -A RENAME_MAP=() RESOLVED_SYMBOL=()
+# tree_identity_into indexa por RUTA, así que sin `declare -A` bash evalúa
+# "/tmp/.../linux-7.2.7" como expresión aritmética y falla con "error de
+# sintaxis aritmética", devolviendo identidad vacía.
+declare -A TREE_IDENTITY=()
 
 printf '%s\n' "== bore_branch_from_version =="
 [ "$(bore_branch_from_version 7.2.6)" = "7.2" ] && rec ok "7.2.6 -> 7.2" || rec fail "7.2.6 -> 7.2"
@@ -203,6 +234,37 @@ apply_patch_register bore
 [ "$BORE_ENABLED" = true ] && rec ok "register de 'bore' marca BORE_ENABLED" || rec fail "BORE_ENABLED tras bore"
 printf '%s\n' "    BORE_ENABLED=$BORE_ENABLED PATCHES_APPLIED=${PATCHES_APPLIED[*]:-}"
 
+# v27.31.52: regresión del símbolo vacío. El idioma "${PATCH_SYMBOLS[@]:-}" itera
+# UNA vez con cadena vacía cuando el array está vacío, así que apply_patch_register
+# terminaba metiendo "" en PATCH_ENABLE_ALL y PATCH_REBEL_ALL. Invisible desde
+# fuera porque "${PATCH_ENABLE_ALL[*]:-}" devuelve "" tanto para un array vacío
+# como para uno con un único elemento vacío: los dos dan la misma cadena.
+# Aquí se mira el NÚMERO de elementos, que sí distingue los dos casos.
+PATCHES_APPLIED=(); PATCH_ENABLE_ALL=(); PATCH_REBEL_ALL=(); PATCH_VALUE_SYMBOLS=()
+declare -a PATCH_SYMBOLS=()
+apply_patch_register bore
+[ "${#PATCH_ENABLE_ALL[@]}" -eq 0 ] && [ "${#PATCH_REBEL_ALL[@]}" -eq 0 ] \
+  && rec ok "register sin símbolos no mete entradas vacías (${#PATCH_ENABLE_ALL[@]}/${#PATCH_REBEL_ALL[@]})" \
+  || rec fail "register sin símbolos metió un elemento vacío: ENABLE=${#PATCH_ENABLE_ALL[@]} REBEL=${#PATCH_REBEL_ALL[@]}"
+
+# Y el camino con símbolos, que es donde el tipo decide a qué array va: un int
+# forzado a "=y" es un valor inválido y olddefconfig lo revierte, así que debe
+# caer en PATCH_VALUE_SYMBOLS y no en ENABLE/REBEL.
+kconfig_index_invalidate
+KCONFIG_SYMBOL_KNOWN=([SCHED_BORE]=1 [MIN_BASE_SLICE_NS]=1 [FAKE_BOOL]=1)
+KCONFIG_SYMBOL_TYPE=([SCHED_BORE]=bool [MIN_BASE_SLICE_NS]=int [FAKE_BOOL]=tristate)
+KCONFIG_SYMBOL_INDEX_BUILT=true; KCONFIG_TYPE_INDEX_BUILT=true
+PATCHES_APPLIED=(); PATCH_ENABLE_ALL=(); PATCH_REBEL_ALL=(); PATCH_VALUE_SYMBOLS=()
+PATCH_SYMBOLS=(SCHED_BORE MIN_BASE_SLICE_NS FAKE_BOOL)
+apply_patch_register bore
+[ "${PATCH_ENABLE_ALL[*]:-}" = "SCHED_BORE FAKE_BOOL" ] \
+  && rec ok "register reparte por tipo: los bool/tristate van a ENABLE (${PATCH_ENABLE_ALL[*]:-})" \
+  || rec fail "register no separó bool de int (ENABLE=${PATCH_ENABLE_ALL[*]:-}, VALUE=${PATCH_VALUE_SYMBOLS[*]:-})"
+[ "${PATCH_VALUE_SYMBOLS[*]:-}" = "MIN_BASE_SLICE_NS" ] \
+  && rec ok "register manda el int a VALUE, no a ENABLE (=y no valdría)" \
+  || rec fail "el int no fue a VALUE (VALUE=${PATCH_VALUE_SYMBOLS[*]:-})"
+kconfig_index_invalidate
+
 printf '%s\n' "== apply_patch_plugin: flujo completo (degrade cachy->upstream) =="
 PATCHES_APPLIED=()
 PATCH_ENABLE_ALL=()
@@ -218,13 +280,23 @@ printf 'BASURA-STALE\n' > "$KERNEL_BUILD_ROOT/bore-7.2.patch"
 if apply_patch_plugin bore; then
   rec ok "apply_patch_plugin devuelve 0 para bore (nto. cachy falla, upstream aplica)"
   [ "$BORE_ENABLED" = true ] && rec ok "BORE_ENABLED=true tras el flujo" || rec fail "BORE_ENABLED tras flujo"
+  # v27.31.52: el reparto por tipo ahora se aplica de verdad. Antes este test
+  # pedía los DOS símbolos en ENABLE y pasaba, pero solo porque el arnés no
+  # extraía kconfig_symbol_type_into: la llamada devolvía 127 dentro de `$( )`,
+  # el tipo salía vacío y el `case` polycayo en la rama `""`, que manda a ENABLE.
+  # Con el índice real, min_base_slice_ns es un int y "=y" no le valdría, así que
+  # va a PATCH_VALUE_SYMBOLS; SCHED_BORE (bool) sí va a ENABLE/REBEL.
   case " ${PATCH_ENABLE_ALL[*]:-} " in
-    *SCHED_BORE*MIN_BASE_SLICE_NS*) rec ok "SCHED_BORE y MIN_BASE_SLICE_NS en ENABLE" ;;
-    *) rec fail "símbolos BORE no registrados en ENABLE: [${PATCH_ENABLE_ALL[*]:-}]" ;;
+  *SCHED_BORE*) rec ok "SCHED_BORE (bool) registrado en ENABLE" ;;
+  *) rec fail "SCHED_BORE no registrado en ENABLE: [${PATCH_ENABLE_ALL[*]:-}]" ;;
   esac
   case " ${PATCH_REBEL_ALL[*]:-} " in
-    *SCHED_BORE*MIN_BASE_SLICE_NS*) rec ok "símbolos BORE rebeldes esperados" ;;
-    *) rec fail "símbolos BORE no en REBEL: [${PATCH_REBEL_ALL[*]:-}]" ;;
+  *SCHED_BORE*) rec ok "SCHED_BORE (bool) registrado en REBEL" ;;
+  *) rec fail "SCHED_BORE no registrado en REBEL: [${PATCH_REBEL_ALL[*]:-}]" ;;
+  esac
+  case " ${PATCH_VALUE_SYMBOLS[*]:-} " in
+  *MIN_BASE_SLICE_NS*) rec ok "MIN_BASE_SLICE_NS (int) va a VALUE, no a ENABLE (=y no valdría)" ;;
+  *) rec fail "MIN_BASE_SLICE_NS no fue a VALUE: [${PATCH_VALUE_SYMBOLS[*]:-}]" ;;
   esac
   stale_c="$(grep -c 'BASURA' "$KERNEL_BUILD_ROOT/bore-7.2.patch" 2>/dev/null || true)"
   [ "${stale_c:-1}" = "0" ] \
@@ -1652,12 +1724,11 @@ config MIN_BASE_SLICE_NS
 KCFG
   cat > "$ROOT/kfn.sh" <<'EXTRACT'
 SRC="$ROOT/src"
-build_kconfig_symbol_index() { :
-}
 EXTRACT
   : > "$ROOT/kfn.sh"
-  for f in kconfig_index_invalidate build_kconfig_symbol_index build_kconfig_type_index \
-           kconfig_symbol_type kconfig_symbol_known kconfig_auto_candidate; do
+  for f in kconfig_index_invalidate build_kconfig_indexes build_kconfig_symbol_index \
+           build_kconfig_type_index kconfig_symbol_type kconfig_symbol_known \
+           kconfig_auto_candidate; do
     sed -n "/^$f() {/,/^}/p" "$MOTOR" >> "$ROOT/kfn.sh"
   done
   cat > "$ROOT/kprobe.sh" <<'PROBE'
@@ -4499,6 +4570,42 @@ fi
   fi
   unset _RB _MB _UK
 }
+# --- v27.31.52: PGO puede cerrar su ciclo (vmlinux persistente) ---
+# El árbol de compilación está en un tmpfs que se desmonta al final del pipeline,
+# así que el vmlinux (imprescindible para llvm-profgen) se perdía siempre y
+# pgo-collect.sh solo podía abortar. Estas regresiones comprueban que el motor lo
+# archive en disco y que el colector lo encuentre ahí sin --vmlinux a mano.
+_VMLINUX_STORE_DEF='/var/cache/cizen-kernel/vmlinux'
+# El bloque de v27.31.45 hizo unset de PGO_ al terminar: se re-deriva aquí.
+PGO_="$(dirname "$MOTOR")/pgo-collect.sh"
+if grep -q 'archive_vmlinux' "$MOTOR" \
+   && grep -q 'VMLINUX_STORE="\${CIZEN_VMLINUX_STORE:-/var/cache/cizen-kernel/vmlinux}"' "$MOTOR" \
+   && grep -q 'prune_vmlinux_store' "$MOTOR"; then
+  rec ok "PGO: el motor archiva el vmlinux en un store persistente y lo poda"
+else
+  rec fail "PGO: falta archive_vmlinux/prune_vmlinux_store o el store por defecto en el motor"
+fi
+# La llamada tiene que ocurrir en el cuerpo del pipeline (no dentro de una función
+# sin invocar) y ANTES de la sincronización de UKI, que es donde ya se da por bueno
+# el build. Si se llamara solo al definir la función, el store quedaría vacío.
+if awk '/^archive_vmlinux$/{f=1} f&&/^log "Sincronizando UKI\.\.\."$/{u=1} END{exit !(f&&u)}' "$MOTOR"; then
+  rec ok "PGO: archive_vmlinux se invoca en el pipeline antes de sincronizar la UKI"
+else
+  rec fail "PGO: archive_vmlinux no se invoca antes de la sincronización de UKI"
+fi
+# El colector debe probar el store como fallback y explicar el flujo cuando no lo
+# encuentra, en vez de un mensaje seco que no menciona ni el tmpfs ni el rebuild.
+if grep -q 'VMLINUX_STORE="\${CIZEN_VMLINUX_STORE:-/var/cache/cizen-kernel/vmlinux}"' "$PGO_"; then
+  rec ok "PGO: pgo-collect.sh busca el vmlinux en el store persistente"
+else
+  rec fail "PGO: pgo-collect.sh no conoce el store de vmlinux"
+fi
+if grep -q 'tmpfs' "$PGO_" && grep -q 'kernel-update.sh build' "$PGO_"; then
+  rec ok "PGO: el fallo por vmlinux ausente explica el tmpfs y el rebuild que lo arregla"
+else
+  rec fail "PGO: el mensaje de vmlinux ausente no explica la causa (tmpfs) ni el remedy"
+fi
+unset _VMLINUX_STORE_DEF
 
 # --- resumen ---
 echo

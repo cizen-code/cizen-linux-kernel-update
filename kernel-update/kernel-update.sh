@@ -6239,12 +6239,22 @@ apply_patch_register() {
   local p="$1" s _stype
   PATCHES_APPLIED+=("$p")
   for s in "${PATCH_SYMBOLS[@]:-}"; do
+    # v27.31.52: `continue` en el símbolo vacío, y no solo por higiene. El idioma
+    # "${ARR[@]:-}" itera UNA vez con cadena vacía cuando el array está vacío, así
+    # que un parche sin símbolos metía literalmente "" en PATCH_ENABLE_ALL y
+    # PATCH_REBEL_ALL. Pasaba desapercibido porque el self-test solo miraba
+    # "${PATCH_ENABLE_ALL[*]:-}" ("" y un único elemento vacío dan la misma
+    # cadena) y porque la llamada iba dentro de `$( )`, que se tragaba el
+    # "kconfig_symbol_type: orden no encontrada" del arnés y devolvía vacío.
+    # Al pasar a la variante sin subshell, el error aflora y _stype nunca se
+    # asignaba: con `set -u` eso es "variable sin asignar" y tumba el self-test.
+    [ -n "$s" ] || continue
     # Solo los booleanos se fuerzan a =y. Un símbolo int/hex/string al que se le
     # pone "=y" no es un valor válido: olddefconfig lo revierte a su default y
     # el validador lo cuenta como activación no satisfecha para siempre.
-    # v27.31.52: kconfig_symbol_type_into, no "$(kconfig_symbol_type ...)": el
-    # $( ) es un subshell que se lleva el flag de memoización del índice, así
-    # que cada símbolo de PATCH_SYMBOLS reescanaba el árbol de 40k ficheros.
+    # kconfig_symbol_type_into, no "$(kconfig_symbol_type ...)": el $( ) es un
+    # subshell que se lleva el flag de memoización del índice, así que cada
+    # símbolo de PATCH_SYMBOLS reescanaba el árbol de 40k ficheros.
     kconfig_symbol_type_into "$s" _stype
     case "$_stype" in
       bool|tristate|"")
