@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.31.54 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.32.0 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / XFS / systemd / KVM-libvirt / QEMU-OVMF
 #
@@ -149,7 +149,28 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.54"
+# v27.32.0: auditoría de rendimiento en tres capas (Kconfig / arranque /
+# runtime). El cambio de arranque vive fuera de este script, en
+# /etc/kernel/cmdline, que es de donde prepare_cizen_cmdline_file() lo hereda
+# (si no existe, cae a /proc/cmdline). Concretamente:
+#   - preempt=full -> preempt=lazy. El kernel se compila con
+#     CONFIG_PREEMPT_DYNAMIC=y, así que el cmdline no la anula: la fija al modo
+#     más caro, donde además "las tareas ceden spinlocks en disputa". Se pagaba
+#     el coste entero de `full` sin obtener nada de `DYNAMIC`, y los caminos de
+#     spinlock/vmexit son justo los que peor toleratean, con KVM en uso.
+#     `lazy` conserva casi la latencia interactiva de `full` dejando un tick de
+#     HZ para que la tarea ceda por sí misma.
+#   - + retp=rethunk. El kernel en ejecución reportaba "spectre_v2: Mitigation:
+#     IBRS; IBPB: conditional; STIBP: disabled; RSB filling"; según el propio
+#     kernel (arch/x86/kernel/cpu/bugs.c) esa cadena significa IBRS o RSB
+#     filling, y el retorno por thunks sería la alternativa. Con
+#     CONFIG_MITIGATION_RETHUNK=y y clang 22.1.8 (-mfunction-return=
+#     thunk-extern) la mitigación equivalente es más barata.
+#   - Perfil v5.17.0: gobernador powersave -> performance, para que la config
+#     deje de describir un estado que el power-profiles-daemon sobrescribe y el
+#     fallback sin PPD no degrade a EPP 255.
+# No se toca el motor: la cmdline se hereda, no se genera.
+SCRIPT_VERSION="27.32.0"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo

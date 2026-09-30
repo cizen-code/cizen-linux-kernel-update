@@ -1,3 +1,58 @@
+## [27.32.0] - 2026-09-30
+
+Auditoría de rendimiento del host en tres capas, porque el cuello de botella
+puede estar en cualquiera de ellas y el perfil solo controla una.
+
+La conclusión de fondo es incómoda y conviene decirla primero: **la capa Kconfig
+estaba impeccable.** 61 `OPTS_ENABLE` respetados y **0** violaciones en los 449
+`OPTS_DISABLE`. Los tres `OPTS_ENABLE` que salen `=m` en vez de `=y`
+(`BT_HCIBTUSB`, `SND_HDA_CODEC_ALC269`, `SND_HDA_CODEC_HDMI_INTEL`) son
+equivalentes funcionalmente y los carga udev. Ese barrido se hizo extrayendo
+cada array del perfil por nombre, saltando los comentarios que viven **dentro**
+de los arrays, y comparando contra `/proc/config.gz` del kernel en ejecución, no
+contra la config del repo. Un parser que se desborda da cuatrocientas falsas
+entradas: conviene decirlo porque es el error fácil.
+
+Lo que sí estaba mal estaba en la capa de arranque.
+
+- **`preempt=full` anulaba `CONFIG_PREEMPT_DYNAMIC`.** El kernel se compila con
+  preempción dinámica, así que el cmdline no la cancela: la **fija** al modo más
+  caro, donde además *"tasks will also yield contended spinlocks"*. Se pagaba el
+  coste entero de `full` sin obtener nada de `DYNAMIC` — que entre otras cosas
+  permite cambiar de modo sin reiniciar. Y los caminos de spinlock y vmexit son
+  exactamente los que peor toleratean, en una máquina que además corre KVM.
+  Pasa a **`preempt=lazy`**: mantiene casi la latencia interactiva de `full`
+  dejando un tick de HZ para que la tarea ceda por sí misma, con mucho menos ruido
+  de preempción. Para escritorio + KVM es el punto que casi nadie prueba.
+- **`+ retp=rethunk`.** El kernel en ejecución reportaba
+  `spectre_v2: Mitigation: IBRS; IBPB: conditional; STIBP: disabled; RSB filling`.
+  Según el propio kernel (`arch/x86/kernel/cpu/bugs.c`), esa cadena significa IBRS
+  *o* RSB filling, y el retorno por thunks sería la alternativa. Con
+  `CONFIG_MITIGATION_RETHUNK=y` y clang 22.1.8 (`-mfunction-return=thunk-extern`)
+  la mitigación **equivalente** es más barata. No es prueba directa —`dmesg` no es
+  legible sin privilegios—, es una inferencia sólida, y queda como candidata a A/B.
+- **Gobernador `powersave` → `performance`** (perfil v5.17.0). Aquí hubo que
+  corregirse a uno mismo: la hipótesis inicial era que `powersave` anclaba la CPU
+  al P-state más bajo. **Es falsa.** El `power-profiles-daemon` de Arch está en
+  perfil `performance` y sobrescribe el EPP a `performance`; el host ya iba a
+  máximo. Lo que arregla el cambio no es rendimiento, es **fragilidad**: con
+  `powersave` compilado, si el PPD no arrancara —rescate, arranque mínimo, unidad
+  fallida— el sistema caía en silencio a EPP 255. Ahora config y realidad
+  coinciden y el fallback también es de máximo rendimiento.
+
+**Descartado explícitamente.** BORE con `NO_HZ_FULL` desactivado *parecía* un
+conflicto, así que se leyó `kernel/sched/bore.c`: BORE solo se condiciona a
+`CONFIG_SCHED_BORE`, sin dependencia dura de `NO_HZ_FULL`. No era un conflicto y
+`NO_HZ_FULL` sigue sin activarse. También se confirma que no hay problema en
+zram (16 GiB de zstd con **cero** uso, RAM al 56 %), en Btrfs
+(`noatime`/`compress=zstd:3`/`ssd`/`discard=async`/`space_cache=v2`), y que las
+mitigaciones ya están en su variante **barata**: IBRS con `IBPB: conditional` y
+`STIBP: disabled`.
+
+El cambio de cmdline vive en `/etc/kernel/cmdline`, no en este script:
+`prepare_cizen_cmdline_file()` lo **hereda** (y cae a `/proc/cmdline` si no
+existe), así que no hay nada que generar aquí.
+
 ## [27.31.54] - 2026-09-30
 
 Un árbol de fuentes parcheado ya no se hereda como si fuera limpio. Lo cazó el
