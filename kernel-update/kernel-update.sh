@@ -10922,6 +10922,16 @@ pgo_pick_profile() {
 # compilador. No es opcional: pasar CLANG_AUTOFDO_PROFILE enciende
 # CONFIG_AUTOFDO_CLANG en el .config, así que sin revalidar, los símbolos nuevos
 # se colarían sin pasar por la auditoría ni por la validación.
+# Sufijo para los mensajes, según se haya quedado el PGO. COMPARA CONTRA 1, a
+# propósito, y no con ${PGO_CHANGED:+ …}: el modificador :+ mira si la variable
+# está vacía, y PGO_CHANGED vale "0" cuando no hubo cambio — que no está vacío,
+# así que la línea anunciaba "+ PGO" en TODAS las compilaciones, PGO o no. Un
+# resumen que miente sobre lo que lleva la build es peor que no resumir: aquí
+# ocurrió de verdad y se vio en pantalla.
+pgo_disp_suffix() {
+  [ "${PGO_CHANGED:-0}" = 1 ] && printf ' + PGO' || printf ''
+}
+
 ask_build_pgo() {
   PGO_CHANGED=0
 
@@ -11050,9 +11060,9 @@ ask_build_prefs() {
   if [ -n "$VARIANT_CHOICE" ] || [ "$cc_changed" = 1 ] || [ "$PGO_CHANGED" = 1 ]; then
     local why="el scheduler ${PATCH_DISP_NAME:-$VARIANT_CHOICE} y el compilador $CC_LAUNCHER"
     [ -n "$VARIANT_CHOICE" ] || why="el compilador $CC_LAUNCHER"
-    [ "$PGO_CHANGED" = 1 ] && why="$why + PGO"
+    why="$why$(pgo_disp_suffix)"
     if revalidate_config_chain "$why"; then
-      ok "Configuración lista para compilar con ${VARIANT_CHOICE:-eevdf} + $CC_LAUNCHER${PGO_CHANGED:+ + PGO}."
+      ok "Configuración lista para compilar con ${VARIANT_CHOICE:-eevdf} + $CC_LAUNCHER$(pgo_disp_suffix)."
     else
       fatal "La configuración no quedó lista con lo elegido (${why}); no se empieza a compilar."
     fi

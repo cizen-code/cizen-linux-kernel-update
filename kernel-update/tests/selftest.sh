@@ -1649,6 +1649,7 @@ PREFS
   extract_fn pgo_profile_dir  >> "$ROOT/pgo.sh"
   extract_fn pgo_list_profiles >> "$ROOT/pgo.sh"
   extract_fn pgo_pick_profile >> "$ROOT/pgo.sh"
+  extract_fn pgo_disp_suffix  >> "$ROOT/pgo.sh"
   extract_fn ask_build_pgo    >> "$ROOT/pgo.sh"
   # Sin perfiles: se dice cómo tener uno y se sigue sin PGO. Un menú que
   # ofrece PGO cuando no hay nada que usar solo enseña aSay "sí" y luego
@@ -1793,6 +1794,28 @@ PGORUN
     rec ok "motor: sin perfil de la versión exacta, PGO ofrece el más reciente"
   else
     rec fail "motor: sin perfil de la versión exacta, PGO se queda sin nada ('$ui_pgo_fallback')"
+  fi
+  # El sufijo del resumen. Con PGO_CHANGED=0 debe ser VACÍO. Antes el mensaje
+  # usaba ${PGO_CHANGED:+ + PGO}, y :+ pregunta por "vacío", no por "distinto
+  # de 1": el 0 no está vacío, así que TODAS las compilaciones anunciaban
+  # "+ PGO". Se vio en una build real sin ningún perfil. Es la clase de fallo
+  # másníkmolesta que hay: la build es correcta y el resumen miente.
+  # Las funciones de PGO viven en el fichero extraído, que se sourcea dentro
+  # del subbanco; para medirlas aquí hace falta un shell que las cargue.
+  pgo_suf() { ROOT_FNS="$ROOT/pgo.sh"; export ROOT_FNS
+              bash -c 'source "$ROOT_FNS"; PGO_CHANGED="$1"; pgo_disp_suffix' _ "$1" 2>/dev/null; }
+  suf0="$(pgo_suf 0)"; suf1="$(pgo_suf 1)"
+  if [ -z "$suf0" ] && [ "$suf1" = ' + PGO' ]; then
+    rec ok "motor: el resumen dice «+ PGO» solo si el PGO se Activó de verdad"
+  else
+    rec fail "motor: el resumen miente sobre el PGO (0→'$suf0', 1→'$suf1')"
+  fi
+  # Y que las dos líneas que lo usan no usen la forma peligrosa.
+  if printf '%s' "$prefs_block" | grep -qF '$(pgo_disp_suffix).' \
+     && ! printf '%s' "$prefs_block" | grep -qF '${PGO_CHANGED:+'; then
+    rec ok "motor: el resumen de la build usa el sufijo, no ${VAR:+}"
+  else
+    rec fail "motor: el resumen vuelve al idioma peligroso ${PGO_CHANGED:+}"
   fi
   # La pantalla tiene que explicar QUÉ se está eligiendo, no solo listar: una
   # lista de nombres de fichero sin encabezado no dice qué es PGO ni qué hace

@@ -27,7 +27,15 @@ pregunta más, y una pregunta **propia**.
   y la build no llegaba a compilar. Ahora usa las variantes `_into`. Este fix no
   tenía entrada propia y por eso aparece aquí.
 
-Verificado: `bash -n` limpio, **0 errores en ShellCheck**, **490 ok, 0 fail** en
+**Un fix de una línea que salió en una build real**: el resumen
+`Configuración lista para compilar con … + PGO.` anunciaba **+ PGO en todas las
+compilaciones**, PGO o no, porque usaba `${PGO_CHANGED:+ + PGO}` y el
+modificador `:+` pregunta por "vacío", no por "distinto de 1" — y `0` no está
+vacío. La build era correcta; el resumen mentía. Lo delata el usuario en una
+build sin ningún perfil. Sustituido por `pgo_disp_suffix()`, que **compara
+contra 1** y además es testeable por separado.
+
+Verificado: `bash -n` limpio, **0 errores en ShellCheck**, **493 ok, 0 fail** en
 selftest contra el motor del repo. Los 17 tests nuevos de PGO se comprobaron por
 mutación (14 mutantes, uno por cosa que podría romperse en silencio: el `Enter`
 que se ignoraba, el guard de clang, la inyección en Kconfig, la revalidación, la
