@@ -11473,6 +11473,84 @@ module_sign_installed() {
   return 0
 }
 
+# v27.31.52: bloque rescatado de la copia INSTALADA (/usr/local/bin), que iba
+# 77 líneas por delante del repo y se había perdido en ningún commit (el mismo
+# patrón que el rescate de verify.sh en 607e099). Único ajuste: el
+# `make -C "$SRC" -s kernelrelease` de archive_vmlinux usaba el helper
+# memoizado kernel_release() que introduce esta versión, así que ya no es un
+# cuarto make sobre el árbol.
+#
+# --- archivo persistente del vmlinux (necesario para PGO) --------------------
+# El árbol de compilación vive en un tmpfs que se DESMONTA al final del pipeline
+# (unmount_tmpfs_build, y además /tmp no sobrevive a un reinicio), de modo que el
+# vmlinux —el ELF con símbolos que llvm-profgen necesita para convertir el
+# perf.data en un .afdo— se perdía siempre. Por eso pgo-collect.sh no encontraba
+# nunca nada y el ciclo de PGO era imposible de cerrar.
+#
+# Aquí se copia el vmlinux (y, si existe, vmlinux.unstripped) a un store en disco
+# indexado por kernelrelease, que es lo que pgo-collect.sh busca como fallback.
+# Se poda dejando solo las versiones más recientes: cada vmlinux ocupa cientos de
+# MB a ~1 GB, así que guardarlos todos no es una opción.
+VMLINUX_STORE="${CIZEN_VMLINUX_STORE:-/var/cache/cizen-kernel/vmlinux}"
+VMLINUX_STORE_KEEP="${CIZEN_VMLINUX_STORE_KEEP:-2}"
+
+archive_vmlinux() {
+  [ -f "$SRC/vmlinux" ] || [ -f "$SRC/vmlinux.unstripped" ] || {
+    warn "PGO: el build no dejó vmlinux en el árbol; no se archiva (pgo-collect.sh no podrá colectar)."
+    return 0
+  }
+  local rel dst src f n=0
+  rel="$(kernel_release)"
+  dst="$VMLINUX_STORE/$rel"
+  if ! sudo mkdir -p "$dst"; then
+    warn "PGO: no se pudo crear $dst; el vmlinux se perderá al desmontar el tmpfs."
+    return 0
+  fi
+  # Se escribe a .tmp y se renombra: si el build se interrumpe no queda un
+  # vmlinux truncado que pgo-collect.sh daría por bueno.
+  for src in vmlinux vmlinux.unstripped; do
+    [ -f "$SRC/$src" ] || continue
+    if sudo cp -f "$SRC/$src" "$dst/$src.tmp" 2>/dev/null \
+       && sudo mv -f "$dst/$src.tmp" "$dst/$src" 2>/dev/null; then
+      n=$((n + 1))
+    else
+      warn "PGO: no se pudo archivar $src en $dst."
+      sudo rm -f "$dst/$src.tmp" 2>/dev/null || true
+    fi
+  done
+  if [ "$n" -gt 0 ]; then
+    sudo sh -c 'printf "%s %s\n" "'"$rel"'" "$(date -Is)" > "'"$dst"'.meta"' 2>/dev/null || true
+    ok "PGO: vmlinux archivado en $dst (para  sudo pgo-collect.sh --duration 900)."
+  fi
+  prune_vmlinux_store
+  return 0
+}
+
+# Poda del store: conserva solo las VMLINUX_STORE_KEEP versiones más nuevas.
+prune_vmlinux_store() {
+  [ -d "$VMLINUX_STORE" ] || return 0
+  shopt -s nullglob
+  local d base keep="$VMLINUX_STORE_KEEP"
+  local -a dirs=()
+  for d in "$VMLINUX_STORE"/*/; do
+    [ -f "$d/vmlinux" ] || [ -f "$d/vmlinux.unstripped" ] || continue
+    dirs+=("${d%/}")
+  done
+  shopt -u nullglob
+  [ "${#dirs[@]}" -le "$keep" ] && return 0
+  # dirs[] viene del glob, que ordena alfabéticamente; las versiones no ordenan
+  # bien así, así que se ordena por mtime (más reciente primero) y se corta.
+  local -a ordered=()
+  local d2
+  for d2 in "${dirs[@]}"; do ordered+=("$(stat -c %Y "$d2") $d2"); done
+  while IFS= read -r line; do
+    d="${line#* }"
+    base="$(basename -- "$d")"
+    sudo rm -rf -- "$d" && log "PGO: vmlinux archivado eliminado (fuera de los $keep más recientes): $base"
+  done < <(printf '%s\n' "${ordered[@]}" | sort -rn | tail -n "+$((keep + 1))")
+  return 0
+}
+
 # v27.30.0: auditoría de disco cifrado (LUKS2) para advertir de cmdline sin
 # parámetros de desbloqueo antes de regenerar el UKI.
 luks_fde_audit() {
@@ -11544,6 +11622,11 @@ esac
 
 # Firma persistente de módulos con MOK propia (feature Arch-SKM).
 module_sign_installed
+
+# Archivo del vmlinux para PGO. Va ANTES del desmontaje del tmpfs (que ocurre al
+# salir, en el trap EXIT) y antes de la firma del build: si el archivado falla, el
+# verificador post-boot no debe ver un build "completo" sin vmlinux recuperable.
+archive_vmlinux
 
 log "Sincronizando UKI..."
 declare -a UKI_SYNC_ARGS=()

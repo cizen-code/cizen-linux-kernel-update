@@ -24,14 +24,20 @@
 #   sudo kernel-update/pgo-collect.sh [--duration N] [--vmlinux RUTA] [--out FICH]
 #
 #   --duration N   segundos de muestreo (default 600)
-#   --vmlinux RUTA vmlinux del kernel Cizen que quieres perfil-optimizar
-#                  (default: /lib/modules/<uname -r>/build/vmlinux si existe)
+#   --vmlinux RUTA vmlinux del kernel Cizen que quieres perfil-optimizar.
+#                  Si se omite se busca, en orden: /lib/modules/<uname -r>/build/vmlinux,
+#                  $CIZEN_VMLINUX_STORE/<uname -r>/vmlinux y .../vmlinux.unstripped.
+#                  El kernel-update.sh actual guarda una copia persistente del vmlinux
+#                  de cada build en ese store (default /var/cache/cizen-kernel/vmlinux),
+#                  porque el árbol de compilación vive en un tmpfs que se desmonta.
 #   --out FICH     fichero .afdo de salida (default $HOME/kernel-pgo/<kver>.afdo)
 #
 # Variables de entorno:
 #   CIZEN_PGO_DURATION  igual que --duration
 #   CIZEN_PGO_VMLINUX   igual que --vmlinux
 #   CIZEN_PGO_OUT       igual que --out
+#   CIZEN_VMLINUX_STORE store de vmlinux persistentes que deja kernel-update.sh
+#                       (default /var/cache/cizen-kernel/vmlinux)
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -82,8 +88,32 @@ done
 command -v perf >/dev/null 2>&1 || fatal "No está 'perf' (sudo pacman -S perf) — herramienta de muestreo."
 
 KVER="$(uname -r)"
-[ -n "$VMLINUX" ] || { [ -f "/lib/modules/$KVER/build/vmlinux" ] && VMLINUX="/lib/modules/$KVER/build/vmlinux" || true; }
-[ -n "$VMLINUX" ] || fatal "No encuentro el vmlinux del kernel Cizen: usa --vmlinux (default: /lib/modules/$KVER/build/vmlinux)."
+
+# Búsqueda del vmlinux (ver pgo-collect: el kernel se compila en un tmpfs que se
+# desmonta al terminar el pipeline, así que el vmlinux SOLO existe como copia
+# persistente en $VMLINUX_STORE; el enlace /lib/modules/<kver>/build no se crea).
+VMLINUX_STORE="${CIZEN_VMLINUX_STORE:-/var/cache/cizen-kernel/vmlinux}"
+if [ -z "$VMLINUX" ]; then
+  for cand in "/lib/modules/$KVER/build/vmlinux" \
+              "$VMLINUX_STORE/$KVER/vmlinux" \
+              "$VMLINUX_STORE/$KVER/vmlinux.unstripped"; do
+    if [ -f "$cand" ]; then VMLINUX="$cand"; break; fi
+  done
+fi
+if [ -z "$VMLINUX" ]; then
+  fatal "No encuentro el vmlinux de '$KVER'.
+  El kernel se compila en un tmpfs que se desmonta tras el build, así que no queda
+  vmlinux en disco salvo en la copia persistente que crea kernel-update.sh.
+  Qué hacer:
+    - ¿Ya hiciste un build con este motor? Reconstruye una vez (el archivado ocurre
+      al final del pipeline) y vuelve a intentar:
+          sudo /usr/local/bin/kernel-update/kernel-update.sh build
+    - ¿El build fue anterior a este cambio? Pasa la ruta a mano si aún conservas el
+      árbol de compilación (con CIZEN_KEEP_TMPFS=1 no se desmonta):
+          sudo $0 --duration $DURATION --vmlinux /ruta/al/vmlinux
+    - La búsqueda por defecto es: /lib/modules/$KVER/build/vmlinux y
+      $VMLINUX_STORE/$KVER/vmlinux (configurable con CIZEN_VMLINUX_STORE)."
+fi
 [ -f "$VMLINUX" ] || fatal "vmlinux no existe: $VMLINUX"
 
 OUT="${OUT:-$HOME/kernel-pgo/$KVER.afdo}"
