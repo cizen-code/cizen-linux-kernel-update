@@ -4607,6 +4607,34 @@ else
 fi
 unset _VMLINUX_STORE_DEF
 
+# --- contrato wrapper/_into (v27.31.52) ---
+# resolve_symbol, config_symbol_state, kconfig_symbol_type y tree_identity son
+# ENVOLTES: imprimen por stdout y toman UN argumento. Sus gemelas _into toman
+# DOS y asignan con `printf -v`, sin subshell. La v27.31.52 convirtió los call
+# sites de los perfiles a las variantes _into (para no abrir miles de forks) y
+# en uno se coló la forma WRONG: `resolve_symbol "$sym" resolved` en
+# verify_build_tree. El segundo argumento se ignora, nada se asigna a `resolved`
+# y el valor sale por stdout, así que la línea siguiente leía una variable sin
+# asignar: "resolved: unbound variable" YA EN LA VALIDACIÓN de una build real,
+# con el árbol extraído y el tmpfs montado. El self-test no lo veía porque
+# verify_build_tree no está en la lista de funciones extraídas.
+#
+# Este chequeo es estático a propósito: es barato y cubre toda la suite, no solo
+# las funciones que el arnés extrae. Un wrapper con dos argumentos es siempre un
+# error, porque su segundo parámetro no existe.
+printf '%s\n' "== contrato wrapper/_into: ningún envuelto con dos argumentos =="
+for _w in resolve_symbol config_symbol_state kconfig_symbol_type tree_identity; do
+  _mal="$(grep -nE "^[[:space:]]*${_w}[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+" "$MOTOR" \
+          | grep -vE ":[0-9]+:[[:space:]]*#" || true)"
+  if [ -z "$_mal" ]; then
+    rec ok "$_w: sin llamadas de dos argumentos (imprime por stdout, un solo arg)"
+  else
+    rec fail "$_w: llamada(s) con dos argumentos, el segundo se ignora en silencio -> $(printf '%s' "$_mal" | tr '\n' ' ')"
+  fi
+  unset _mal
+done
+unset _w
+
 # --- resumen ---
 echo
 printf 'Totales: %d ok, %d fail\n' "$PASS" "$FAIL"

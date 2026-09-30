@@ -7391,8 +7391,15 @@ verify_build_tree() {
   local -a boot_critical=(X86_NATIVE_CPU BTRFS_FS DRM_I915 KVM_SMM)
   local sym resolved state
   for sym in "${boot_critical[@]}"; do
-    resolve_symbol "$sym" resolved          # sin $(): el subshell perdía caches
-    config_symbol_state "$resolved" state
+    # v27.31.52: las variantes _into, NO resolve_symbol/config_symbol_state.
+    # Esas dos son envueltes que IMPRIMEN por stdout: `resolve_symbol "$sym"
+    # resolved` no asignaba nada a `resolved` (el segundo argumento se ignora) y
+    # devolvía el valor por stdout, así que la línea siguiente leía una variable
+    # sin asignar y la build moría con "resolved: unbound variable" ya en la
+    # validación, con el árbol extraído y el tmpfs montado. La de $state
+    # después: mismo error, dos variables distintas.
+    resolve_symbol_into "$sym" resolved
+    config_symbol_state_into "$resolved" state
     if [ "$state" != y ]; then
       fatal "Falta CONFIG_${resolved}=y (crítico para el arranque sin initramfs de este equipo; estado actual: $state)"
     fi
