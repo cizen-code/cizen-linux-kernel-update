@@ -1,3 +1,42 @@
+## [27.31.53] - 2026-09-30
+
+PGO con perfil AutoFDO sale del internaje: era posible usarlo, pero había que
+saber la variable de entorno y el fichero, y en el menú no existía. Ahora es una
+pregunta más, y una pregunta **propia**.
+
+- **Opción 18 en el menú** (`pgo`) y pregunta de PGO al final de *cualquier*
+  compilación, junto a scheduler y compilador. Antes solo se preguntaban esos
+  dos, porque PGO no se preguntaba en ningún sitio. Es independiente: vale
+  igual con Vanilla que con BORE, con ntsync que con cachy.
+- La pregunta **lista los perfiles que hay** con el de tu versión marcado, en vez
+  de dar un sí/no a ciegas. `Enter` se lleva el recomendado; `n` pasa; un número
+  o una ruta eligen otro. Sin ningún `.afdo` explica cómo conseguir uno en vez de
+  fingir que se puede.
+- `--pgo [ruta.afdo]`, `--no-pgo` y `CIZEN_PGO_PROFILE` conviven. `--pgo` a secas
+  busca solo el perfil de la versión objetivo, que es lo que quiere la opción 18.
+- **Exige clang y lo dice.** AutoFDO es de LLVM y `CONFIG_AUTOFDO_CLANG` no
+  existe con GCC. Con GCC la pregunta no sale y se avisa de por qué, en vez de
+  compilar con un perfil que no se está aplicando. `--pgo` + GCC sigue siendo un
+  error de arranque, como ya era.
+- El perfil elegido entra en `KCONFIG_CC_OPTS` y **dispara la revalidación** de
+  la config, igual que el compilador. Sin eso, `CONFIG_AUTOFDO_CLANG` se
+  encendería a medias, sin pasar por la auditoría ni la validación: es el mismo
+  fallo que motivó `resolve_symbol_into`, y por el mismo motivo de fondo.
+- `verify_build_tree` usaba `resolve_symbol`/`config_symbol_state` en subshell,
+  que devuelven por stdout: con `set -u` petaba con `resolved: unbound variable`
+  y la build no llegaba a compilar. Ahora usa las variantes `_into`. Este fix no
+  tenía entrada propia y por eso aparece aquí.
+
+Verificado: `bash -n` limpio, **0 errores en ShellCheck**, **490 ok, 0 fail** en
+selftest contra el motor del repo. Los 17 tests nuevos de PGO se comprobaron por
+mutación (14 mutantes, uno por cosa que podría romperse en silencio: el `Enter`
+que se ignoraba, el guard de clang, la inyección en Kconfig, la revalidación, la
+opción 18, el rango del menú, los flags fuera del parser, la lista que no se
+imprime, la ruta inexistente aceptada). Cinco de ellos pasaron al primer intento
+porque grepeaban en todo el motor, donde la misma cadena ya existía por la vía
+temprana; se acotaron al bloque `ask_build_prefs`. El `Enter` prometía el perfil
+marcado y lo ignoraba: ese bug lo encontró el banco, no el test.
+
 ## [27.31.52] - 2026-09-30
 
 Rendimiento y correctitud del motor. Todo lo que se toca aquí se verificó

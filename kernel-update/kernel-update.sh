@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.31.52 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.31.53 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / XFS / systemd / KVM-libvirt / QEMU-OVMF
 #
@@ -47,6 +47,19 @@
 #     preguntará antes de compilar si absorberlas a EXPECTED_REBELS (v27.25.1).
 #     --absorb-rebels lo hace siempre de forma incondicional.
 #   ./kernel-update.sh <versión> --force
+#   ./kernel-update.sh <versión> --pgo [fichero.afdo]
+#   ./kernel-update.sh <versión> --no-pgo
+#     PGO con perfil AutoFDO de llvm-profgen (pipeline de docs.kernel.org/
+#     dev-tools/autofdo.html). Es una decisión INDEPENDIENTE de parche, scheduler
+#     y compilador: sin flag, el motor la pregunta al final, junto a la variante
+#     y el compilador, bajo cualquier combinación de las tres. --pgo a secas
+#     busca el mejor .afdo de $CIZEN_PGO_DIR (default ~/kernel-pgo) para la
+#     versión objetivo; con fichero, usa ese. Los perfiles los genera
+#     `sudo pgo-collect.sh --duration 900`, que busca solo el vmlinux archivado
+#     por el propio motor (/var/cache/cizen-kernel/vmlinux/<kernelrelease>), así
+#     que no hay que pasárselo a mano. Exige clang: AutoFDO es de LLVM y
+#     CONFIG_AUTOFDO_CLANG no existe con GCC; con --pgo y gcc el motor lo dice y
+#     se queda sin PGO en vez de compilar sin querer. --no-pgo lo desactiva.
 #   ./kernel-update.sh <versión> --keep-src
 #   ./kernel-update.sh <versión> --no-prune                  # sin poda de módulos
 #   El modo lite es el ÚNICO modo de compilación (v27.25.4): la config siempre
@@ -136,7 +149,7 @@ IFS=$'\n\t'
 # Salida de herramientas predecible para validaciones y logs.
 export LC_ALL=C
 
-SCRIPT_VERSION="27.31.52"
+SCRIPT_VERSION="27.31.53"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -237,6 +250,14 @@ DO_RENAME=false
 RENAME_PAIR=""
 DO_LIST=false
 CHECK_UPDATE=false
+
+# PGO (v27.31.53): PGO_REQUESTED es la decisión, PGO_EXPLICIT marca que vino de
+# la línea de órdenes o del entorno y por tanto la pregunta se omite. El perfil
+# en sí sigue viviendo en CIZEN_PGO_PROFILE, que es lo que leen tanto la
+# validación temprana como KCONFIG_CC_OPTS y MAKE_CC_OPTS.
+PGO_REQUESTED=false
+PGO_EXPLICIT=false
+PGO_CHANGED=0
 
 # Poda de módulos (v27.25.0): tras empaquetar, se conservan únicamente los
 # módulos que este hardware usa (ver podar-modulos.sh). 1=activada (default),
@@ -638,6 +659,20 @@ while [ $# -gt 0 ]; do
       NO_ASK_CC=true; shift ;;
     --ask-cc)
       NO_ASK_CC=false; shift ;;
+    --pgo)
+      PGO_REQUESTED=true; PGO_EXPLICIT=true
+      if [ -n "${2:-}" ] && [[ ! "$2" =~ ^-- ]]; then
+        CIZEN_PGO_PROFILE="$2"; shift 2
+      else
+        shift
+      fi ;;
+    --no-pgo)
+      # Vacía también el perfil heredado del entorno: si no, --no-pgo sólo
+      # apagaba PGO_REQUESTED y la validación de arranque veía el
+      # CIZEN_PGO_PROFILE de siempre y lo volvía a encender. Era un flag que
+      # decía una cosa y ejecutaba otra, y justo en el sentido contrario al
+      # que se le pide.
+      PGO_REQUESTED=false; PGO_EXPLICIT=true; CIZEN_PGO_PROFILE=""; shift ;;
     --check-update)
       CHECK_UPDATE=true; shift ;;
     --check)
@@ -10843,6 +10878,145 @@ fork_release_guard() { # $1=scheduler elegido (vacío = vanilla)
 
 # Pregunta las dos cosas y aplica lo que haya cambiado, con UNA sola
 # revalidación de la config (variante y compilador tocan los mismos símbolos).
+# --- PGO (v27.31.53) -------------------------------------------------------
+# PGO es una decisión INDEPENDIENTE de parche, scheduler y compilador: se
+# pregunta aparte y vale bajo cualquier combinación de las tres. Solo depende
+# de que el compilador sea clang, porque AutoFDO (`-fprofile-sample-use`) es un
+# invento de LLVM y CONFIG_AUTOFDO_CLANG no existe con GCC. Como el motor ya
+# pregunta el compilador justo antes, aquí se puede comprobar sin adivinar.
+#
+# El perfil lo produce pgo-collect.sh en $HOME/kernel-pgo/<kver>.afdo. Se
+# listan antes de preguntar porque elegir PGO a ciegas es como se quema media
+# hora de compilación: si no hay ningún perfil, la respuesta honesta es que
+# primero hay que colectar uno.
+pgo_profile_dir() { printf '%s\n' "${CIZEN_PGO_DIR:-$HOME/kernel-pgo}"; }
+
+pgo_list_profiles() { # un .afdo por línea, en orden de versión
+  local d f
+  d="$(pgo_profile_dir)"
+  [ -d "$d" ] || return 0
+  shopt -s nullglob
+  for f in "$d"/*.afdo; do printf '%s\n' "$f"; done | sort -V
+  shopt -u nullglob
+}
+
+# El perfil que más encaja con lo que se va a compilar: el de ESA versión si
+# existe, y si no el más reciente disponible. Un perfil de otra versión se
+# puede usar (AutoFDO degrada por pesos, no rompe) pero es peor advice, así que
+# solo se propone como último recurso.
+pgo_pick_profile() {
+  local f best=""
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if [ "$(basename -- "$f")" = "$VERSION-cizen-v3.afdo" ] \
+       || [ "$(basename -- "$f")" = "$VERSION.afdo" ]; then
+      best="$f"; break
+    fi
+    best="$f"
+  done < <(pgo_list_profiles)
+  printf '%s\n' "${best:-}"
+}
+
+# Devuelve 1 si esta llamada cambió CIZEN_PGO_PROFILE, para que ask_build_prefs
+# revalide la cadena de config igual que hace cuando cambian variante o
+# compilador. No es opcional: pasar CLANG_AUTOFDO_PROFILE enciende
+# CONFIG_AUTOFDO_CLANG en el .config, así que sin revalidar, los símbolos nuevos
+# se colarían sin pasar por la auditoría ni por la validación.
+ask_build_pgo() {
+  PGO_CHANGED=0
+
+  # 1) Se pidió PGO sin concretarlo (--pgo a secas): se busca el mejor perfil.
+  #    Va AQUÍ y no al parsear la línea de órdenes porque VERSION no se conoce
+  #    hasta mucho después (se resuelve contra kernel.org), y pgo_pick_profile
+  #    prefiere el perfil de la versión objetivo.
+  if [ "$PGO_REQUESTED" = true ] && [ -z "${CIZEN_PGO_PROFILE:-}" ]; then
+    local auto_p; auto_p="$(pgo_pick_profile)"
+    if [ -n "$auto_p" ]; then
+      CIZEN_PGO_PROFILE="$auto_p"
+      PGO_CHANGED=1
+      ok "PGO AutoFDO con $CIZEN_PGO_PROFILE (la build incluirá -fprofile-sample-use)."
+    elif [ "$PGO_EXPLICIT" = true ]; then
+      fatal "Se pidió PGO (--pgo) pero no hay ningún perfil .afdo en $(pgo_profile_dir).
+       Para tener uno, compila una vez, usa el sistema con carga representativa y ejecuta:
+         sudo pgo-collect.sh --duration 900
+       El vmlinux de este build ya se archiva solo, así que no hay que pasárselo a mano."
+    fi
+  fi
+
+  # 2) Ya está decidido (--pgo con ruta, o CIZEN_PGO_PROFILE del entorno): no se
+  #    pregunta. La validación temprana de las líneas ~849 ya cubrió ese caso.
+  if [ "$PGO_EXPLICIT" = true ] || [ -n "${CIZEN_PGO_PROFILE:-}" ]; then
+    [ -n "${CIZEN_PGO_PROFILE:-}" ] && PGO_REQUESTED=true
+    return 0
+  fi
+
+  PGO_REQUESTED=false
+  if ! prefs_interactive; then
+    warn "Sin terminal interactiva; se compila sin PGO."
+    return 0
+  fi
+  if [ "$CC_FAMILY" != "clang" ]; then
+    info "PGO AutoFDO exige clang y el compilador elegido es ${CC_LAUNCHER} (familia ${CC_FAMILY}); se compila sin PGO."
+    info "Para usarlo, elige compilador=clang en la pregunta anterior."
+    return 0
+  fi
+
+  local -a profs=()
+  local p choice
+  while IFS= read -r p; do [ -n "$p" ] && profs+=("$p"); done < <(pgo_list_profiles)
+
+  printf '\n  %bPGO (AutoFDO)%b (Enter usa el default):\n' "$W" "$N"
+  if [ "${#profs[@]}" -eq 0 ]; then
+    printf '    %bno%b    todavía no hay ningún perfil .afdo en %s\n' "$W" "$N" "$(pgo_profile_dir)"
+    printf '            para tener uno:  sudo pgo-collect.sh --duration 900\n'
+    printf '            (compila con carga real representativa; el perfil solo optimiza lo que ve)\n'
+    printf '            el vmlinux de este build se archiva solo, así que luego no hay que pasárselo a mano\n'
+    while true; do
+      printf '  %bPGO%b [Enter=%bno, sin PGO%b]: ' "$W" "$N" "$Y" "$N"
+      prefs_read choice
+      case "${choice:-}" in
+        ""|no|n|No|NO) break ;;
+        *) warn "No hay ningún perfil que elegir todavía. Responde Enter para seguir sin PGO." ;;
+      esac
+    done
+    return 0
+  fi
+
+  local rec_profile; rec_profile="$(pgo_pick_profile)"
+  local p_n=1 label size
+  for p in "${profs[@]}"; do
+    label="$p_n"
+    [ "$p" = "$rec_profile" ] && label="*$p_n"
+    size="$(du -h -- "$p" 2>/dev/null | cut -f1)"
+    printf '    %b%3s%b) %s%b  (%s)\n' "$W" "$label" "$N" "$(basename -- "$p")" "$N" "${size:-?}"
+    p_n=$((p_n + 1))
+  done
+  printf '    %bn%s   compilar sin PGO\n' "$W" "$N"
+  printf '    %bEnter usa el marcado con *%b; también puedes teclear la ruta a un .afdo\n' "$Y" "$N"
+  printf '  %bPGO%b [Enter=%b*%b, número de la lista, o n para seguir sin PGO]: ' "$W" "$N" "$Y" "$N"
+  prefs_read choice
+  case "${choice:-}" in
+    # El Enter se lleva el perfil recomendado: es lo que el prompt promete, y
+    # quien quiere pasar sin PGO lo dice con 'n'. Antes se ignoraba el Enter y
+    # el '*' de la pantalla mentía.
+    "")  CIZEN_PGO_PROFILE="$rec_profile" ;;
+    n|no|No|NO) return 0 ;;
+    *)
+      if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#profs[@]}" ]; then
+        CIZEN_PGO_PROFILE="${profs[$((choice - 1))]}"
+      else
+        CIZEN_PGO_PROFILE="$choice"
+      fi ;;
+  esac
+  if [ ! -f "$CIZEN_PGO_PROFILE" ] || [ ! -r "$CIZEN_PGO_PROFILE" ]; then
+    fatal "El perfil PGO elegido no es un fichero legible: $CIZEN_PGO_PROFILE"
+  fi
+  PGO_REQUESTED=true
+  PGO_CHANGED=1
+  ok "PGO AutoFDO con $CIZEN_PGO_PROFILE (la build incluirá -fprofile-sample-use)."
+  return 0
+}
+
 ask_build_prefs() {
   ask_build_variant
   fork_release_guard "$VARIANT_CHOICE"
@@ -10851,10 +11025,21 @@ ask_build_prefs() {
   local cc_changed=0
   apply_cc_choice "$CC_CHOICE" && cc_changed=1
 
+  # PGO se pregunta DESPUÉS del compilador (para poder exigir clang) y antes de
+  # la revalidación, para que su efecto entre en la misma pasada que variante y
+  # compilador. Es una decisión propia: no se cuela por debajo de ninguna otra.
+  ask_build_pgo
+  if [ "$PGO_CHANGED" = 1 ]; then
+    # El perfil tiene que viajar también por la fase de config, igual que hace
+    # apply_cc_choice. Sin esto, .config se prepara sin él, se enciende
+    # CONFIG_AUTOFDO_CLANG a mitad y la validación nunca lo ve.
+    KCONFIG_CC_OPTS+=("CLANG_AUTOFDO_PROFILE=$CIZEN_PGO_PROFILE")
+  fi
+
   if [ -n "$VARIANT_CHOICE" ]; then
     PATCH_NAMES+=("$VARIANT_CHOICE")
     if ! apply_patch_plugin "$VARIANT_CHOICE"; then
-      unset 'PATCH_NAMES[${#PATCH_NAMES[@]}-1]'
+      unset 'PATCH_NAMES[${#PATCH_NAMES[@]-1}]'
       fatal "No se pudo aplicar el scheduler ${VARIANT_CHOICE} sobre $VERSION; no se degrada a otro en silencio."
     fi
     build_effective_arrays
@@ -10862,11 +11047,12 @@ ask_build_prefs() {
     ok "Se compilará con el scheduler ${PATCH_DISP_NAME:-$VARIANT_CHOICE}."
   fi
 
-  if [ -n "$VARIANT_CHOICE" ] || [ "$cc_changed" = 1 ]; then
+  if [ -n "$VARIANT_CHOICE" ] || [ "$cc_changed" = 1 ] || [ "$PGO_CHANGED" = 1 ]; then
     local why="el scheduler ${PATCH_DISP_NAME:-$VARIANT_CHOICE} y el compilador $CC_LAUNCHER"
     [ -n "$VARIANT_CHOICE" ] || why="el compilador $CC_LAUNCHER"
+    [ "$PGO_CHANGED" = 1 ] && why="$why + PGO"
     if revalidate_config_chain "$why"; then
-      ok "Configuración lista para compilar con ${VARIANT_CHOICE:-eevdf} + $CC_LAUNCHER."
+      ok "Configuración lista para compilar con ${VARIANT_CHOICE:-eevdf} + $CC_LAUNCHER${PGO_CHANGED:+ + PGO}."
     else
       fatal "La configuración no quedó lista con lo elegido (${why}); no se empieza a compilar."
     fi

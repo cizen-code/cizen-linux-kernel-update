@@ -11,6 +11,7 @@
 #            muestra la stable; sin conexión indica la opción 6.
 # Opciones: 1-4 validación/build, 5 force, 6 check-update, 7/8 BORE,
 # 14 buildvariant (scheduler/tuning), 15 ntsync, 16 cachy, 17 manager,
+# 18 pgo (perfil AutoFDO),
 # 9 rollback (reinstala el PAQUETE del kernel anterior), 10 kcfg, 11 selftest,
 # 12 changelog, 13 hardened, 0 salir.
 # ============================================================
@@ -269,6 +270,10 @@ else
 fi
 opt 15 "ntsync"     "compilar con NTSync"
 opt 16 "cachy"      "compilar con misc CachyOS"
+# v27.31.53: PGO entra como opción PROPIA, y además el motor pregunta PGO en
+# CUALQUIER build (es independiente de parche, scheduler y compilador). Esta
+# entrada es para quien ya sabe que quiere PGO y no quiere ir contestando.
+opt 18 "pgo"        "compilar con perfil PGO · AutoFDO"
 rule
 echo "  ${W}Mantenimiento${N}"
 opt 10 "kcfg"       "editar config con menuconfig"
@@ -283,7 +288,7 @@ opt 9 "rollback"    "volver al kernel anterior · $(rollback_resumen)"
 rule
 
 while true; do
-  read -r -p "${W}  [0-17] > ${N}" choice || break
+  read -r -p "${W}  [0-18] > ${N}" choice || break
   case "$choice" in
     1) build_and_exec baja ask --absorb-rebels --check ;;
     2) build_and_exec alta ask --absorb-rebels --check ;;
@@ -322,6 +327,9 @@ while true; do
     15) build_and_exec baja ask --absorb-rebels --ntsync ;;
     16) build_and_exec baja ask --absorb-rebels --cachy ;;
     17) exec /usr/local/bin/kernel-update/kernel-update-manager.sh ;;
+    # --pgo sin ruta: el motor busca el mejor .afdo para la versión objetivo.
+    # Con --pgo RUTA se usa ese fichero concreto. Pide clang si hace falta.
+    18) build_and_exec baja ask --absorb-rebels --pgo ;;
     0) echo "  Saliendo."; exit 0 ;;
     *) printf '  %bOpción no válida: %s%b\n' "$R" "$choice" "$N" ;;
   esac

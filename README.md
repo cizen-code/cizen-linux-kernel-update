@@ -222,7 +222,7 @@ vuelve al comportamiento anterior (solo archive de ficheros).
 | sched | `kernel-update.sh --sched pds` | Compila con el scheduler elegido: `eevdf`, `bore`, `pds`, `bmq`, `lfbmq`, `muqss` (los de parche descargan PRJC/CachyOS con fallback upstream). También interactivo al confirmar build/check (variante Vanilla/BORE/PDS/BMQ/LFBMQ/MuQSS) |
 | cc | `kernel-update.sh --cc clang` | Toolchain LLVM/Clang (`clang`+`lld`, requiere ambos); `gcc` o `auto` |
 | lto | `kernel-update.sh --lto-thin` | LTO thin/full con clang; **default thin desde v27.31.45**. `--no-lto` / `CIZEN_LLVM_LTO=0` vuelve a sin-LTO (GCC) |
-| pgo | `CIZEN_PGO_PROFILE=/ruta/.afdo` | PGO/AutoFDO opt-in: fuerza `CONFIG_AUTOFDO_CLANG` y entrega el perfil como `CLANG_AUTOFDO_PROFILE`. Helper: `pgo-collect.sh` |
+| pgo | `kernel-update.sh --pgo [ruta.afdo]` | PGO/AutoFDO opt-in: fuerza `CONFIG_AUTOFDO_CLANG` y entrega el perfil como `CLANG_AUTOFDO_PROFILE`. `--pgo` a secas busca el mejor `.afdo` de la versión objetivo en `~/kernel-pgo`; `--no-pgo` lo desactiva. Sin flag **se pregunta en cualquier build** (opción 18 del menú, o al confirmar como scheduler y compilador) y es independiente de parche, scheduler y compilador. Exige clang. Helper: `pgo-collect.sh` |
 | o3 | `kernel-update.sh --o3` | `-O3` (Kbuild) + `CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE` |
 | native | `kernel-update.sh --native` | `-march=native`; `--march=<env>` para un valor explícito (`.config` siempre envejece: se re-aplica en cada build) |
 | timer-freq | `kernel-update.sh --timer-freq 1000` | `CONFIG_HZ` |
@@ -261,13 +261,25 @@ vuelve al comportamiento anterior (solo archive de ficheros).
   `SLAB_MERGE_DEFAULT=n` (caches slab no fusionadas; aislamiento de
   rendimiento).
 - **PGO/AutoFDO (opt-in)**: recoge un perfil del sistema en ejecución y
-  recompila el kernel optimizado para esa carga:
-  1. `sudo kernel-update/pgo-collect.sh --duration 900` (captura `perf record
-     -F 999 -a -g` durante tu carga real y convierte con `llvm-profgen`; sale en
+  recompila el kernel optimizado para esa carga. Es una decisión **propia**: se
+  pregunta en cualquier compilación, con cualquier parche, scheduler y
+  compilador (opción 18 del menú, o la pregunta que sale al confirmar un build).
+  El ciclo es:
+  1. Compila una vez **sin** PGO. Al terminar, el motor archiva solo su
+     `vmlinux` en `/var/cache/cizen-kernel/vmlinux/`, así que no hay que
+     pasárselo a mano a nadie.
+  2. Usa el sistema con carga representativa y recoge el perfil:
+     `sudo kernel-update/pgo-collect.sh --duration 900` (captura `perf record
+     -F 999 -a -g` y convierte con `llvm-profgen`; sale en
      `~/kernel-pgo/<kver>.afdo`).
-  2. `CIZEN_PGO_PROFILE=~/kernel-pgo/<kver>.afdo kernel-update.sh <build>`
-     (motor fuerza `CONFIG_AUTOFDO_CLANG` y entrega `CLANG_AUTOFDO_PROFILE`).
-     Se puede comparar con una build `--no-lto` sin `CIZEN_PGO_PROFILE`.
+  3. Vuelve a compilar. El motor ofrece los perfiles que haya, con el de tu
+     versión recomendado: `Enter` se lo lleva, o se teclea otro. En línea de
+     órdenes: `--pgo` a secas (elige el mejor), `--pgo ruta.afdo`, `--no-pgo`,
+     o `CIZEN_PGO_PROFILE=ruta.afdo`.
+
+  Exige clang: AutoFDO (`-fprofile-sample-use`, `CONFIG_AUTOFDO_CLANG`) es de
+  LLVM y no existe con GCC, así que la pregunta se omite si elegiste GCC
+  diciendo por qué. Para comparar, usa una build `--no-lto` sin `--pgo`.
 - **Cmdline (sistema)**: `/etc/kernel/cmdline` incluye ahora
   `intel_idle.max_cstate=4` (despierta antes desde los estados profundos;
   reversible). Se aplica al regenerar la UKI (`sudo cizen-uki-sync`) y reboot.

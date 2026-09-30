@@ -1642,6 +1642,209 @@ PREFS
   else
     rec fail "motor: orden de las preguntas distinto de variante→compilador"
   fi
+  # ---- PGO / AutoFDO (v27.31.53) ------------------------------------------
+  # Es una decisión propia: ni el parche ni el compilador la controlan, así que
+  # tiene que existir como pregunta propia, no colarse dentro de otra.
+  : > "$ROOT/pgo.sh"
+  extract_fn pgo_profile_dir  >> "$ROOT/pgo.sh"
+  extract_fn pgo_list_profiles >> "$ROOT/pgo.sh"
+  extract_fn pgo_pick_profile >> "$ROOT/pgo.sh"
+  extract_fn ask_build_pgo    >> "$ROOT/pgo.sh"
+  # Sin perfiles: se dice cómo tener uno y se sigue sin PGO. Un menú que
+  # ofrece PGO cuando no hay nada que usar solo enseña aSay "sí" y luego
+  # compila sin PGO, que es el peor resultado posible: silencioso.
+  rm -rf "$ROOT/kp"; mkdir -p "$ROOT/kp"
+  cat > "$ROOT/pgo-run.sh" <<'PGORUN'
+W=''; Y=''; N=''
+VERSION="${VERSION:-7.2.8}"; CC_FAMILY="${CC_FAMILY:-clang}"; CC_LAUNCHER="${CC_LAUNCHER:-clang}"
+CIZEN_PGO_DIR="${CIZEN_PGO_DIR:?}"; CIZEN_PGO_PROFILE="${CIZEN_PGO_PROFILE:-}"
+PGO_REQUESTED="${PGO_REQUESTED:-false}"; PGO_EXPLICIT="${PGO_EXPLICIT:-false}"; PGO_CHANGED=0
+log(){ :; }
+ok(){ printf '  ok: %s\n' "$*"; }
+info(){ printf '  info: %s\n' "$*"; }
+warn(){ printf '  warn: %s\n' "$*"; }
+fatal(){ printf '  fatal: %s\n' "$*"; FATAL=1; }
+FATAL=0
+prefs_interactive(){ return 0; }
+prefs_read(){ local __v=''; read -r __v || __v=''; printf -v "$1" '%s' "$__v"; }
+# shellcheck disable=SC1090
+source "$ROOT_FNS"
+ask_build_pgo
+printf 'RES req=%s chg=%s perfil=%s\n' "$PGO_REQUESTED" "$PGO_CHANGED" \
+  "$(basename -- "${CIZEN_PGO_PROFILE:-<ninguno>}")"
+PGORUN
+  pgo_run() { # $1=stdin, resto=entorno
+    ( ROOT_FNS="$ROOT/pgo.sh"; export ROOT_FNS
+      CIZEN_PGO_DIR="$ROOT/kp"; export CIZEN_PGO_DIR
+      eval "$@"
+      export CC_FAMILY CC_LAUNCHER PGO_REQUESTED PGO_EXPLICIT FATAL 2>/dev/null || :
+      bash "$ROOT/pgo-run.sh" 2>&1 )
+  }
+  ui_pgo_none="$(printf '\n' | pgo_run ':')"
+  if printf '%s' "$ui_pgo_none" | grep -q 'todavía no hay ningún perfil' \
+     && printf '%s' "$ui_pgo_none" | grep -q 'pgo-collect.sh --duration 900' \
+     && printf '%s' "$ui_pgo_none" | grep -q 'RES req=false chg=0 perfil=<ninguno>'; then
+    rec ok "motor: PGO sin ningún perfil explica cómo obtenerlo y sigue SIN PGO (no finge)"
+  else
+    rec fail "motor: sin perfiles, el PGO no explica nada o finge activarse ('$ui_pgo_none')"
+  fi
+  # Con perfiles: Enter se lleva el marcado con *, y 'n' pasa. Antes el Enter
+  # se ignoraba y el '*' de la pantalla mentía.
+  head -c 512 /dev/urandom > "$ROOT/kp/7.2.7.afdo"
+  head -c 640 /dev/urandom > "$ROOT/kp/7.2.8-cizen-v3.afdo"
+  ui_pgo_enter="$(printf '\n' | pgo_run ':')"
+  if printf '%s' "$ui_pgo_enter" | grep -q '\*2) 7.2.8-cizen-v3.afdo' \
+     && printf '%s' "$ui_pgo_enter" | grep -q 'RES req=true chg=1 perfil=7.2.8-cizen-v3.afdo'; then
+    rec ok "motor: PGO con perfiles → Enter usa el recomendado (y lo marca con *)"
+  else
+    rec fail "motor: Enter no se lleva el perfil recomendado ('$ui_pgo_enter')"
+  fi
+  ui_pgo_n="$(printf 'n\n' | pgo_run ':')"
+  if printf '%s' "$ui_pgo_n" | grep -q 'RES req=false chg=0 perfil=<ninguno>'; then
+    rec ok "motor: PGO → 'n' compila sin PGO a propósito"
+  else
+    rec fail "motor: con 'n' se activa PGO igualmente ('$ui_pgo_n')"
+  fi
+  ui_pgo_idx="$(printf '1\n' | pgo_run ':')"
+  if printf '%s' "$ui_pgo_idx" | grep -q 'RES req=true chg=1 perfil=7.2.7.afdo'; then
+    rec ok "motor: PGO → elegir un número de la lista coge ese perfil"
+  else
+    rec fail "motor: el número de la lista no se respeta ('$ui_pgo_idx')"
+  fi
+  # gcc: AutoFDO es de LLVM. Se explica y se sigue sin PGO; jamás se finge.
+  ui_pgo_gcc="$(printf '\n' | pgo_run 'CC_FAMILY=gcc CC_LAUNCHER=gcc')"
+  if printf '%s' "$ui_pgo_gcc" | grep -q 'PGO AutoFDO exige clang' \
+     && printf '%s' "$ui_pgo_gcc" | grep -q 'RES req=false chg=0 perfil=<ninguno>'; then
+    rec ok "motor: con gcc, PGO dice que AutoFDO es de clang y compila sin él"
+  else
+    rec fail "motor: con gcc el PGO no se explica o se cuela igual ('$ui_pgo_gcc')"
+  fi
+  # --pgo a secas y sin perfiles: se para con instrucciones, no con un fallo sordo.
+  rm -f "$ROOT"/kp/*.afdo
+  ui_pgo_expl="$(printf '\n' | pgo_run 'PGO_REQUESTED=true PGO_EXPLICIT=true')"
+  if printf '%s' "$ui_pgo_expl" | grep -q 'fatal: Se pidió PGO' \
+     && printf '%s' "$ui_pgo_expl" | grep -q 'pgo-collect.sh --duration 900'; then
+    rec ok "motor: --pgo sin ningún perfil separa con el cómo, no con un error pelado"
+  else
+    rec fail "motor: --pgo sin perfil no explica cómo obtenerlo ('$ui_pgo_expl')"
+  fi
+  # --pgo a secas y con perfil: elige solo, sin preguntar (es lo que pide la opción 18).
+  head -c 512 /dev/urandom > "$ROOT/kp/7.2.7.afdo"
+  head -c 640 /dev/urandom > "$ROOT/kp/7.2.8-cizen-v3.afdo"
+  ui_pgo_auto="$(printf '\n' | pgo_run 'PGO_REQUESTED=true PGO_EXPLICIT=true')"
+  if printf '%s' "$ui_pgo_auto" | grep -q 'RES req=true chg=1 perfil=7.2.8-cizen-v3.afdo'; then
+    rec ok "motor: --pgo elige el perfil de la versión objetivo sin preguntar"
+  else
+    rec fail "motor: --pgo no auto-elige el perfil ('$ui_pgo_auto')"
+  fi
+  # Orden: PGO se pregunta DESPUÉS del compilador, para poder exigir clang.
+  if sed -n '/^ask_build_prefs() {/,/^}/p' "$MOTOR" \
+       | grep -E '^ *(apply_cc_choice|ask_build_pgo)' | sed 's/^ *//' | awk '{print $1}' \
+       | head -2 | paste -sd'|' - | grep -qx 'apply_cc_choice|ask_build_pgo'; then
+    rec ok "motor: PGO se pregunta después del compilador (para poder exigir clang)"
+  else
+    rec fail "motor: PGO se pregunta antes del compilador, o no se pregunta en ask_build_prefs"
+  fi
+  # El perfil elegido tiene que entrar en la fase de config y disparar la
+  # revalidación, igual que el compilador. Si no, CONFIG_AUTOFDO_CLANG se
+  # encendería a medias sin pasar por la auditoría.
+  #
+  # OJO: esto se mira DENTRO de ask_build_prefs y no en el motor entero. El
+  # motor ya mete CLANG_AUTOFDO_PROFILE en KCONFIG_CC_OPTS al arrancar (para
+  # cuando el perfil viene por flag o por el entorno), así que un grep global
+  # daba verde aunque la inyección TARDÍA —la de un perfil elegido en la
+  # pregunta, que es justo la nueva— hubiera desaparecido. Ese fallo es
+  # silencioso: el .config se prepara sin PGO, la compilación usa
+  # -fprofile-sample-use sin CONFIG_AUTOFDO_CLANG detrás, y ni la auditoría ni
+  # la validación se enteran.
+  prefs_block="$(sed -n '/^ask_build_prefs() {/,/^}/p' "$MOTOR")"
+  for trozo in 'ask_build_pgo' \
+               'KCONFIG_CC_OPTS+=("CLANG_AUTOFDO_PROFILE=$CIZEN_PGO_PROFILE")'; do
+    if printf '%s' "$prefs_block" | grep -qF -- "$trozo"; then
+      rec ok "motor: dentro de ask_build_prefs, «$trozo»"
+    else
+      rec fail "motor: «$trozo» no está en ask_build_prefs (config y build se desincronizarían)"
+    fi
+  done
+  if printf '%s' "$prefs_block" | grep -qF 'revalidate_config_chain "$why"' \
+     && printf '%s' "$prefs_block" | grep -qF '|| [ "$PGO_CHANGED" = 1 ]; then'; then
+    rec ok "motor: cambiar el PGO obliga a revalidar la config"
+  else
+    rec fail "motor: se puede cambiar el PGO sin revalidar la config"
+  fi
+  # Y la inyección no puede quedar suelta: tiene que ir DENTRO del guard de
+  # PGO_CHANGED. Con el guard puesto pero la línea fuera, o al revés, el grep
+  # anterior daba verde y el perfil no llegaba a la fase de config.
+  # (los comentarios se quitan antes, o la distancia entre el guard y la línea
+  # que guarda depende de cuántos explicadores se hayan escrito encima)
+  prefs_sin_comentarios="$(printf '%s' "$prefs_block" | grep -vE '^[[:space:]]*#')"
+  if printf '%s' "$prefs_sin_comentarios" \
+       | grep -A2 'if \[ "\$PGO_CHANGED" = 1 \]; then' \
+       | grep -qF 'KCONFIG_CC_OPTS+=("CLANG_AUTOFDO_PROFILE=$CIZEN_PGO_PROFILE")'; then
+    rec ok "motor: el perfil entra en KCONFIG_CC_OPTS solo cuando PGO ha cambiado"
+  else
+    rec fail "motor: el perfil no entra en KCONFIG_CC_OPTS tras elegirlo"
+  fi
+  # Si no hay perfil de la versión exacta, el recommended cae al más reciente
+  # (no a nada). Con un kernel nuevo y perfiles viejos, devolver vacío haría que
+  # el Enter se comiera el PGO sin avisar.
+  ui_pgo_fallback="$(printf '\n' | pgo_run 'VERSION=99.99')"
+  if printf '%s' "$ui_pgo_fallback" | grep -q 'RES req=true chg=1 perfil=7.2.8-cizen-v3.afdo'; then
+    rec ok "motor: sin perfil de la versión exacta, PGO ofrece el más reciente"
+  else
+    rec fail "motor: sin perfil de la versión exacta, PGO se queda sin nada ('$ui_pgo_fallback')"
+  fi
+  # La pantalla tiene que explicar QUÉ se está eligiendo, no solo listar: una
+  # lista de nombres de fichero sin encabezado no dice qué es PGO ni qué hace
+  # el Enter.
+  if printf '%s' "$ui_pgo_enter" | grep -q 'PGO (AutoFDO)' \
+     && printf '%s' "$ui_pgo_enter" | grep -q 'Enter usa el marcado con \*'; then
+    rec ok "motor: la pantalla de PGO dice qué se elige y qué hace el Enter"
+  else
+    rec fail "motor: la pantalla de PGO no explica el encabezado ni el Enter ('$ui_pgo_enter')"
+  fi
+  # Una ruta tecleada a mano que no existe tiene que parar, no compilar con un
+  # perfil imaginario: -fprofile-sample-use con un fichero ausente falla mucho
+  # más tarde y en mitad de la build.
+  ui_pgo_ruta="$(printf '/no/existe/p.afdo\n' | pgo_run ':')"
+  if printf '%s' "$ui_pgo_ruta" | grep -q 'fatal: El perfil PGO elegido no es un fichero legible'; then
+    rec ok "motor: una ruta de PGO inexistente se rechaza con un error claro"
+  else
+    rec fail "motor: una ruta de PGO inexistente se acepta en silencio ('$ui_pgo_ruta')"
+  fi
+  # Los flags existen y son opt-in explícito. Se buscan en la posición del
+  # parser (sangrados cuatro, como el resto de los casos), no en cualquier
+  # sitio: la cadena «--pgo)» también sale en el texto de error, y un grep
+  # global daba verde con el flag fuera del parser.
+  for flag in '--pgo)' '--no-pgo)'; do
+    if grep -qE "^ +${flag}\$" "$MOTOR"; then
+      rec ok "motor: el flag «$flag» está en el parser"
+    else
+      rec fail "motor: falta el flag «$flag» en el parser"
+    fi
+  done
+  # --pgo a secas busca el perfil, --no-pgo lo apaga, y los dos marcan la
+  # decisión como explícita para que la pregunta no se repita.
+  if grep -qE '^ +PGO_REQUESTED=false; PGO_EXPLICIT=true; CIZEN_PGO_PROFILE=""' "$MOTOR"; then
+    rec ok "motor: --no-pgo limpia el perfil heredado del entorno (si no, no apagaba nada)"
+  else
+    rec fail "motor: --no-pgo deja el CIZEN_PGO_PROFILE del entorno y PGO sigue encendido"
+  fi
+  if grep -qE '^ +PGO_REQUESTED=true; PGO_EXPLICIT=true$' "$MOTOR" \
+     && grep -qE '^ +PGO_REQUESTED=false; PGO_EXPLICIT=true; CIZEN_PGO_PROFILE=""' "$MOTOR"; then
+    rec ok "motor: --pgo y --no-pgo cuentan como decisión explícita (no se vuelve a preguntar)"
+  else
+    rec fail "motor: --pgo/--no-pgo no marcan PGO_EXPLICIT"
+  fi
+  # La opción del menú: propia, y el rango la incluye.
+  MENU="$(dirname "$MOTOR")/kernel-update-menu.sh"
+  if grep -q 'opt 18 "pgo"' "$MENU" && grep -q '\[0-18\]' "$MENU" \
+     && grep -q '18) build_and_exec.*--pgo' "$MENU"; then
+    rec ok "menú: PGO tiene su propia opción (18) y el rango la cubre"
+  else
+    rec fail "menú: la opción 18 de PGO no está, o el rango no llega a 18"
+  fi
+
   # La UI a stdout, no a stderr (si stderr no es la terminal, el submenú
   # desaparecería), y el prompt impreso, no `read -p`.
   if grep -q 'prefs_read()' "$MOTOR" && ! grep -q "read -r -t 300 -p '  %bVariante" "$MOTOR"; then
