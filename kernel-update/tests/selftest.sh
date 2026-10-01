@@ -1483,6 +1483,10 @@ cachyos-7.2.80-1" fork_tagrel 7.2.8)" ]; then
   # motor es lo único que sale, y lo que entre se tiene que ver llegar tal cual.
   : > "$ROOT/ccfn.sh"
   sed -n '/^fork_fallback_for() {/,/^}/p' "$MENU" >> "$ROOT/ccfn.sh"
+  # v27.33.0: resolve_btf_flag se extrae también, para que el test use la
+  # definición REAL del menú y no una copia suya (si el menú se rompe, el test
+  # tiene que enterarse).
+  sed -n '/^resolve_btf_flag() {/,/^}/p'   "$MENU" >> "$ROOT/ccfn.sh"
   sed -n '/^build_and_exec() {/,/^}/p'   "$MENU" >> "$ROOT/ccfn.sh"
   cat > "$ROOT/fake-engine.sh" <<'FAKE'
 #!/bin/bash
@@ -1499,19 +1503,19 @@ build_and_exec "\$@"
 RUNNER
   eng() { sed -n 's/^.*\(ARGS:.*\)$/\1/p'; }
   out_ask="$(bash "$ROOT/cc-run.sh" baja ask --absorb-rebels 2>/dev/null | eng)"
-  if [ "$out_ask" = "ARGS: <--absorb-rebels> PRIO=unset" ]; then
-    rec ok "menú: una build sin variante impuesta llega al motor tal cual, sin flags extra"
+  if [ "$out_ask" = "ARGS: <--absorb-rebels> <--no-btf> PRIO=unset" ]; then
+    rec ok "menú: una build sin variante impuesta llega al motor tal cual, más --no-btf"
   else
     rec fail "menú: build_and_exec añade o quita algo de la llamada ('$out_ask')"
   fi
   out_bore="$(bash "$ROOT/cc-run.sh" baja bore --absorb-rebels 2>/dev/null | eng)"
-  if [ "$out_bore" = "ARGS: <--absorb-rebels> <--patch> <bore> PRIO=unset" ]; then
+  if [ "$out_bore" = "ARGS: <--absorb-rebels> <--no-btf> <--patch> <bore> PRIO=unset" ]; then
     rec ok "menú: la opción que ya impone bore sigue pasándolo como --patch"
   else
     rec fail "menú: bore no llega al motor ('$out_bore')"
   fi
   out_alta="$(bash "$ROOT/cc-run.sh" alta ask --absorb-rebels 2>/dev/null | eng)"
-  if [ "$out_alta" = "ARGS: <--absorb-rebels> PRIO=normal" ]; then
+  if [ "$out_alta" = "ARGS: <--absorb-rebels> <--no-btf> PRIO=normal" ]; then
     rec ok "menú: la prioridad «alta» sigue llegando al motor por CIZEN_BUILD_PRIORITY"
   else
     rec fail "menú: prioridad mal pasada ('$out_alta')"
@@ -1523,6 +1527,42 @@ RUNNER
     rec ok "menú: build_and_exec no imprime ninguna UI de variante/compilador"
   else
     rec fail "menú: build_and_exec imprime UI de preferencias ('$ui_menu')"
+  fi
+
+  # ── v27.33.0: BTF apagado en todas las builds ──────────────────
+  # El equipo usa solo BORE. BTF solo servía para sched_ext, que con BORE no
+  # tiene dónde anclarse, y pahole se come 6,7 GB de RSS por build. El motor lo
+  # enciende por defecto (BTF_REQUESTED=true) y el perfil no puede apagarlo, así
+  # que el menú es el único sitio donde el flag puede entrar. Si esto se rompe,
+  # el síntoma es silencioso: se vuelve a pagar pahole sin avisar.
+  if grep -q '^resolve_btf_flag() {' "$MENU" \
+     && grep -q 'btf_arg="\$(resolve_btf_flag)"' "$MENU" \
+     && sed -n '/^build_and_exec() {/,/^}/p' "$MENU" | grep -q 'btf_arg'; then
+    rec ok "menú: resolve_btf_flag existe y build_and_exec lo usa"
+  else
+    rec fail "menú: build_and_exec no resuelve el flag de BTF"
+  fi
+  # La 14 no pasa por build_and_exec: es el camino que se olvidaría.
+  if grep -A 15 '^ *14)' "$MENU" | grep -q 'resolve_btf_flag'; then
+    rec ok "menú: la 14 también pasa --no-btf (no va por build_and_exec)"
+  else
+    rec fail "menú: la 14 construye fuera de build_and_exec y se queda sin --no-btf"
+  fi
+  # Escape hatch: CIZEN_BTF=1 tiene que devolver la llamada a como estaba.
+  out_btf1="$(CIZEN_BTF=1 bash "$ROOT/cc-run.sh" baja ask --absorb-rebels 2>/dev/null | eng)"
+  if [ "$out_btf1" = "ARGS: <--absorb-rebels> PRIO=unset" ]; then
+    rec ok "menú: CIZEN_BTF=1 reactiva BTF y no deja un argumento vacío colgado"
+  else
+    rec fail "menú: CIZEN_BTF=1 no deja la llamada limpia ('$out_btf1')"
+  fi
+  # El porqué: si algún día el motor deja de encender BTF por defecto, este test
+  # falla y obliga a mirar el menú en vez de dejar un --no-btf inofensivo.
+  if grep -q '^BTF_REQUESTED=true' "$MOTOR" \
+     && grep -q 'CIZEN_NO_BTF' "$MOTOR" \
+     && grep -q '\-\-no-btf' "$MOTOR"; then
+    rec ok "motor: BTF sigue siendo opt-out (--no-btf / CIZEN_NO_BTF), que es lo que el menú supone"
+  else
+    rec fail "motor: BTF ya no es opt-out; revisa si el menú debe seguir pasando --no-btf"
   fi
 
   # ── Motor: las dos preguntas, y solo con la respuesta SÍ ──

@@ -229,6 +229,27 @@ fork_fallback_for() { # $1=variante
   esac
 }
 
+# ── BTF ─────────────────────────────────────────────────────────
+# v27.33.0: este equipo usa SOLO BORE. CONFIG_DEBUG_INFO_BTF solo se pedía para
+# sched_ext, y con BORE no hay dónde anclarla: BORE sustituye a SCHED_CORE, que
+# es justo donde sched_ext se engancha. O sea que el BTF no compraba nada
+# utilizable, y se pagaba caro de verdad — el pase de `pahole` sobre el vmlinux
+# se come ~6,7 GB de RSS y fue lo que provocó el swapeo del build de 34 min
+# (§36.2 de Agente.md).
+#
+# El motor lo trae ENCENDIDO por defecto (BTF_REQUESTED=true, kernel-update.sh:316)
+# y el perfil NO puede apagarlo: CIZEN_NO_BTF se lee en la 881 y el perfil se
+# sourcea en la 1515, después. Ponerlo dentro del perfil llega tarde. La única
+# forma real de apagarlo es el flag, y este menú es quien lo tiene que pasar.
+# CIZEN_BTF=1 lo vuelve a pedir, por si algún día hace falta (bpftrace, etc.).
+resolve_btf_flag() {
+  if [ "${CIZEN_BTF:-0}" = "1" ]; then
+    printf ''
+  else
+    printf -- '--no-btf'
+  fi
+}
+
 # Lanza un build. NO pregunta nada: el motor se encarga de la variante y del
 # compilador, en ese orden, cuando ya sabe que la compilación va a empezar.
 #   $1 = prioridad (baja|alta)
@@ -236,14 +257,15 @@ fork_fallback_for() { # $1=variante
 #   $3.. = argumentos del motor
 build_and_exec() {
   local prio="$1" vmode="$2"; shift 2
-  local patch_arg=""
+  local patch_arg="" btf_arg
   case "$vmode" in
     ask) ;;   # la pregunta el motor, después de validar la config
     bore) patch_arg="bore" ;;
   esac
+  btf_arg="$(resolve_btf_flag)"
   [ "$prio" = alta ] && export CIZEN_BUILD_PRIORITY=normal
   # shellcheck disable=SC2086
-  set -- "$@" ${patch_arg:+--patch "$patch_arg"}
+  set -- "$@" ${btf_arg:+"$btf_arg"} ${patch_arg:+--patch "$patch_arg"}
   exec "$SCRIPT" "$@"
 }
 
@@ -274,6 +296,7 @@ opt 16 "cachy"      "compilar con misc CachyOS"
 # CUALQUIER build (es independiente de parche, scheduler y compilador). Esta
 # entrada es para quien ya sabe que quiere PGO y no quiere ir contestando.
 opt 18 "pgo"        "compilar con perfil PGO · AutoFDO"
+printf '     %sBTF no pedido en ninguna build (solo BORE; CIZEN_BTF=1 lo reactiva)%s\n' "$G" "$N"
 rule
 echo "  ${W}Mantenimiento${N}"
 opt 10 "kcfg"       "editar config con menuconfig"
@@ -321,9 +344,12 @@ while true; do
        # v27.31.37+: la opción 14 solo lanza el motor; el scheduler y el compilador
        # se preguntan en el motor (ask_build_prefs) tras confirmar "¿Desea continuar?".
        # No se pasa --no-ask-variant: si el usuario no elige nada, el motor pregunta.
+       # v27.33.0: esta opción NO pasa por build_and_exec, así que el --no-btf hay
+       # que añadirlo aquí o se quedaría fuera de la mitad de las builds.
        args="--absorb-rebels"
+       btf_arg="$(resolve_btf_flag)"
        # shellcheck disable=SC2086
-       exec "$SCRIPT" $args ;;
+       exec "$SCRIPT" $args ${btf_arg:+"$btf_arg"} ;;
     15) build_and_exec baja ask --absorb-rebels --ntsync ;;
     16) build_and_exec baja ask --absorb-rebels --cachy ;;
     17) exec /usr/local/bin/kernel-update/kernel-update-manager.sh ;;

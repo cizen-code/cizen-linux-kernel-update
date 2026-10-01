@@ -1,3 +1,42 @@
+## [27.33.0] - 2026-09-30
+
+**El menú pasa `--no-btf` en todas las builds.** Decisión del usuario: este
+equipo usa **solo BORE**, sin sched_ext.
+
+- **Por qué BTF no servía.** `CONFIG_DEBUG_INFO_BTF` se pedía únicamente para
+  `SCHED_CLASS_EXT`, y con BORE no hay dónde anclarla: BORE *sustituye* a
+  `SCHED_CORE`, que es justo donde sched_ext se engancha. Con las dos
+  compiladas a la vez, `sudo scx_bpfland` falla con `Failed to load BPF
+  program`. El perfil v5.16.0 ya lo había decidido así (y quitado
+  `SCHED_CLASS_EXT` de `OPTS_ENABLE`), pero **solo declarándolo**: apagarlo de
+  verdad requería el flag, y el menú no tenía forma de pasarlo.
+- **Por qué era un coste real, no teórico.** El pase de `pahole` sobre el
+  `vmlinux` se come ~6,7 GB de RSS, y fue lo que provocó el swapeo y los 34
+  min del build de pkgrel 9 (§36.2 de Agente.md). Se estaba pagando en cada
+  compilación por una capacidad inalcanzable.
+- **Por qué el perfil no puede arreglarlo solo.** `CIZEN_NO_BTF` se lee en
+  `kernel-update.sh:881` y el perfil se sourcea en la 1515, **después**; ponerlo
+  dentro del perfil llega tarde. El motor además lo enciende por defecto
+  (`BTF_REQUESTED=true`, línea 316). El menú era el único punto de entrada real.
+- **Qué cambia.** `resolve_btf_flag()` devuelve `--no-btf`, y lo usan
+  `build_and_exec()` (opciones 1-5, 7, 8, 15, 16, 18) **y la 14**, que construye
+  fuera de `build_and_exec` y se habría quedado fuera. Se añade una línea visible
+  en la sección «Compilación» para que no sea unBehaviour invisible.
+- **Escape hatch:** `CIZEN_BTF=1` devuelve la llamada a como estaba, por si
+  algún día hace falta (`bpftrace`, etc.).
+- **Tests.** 4 nuevos, y se actualizan las 3 aserciones de args exactos de
+  `build_and_exec` (ahora llevan `--no-btf`). Uno comprueba el porqué —que el
+  motor siga siendo opt-out— para que si algún día se invierte el default, el
+  test falle y obligue a revisar el menú en vez de dejar un `--no-btf` inofensivo.
+  Otro cubre `CIZEN_BTF=1`, en particular que no cuelgue un argumento vacío
+  (`set -- "$@" ""` invocaría el motor con un flag fantasma).
+- **Fuera de este cambio, por si se busca:** el perfil del usuario en
+  `~/.config/kernel-update/profiles/` estaba en **v5.13.0**, 327 líneas por
+  detrás del instalado (v5.17.0). No rompía nada —el motor resuelve primero
+  `$SCRIPT_DIR/profiles/` (`kernel-update.sh:206-210`), así que el rancio estaba
+  muerto— pero habría reactivado `SCHED_CLASS_EXT` y BTF si el instalado
+  desapareciera. Sincronizado con paridad sha256 y el v5.13.0 queda como `.bak`.
+
 ## [27.32.0] - 2026-09-30
 
 Auditoría de rendimiento del host en tres capas, porque el cuello de botella
