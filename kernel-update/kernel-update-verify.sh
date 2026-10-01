@@ -25,8 +25,12 @@
 #                 esto, un build con BMQ notificaba "Perfil: FALLO" en cada
 #                 arranque por un símbolo imposible de habilitar.
 #   c) BOOT     : compara systemd-analyze (kernel/userspace/total) del boot
-#                 actual con el del boot previo registrado y avisa si el total
-#                 empeora más allá de un factor/umbral.
+#                 actual contra una REFERENCIA y avisa si el total la empeora
+#                 más allá de un factor/umbral. La referencia es la mediana de
+#                 los últimos N arranques del mismo kernel (v27.33.0); antes
+#                 era el arranque inmediatamente anterior, que con la
+#                 dispersión real de este host (11.8-22.8 s) disparaba por
+#                 azar. Sin historial suficiente se cae al arranque previo.
 #   d) JOURNAL  : cuenta patrones de regresión del kernel (oops/panic/GPU
 #                 hang/hung task/... ) en el journal del boot actual y avisa
 #                 si aparecen más que en el boot previo.
@@ -50,6 +54,10 @@
 #   CIZEN_KERNEL_TRACK       se respeta igual que kernel-update.sh
 #   CIZEN_VERIFY_BOOT_FACTOR umbral de empeoramiento de boot (default 1.35)
 #   CIZEN_VERIFY_BOOT_MIN_DELTA  delta mínimo en s (default 3)
+#   CIZEN_VERIFY_BOOT_REF_N      arranques del mismo kernel que forman la
+#                                mediana de referencia (default 7)
+#   CIZEN_VERIFY_BOOT_REF_MIN    muestras mínimas para usar esa mediana en vez
+#                                del arranque previo (default 3)
 #   CIZEN_NOTIFY_BIN         binario de notificación (default notify-send)
 #   CIZEN_FIRMWARE_DIR       raíz de firmware a auditar (default /usr/lib/firmware)
 # ============================================================
@@ -76,6 +84,11 @@ CIZEN_VERIFY_SUFFIX="${CIZEN_VERIFY_SUFFIX:--cizen-v3}"
 
 BOOT_FACTOR="${CIZEN_VERIFY_BOOT_FACTOR:-1.35}"
 BOOT_MIN_DELTA="${CIZEN_VERIFY_BOOT_MIN_DELTA:-3}"
+# Referencia de la comparación de arranque: mediana de los últimos BOOT_REF_N
+# arranques del MISMO kernel (ver boot_ref). Sin ella el umbral se comparaba
+# contra una única muestra.
+BOOT_REF_N="${CIZEN_VERIFY_BOOT_REF_N:-7}"
+BOOT_REF_MIN="${CIZEN_VERIFY_BOOT_REF_MIN:-3}"
 JOURNAL_PATTERNS=(
   'Oops'
   'oops'
@@ -558,24 +571,85 @@ boot_times() {
 
 float_ge() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a>=b)}'; }
 
+# Referencia contra la que se juzga si este arranque se ha empeorado: la MEDIANA
+# de los últimos BOOT_REF_N arranques del MISMO kernel, leída de verify-history.
+#
+# Antes se comparaba contra el arranque inmediatamente anterior, y eso es
+# comparar ruido con ruido: en este host el total va de 11.8 a 22.8 s con una
+# desviación de 2.9 s, así que un umbral de 1.35x/+3 s sobre UNA muestra
+# dispara por azar — en el historial real, 3 de 44 pares (6 %), y el "peor"
+# caso era 17.795 s, la mediana del propio kernel. Una mediana no se ve
+# desplazada por un arranque lento suelto, que es justo lo que se quiere
+# detectar como anomalía y no como nuevo nivel de referencia.
+#
+# Dos detalles que no son cosméticos:
+#   - Solo cuenta si el kernel es el MISMO. Comparar contra un LTS o contra el
+#     kernel anterior mezcla dos distribuciones: el 22.797 s del 27-sep era el
+#     LTS, no una regresión del kernel Cizen.
+#   - Una línea por ARRANQUE, no por verificación. Se deduplica por boot_id: una
+#     unidad que corre dos veces en el mismo arranque, una verificación manual y
+#     un --dry-run son el MISMO dato, no tres arranques. La primera versión
+#     deduplicaba por "total igual al anterior" y eso rompía justo en el caso
+#     que más importa: con un arranque determinista (5 arranques de 13.0 s
+#     seguidos) colapsaba las cinco muestras en una, nunca se alcanzaba el
+#     mínimo, y la mediana no se usaba nunca.
+boot_ref() { # $1 = versión de kernel -> imprime la mediana, o nada
+  local want="$1" n min v ke us tot j ts bid
+  local -a vals=()
+  local -A seen=()
+  [ -f "$HIST" ] || return 0
+  n="$BOOT_REF_N"; min="$BOOT_REF_MIN"
+  [ "$n" -ge 1 ] 2>/dev/null || n=7
+  [ "$min" -ge 1 ] 2>/dev/null || min=3
+  # El nº de incidencias de la línea no forma parte de la referencia (aquí solo
+  # cuenta el tiempo de arranque), pero hay que leer la línea entera para no
+  # desplazar ts/bid: se desperdicia en `_`.
+  while read -r v ke us tot j _ ts bid; do
+    [ "$v" = "$want" ] || continue
+    [[ "$tot" =~ ^[0-9]+(\.[0-9]+)?$ ]] || continue
+    # Clave de arranque: el boot_id si la línea lo trae (formato actual), y si
+    # no, el par (timestamp, total) de las líneas escritas antes de v27.33.0.
+    local key="${bid:-${ts:-}/$tot}"
+    [ -n "${seen[$key]:-}" ] && continue
+    seen[$key]=1
+    vals+=("$tot")
+  done < "$HIST"
+  [ "${#vals[@]}" -ge "$min" ] || return 0
+  [ "${#vals[@]}" -gt "$n" ] && vals=( "${vals[@]: -n}" )
+  printf '%s\n' "${vals[@]}" | sort -n | awk '
+    { a[NR]=$1 }
+    END { if (NR % 2) printf "%s\n", a[(NR+1)/2]; else printf "%.3f\n", (a[NR/2]+a[NR/2+1])/2 }'
+  return 0
+}
+
 boot_check() {
   # args: fw load kernel userspace total (string)
   local tot="$5" us="$4" ke="$3"
-  local p_tot p_ke p_us p_ver p_thr
-  read -r p_ver p_ke p_us p_tot p_j p_issues p_ts < "$LAST" 2>/dev/null || return 0
-  if [ -z "${p_tot:-}" ] || ! [[ "$p_tot" =~ ^[0-9]+(\.[0-9]+)?$ ]] || [ "$p_tot" = "0" ]; then
-    return 0 # sin registro previo comparable
+  local p_tot p_ver p_ke p_us p_j p_issues p_ts p_thr min_d base base_txt=""
+  # La referencia se busca primero en el historial del mismo kernel; si no hay
+  # muestras suficientes se cae al arranque previo registrado, que es el
+  # comportamiento de siempre y solo se usa con pocos datos.
+  base="$(boot_ref "$CUR_VERSION")"
+  if [ -n "$base" ]; then
+    base_txt="mediana de los últimos $BOOT_REF_N arranques de $CUR_VERSION ($base s)"
+  else
+    read -r p_ver p_ke p_us p_tot p_j p_issues p_ts < "$LAST" 2>/dev/null || return 0
+    if [ -z "${p_tot:-}" ] || ! [[ "$p_tot" =~ ^[0-9]+(\.[0-9]+)?$ ]] || [ "$p_tot" = "0" ]; then
+      return 0 # sin registro previo comparable
+    fi
+    base="$p_tot"
+    base_txt="arranque previo ($p_tot s en ${p_ver:-—})"
   fi
-  if float_ge "$tot" "$p_tot"; then
-    p_thr="$(awk -v b="$p_tot" -v f="$BOOT_FACTOR" 'BEGIN{printf "%.1f", b*f}')"
-    min_d="$(awk -v a="$p_tot" -v d="$BOOT_MIN_DELTA" 'BEGIN{printf "%.1f", a+d}')"
+  if float_ge "$tot" "$base"; then
+    p_thr="$(awk -v b="$base" -v f="$BOOT_FACTOR" 'BEGIN{printf "%.1f", b*f}')"
+    min_d="$(awk -v a="$base" -v d="$BOOT_MIN_DELTA" 'BEGIN{printf "%.1f", a+d}')"
     if float_ge "$tot" "$p_thr" && float_ge "$tot" "$min_d"; then
-      warn "Boot más lento que el previo: $tot s (previo $p_tot s en $p_ver)."
+      warn "Boot más lento que la referencia ($base_txt): $tot s (umbral $p_thr s / $min_d s)."
       ISSUES=$((ISSUES + 1))
       return 0
     fi
   fi
-  [ "${DRY:-false}" = true ] && info "Boot: total $tot s (kernel $ke s / userspace $us s); previo ${p_tot:-—} s."
+  [ "${DRY:-false}" = true ] && info "Boot: total $tot s (kernel $ke s / userspace $us s); referencia $base_txt."
   return 0
 }
 
@@ -996,10 +1070,26 @@ read -r P_VER P_KE P_US P_TOT P_J P_ISS P_TS < "$LAST"
 FIRST_BOOT=false
 if [ "${P_VER:-}" != "$CUR_VERSION" ]; then FIRST_BOOT=true; fi
 
-# Persistir registro
+# Persistir registro. Con --dry-run NO se escribe: una simulación no puede
+# cambiar la línea base de la verificación real siguiente. Antes sí lo hacía, y
+# las consecuencias eran dos: (1) `verify-last` quedaba con los tiempos del
+# ARRANQUE EN CURSO, así que el "previo" que lee boot_check/journal_check
+# acababa siendo el propio arranque y la comparación no comprobaba nada;
+# (2) el --dry-run documentado como auditoría tras un reboot ("imprime sin
+# notificar, útil tras un reboot para auditar") metía líneas falsas en
+# verify-history, que es de donde se saca la referencia de boot.
+# El boot_id (v27.33.0) es lo que permite saber si dos líneas son el MISMO
+# arranque: sin él, varias verificaciones dentro de un mismo arranque (la unit,
+# una manual, un --dry-run) cuentan como arranques independientes y sesgan la
+# mediana de la referencia. Va al final de la línea, así que las lecturas
+# antiguas (read -r v ke us tot j iss ts) siguen funcionando: se quedan con el
+# resto de la línea en la última variable.
 NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-printf '%s %s %s %s %s %s %s\n' "$CUR_VERSION" "$KE_N" "$US_N" "$TOT_N" "$JCOUNT" "$ISSUES" "$NOW" > "$LAST"
-printf '%s\n' "$CUR_VERSION $KE_N $US_N $TOT_N $JCOUNT $ISSUES $NOW" >> "$HIST" 2>/dev/null || true
+BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+if [ "$DRY" != true ]; then
+  printf '%s %s %s %s %s %s %s %s\n' "$CUR_VERSION" "$KE_N" "$US_N" "$TOT_N" "$JCOUNT" "$ISSUES" "$NOW" "$BOOT_ID" > "$LAST"
+  printf '%s\n' "$CUR_VERSION $KE_N $US_N $TOT_N $JCOUNT $ISSUES $NOW $BOOT_ID" >> "$HIST" 2>/dev/null || true
+fi
 
 # ----------------- salida -----------------
 PROFILE_OUT_TXT="?"

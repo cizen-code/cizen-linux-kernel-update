@@ -3452,6 +3452,121 @@ else
   rec fail "la extracción del nombre de firmware rompe con rutas tipo i915/..."
 fi
 
+# --- v27.33.0: la comparación de boot no puede ser contra UNA muestra ---
+# En este host el total de arranque va de 11.8 a 22.8 s (desv 2.9). Con el
+# criterio viejo (factor 1.35x y +3 s contra el arranque INMEDIATAMENTE
+# anterior) el 17.795 s de un 1-oct se contaba como incidencia: 17.795 era la
+# mediana del propio kernel. En el historial real, el criterio viejo daba 5
+# notificaciones de boot en 77 verificaciones y el nuevo 3, sin el flapping de
+# "dispara y en la siguiente verificación del MISMO arranque no".
+_br_hist="$ROOT/boot-ref.hist"
+_br_last="$ROOT/boot-ref.last"
+{ _sx float_ge; _sx boot_ref; _sx boot_check; } > "$ROOT/bootref.sh"
+# shellcheck disable=SC1090,SC1091
+source "$ROOT/bootref.sh"
+BOOT_REF_N=7; BOOT_REF_MIN=3; BOOT_FACTOR=1.35; BOOT_MIN_DELTA=3
+HIST="$_br_hist"; LAST="$_br_last"; CUR_VERSION="k-test"
+warn() { :; }; info() { :; }; DRY=false
+_br_line() { printf 'k-test 1.2 3.7 %s 0 0 2026-01-01T00:00:00Z %s\n' "$1" "$2"; }
+# Variante con kernel explícito, para comprobar que la referencia NO se
+# contruye con arranques de otro (escribir 22 s de "LTS" con k-test no probaría
+# nada: la línea seguiría siendo del kernel que se está consultando).
+_br_line_k() { printf '%s 1.2 3.7 %s 0 0 2026-01-01T00:00:00Z %s\n' "$1" "$2" "$3"; }
+_br_check() { ISSUES=0; boot_check 0 0 1.2 3.7 "$1" >/dev/null 2>&1; printf '%s' "$ISSUES"; }
+: > "$HIST"; : > "$LAST"
+# 5 arranques NORMALES y muy juntos en el tiempo (12.4-12.9): la referencia
+# tiene que ser ~12.6, no "el último".
+for i in 1 2 3 4 5; do _br_line 12.4 "b$i" >> "$HIST"; _br_line 12.9 "b$i" >> "$HIST"; _br_last="$(sed -n '$p' "$HIST")"; printf '%s\n' "$_br_last" > "$LAST"; done
+_br_ref="$(boot_ref k-test)"
+case "$_br_ref" in
+  12.*|13.*) rec ok "boot_ref: la referencia es una mediana de arranques, no el último (${_br_ref}s)" ;;
+  *)         rec fail "boot_ref dio '${_br_ref}' en vez de la mediana ~12.6s" ;;
+esac
+[ "$(_br_check 12.7)" = "0" ] \
+  && rec ok "boot: un arranque dentro de la norma no genera incidencia" \
+  || rec fail "boot: un arranque normal se cuenta como incidencia"
+[ "$(_br_check 18.5)" = "1" ] \
+  && rec ok "boot: una regresión clara contra la mediana sí genera incidencia" \
+  || rec fail "boot: una regresión sostenida ya no se detecta (el umbral se ha comido el rango)"
+# El caso exacto que-notificaba: 17.795 s con la mediana del kernel en 17.8.
+: > "$HIST"
+for i in 1 2 3 4 5 6 7; do _br_line 17.8 "n$i" >> "$HIST"; done
+printf 'k-test 1.2 3.7 17.8 0 0 2026-01-01T00:00:00Z n7\n' > "$LAST"
+[ "$(_br_check 17.795)" = "0" ] \
+  && rec ok "boot: el arranque de 17.795 s que-avISó ya no es incidencia (era la mediana)" \
+  || rec fail "boot: 17.795s contra su propia mediana sigue disparando (falso positivo)"
+# Varias verificaciones del MISMO arranque no son varios arranques: sin esto la
+# mediana se pondera por cuántas veces se verificó.
+: > "$HIST"
+for i in 1 2 3; do for _ in 1 2 3 4 5; do _br_line 13.0 "mismo$i" >> "$HIST"; done; done
+# El caso que hay que discriminar bien: 3 arranques rápidos verificados una vez
+# cada uno, y UN arranque lento verificado 5 veces (que es justo lo que pasaba
+# con el bug de --dry-run, que metía líneas de un mismo arranque).
+#   - deduplicando por boot_id -> 4 muestras [13,13,13,40] -> mediana 13.000
+#   - sin deduplicar          -> 8 muestras, 5 de ellas a 40 -> mediana 40.0
+# Las dos respuestas son distintas, así que el test mide de verdad.
+: > "$HIST"
+_br_line 40.0 "lento" >> "$HIST"
+for _ in 1 2 3 4 5; do _br_line 40.0 "lento" >> "$HIST"; done
+_br_line 13.0 "r1" >> "$HIST"
+_br_line 13.0 "r2" >> "$HIST"
+_br_line 13.0 "r3" >> "$HIST"
+_br_ref2="$(boot_ref k-test)"
+[ "$_br_ref2" = "13.000" ] \
+  && rec ok "boot_ref: un arranque verificado 5 veces no pesa como 5 arranques" \
+  || rec fail "boot_ref no deduplica por boot_id: mediana '$_br_ref2' (13.000 si deduplica, 40.0 si no)"
+# Y el determinista: 3 arranques IDÉNTICOS con boot_id distinto son 3 muestras,
+# no 1. Deduplicar por "total igual al anterior" colapsaba estos casos y la
+# mediana no se usaba nunca.
+: > "$HIST"
+_br_line 13.0 d1 >> "$HIST"; _br_line 13.0 d2 >> "$HIST"; _br_line 13.0 d3 >> "$HIST"
+[ -n "$(boot_ref k-test)" ] \
+  && rec ok "boot_ref: arranques idénticos con boot_id distinto son muestras distintas" \
+  || rec fail "boot_ref colapsa arranques deterministas y nunca alcanza la mediana"
+# Con menos muestras que el mínimo se cae al arranque previo (compatibilidad).
+: > "$HIST"; _br_line 15.0 u1 >> "$HIST"
+printf 'k-test 1.2 3.7 15.0 0 0 2026-01-01T00:00:00Z u1\n' > "$LAST"
+[ -z "$(boot_ref k-test)" ] && [ "$(_br_check 15.0)" = "0" ] \
+  && rec ok "boot: sin historial suficiente se usa el arranque previo, sin inventarbaseline" \
+  || rec fail "boot: con 1 sola muestra el comportamiento cambió sin avisar"
+# La referencia NO puede cruzar de kernel: el 22.797s del LTS no es una
+# regresión del Cizen.
+: > "$HIST"
+for i in 1 2 3 4 5; do _br_line_k 6.18.54-1.1-lts 22.0 "lts$i" >> "$HIST"; done
+[ -z "$(boot_ref k-test)" ] \
+  && rec ok "boot_ref: la referencia solo usa arranques del MISMO kernel" \
+  || rec fail "boot_ref mezcla arranques de otro kernel en la referencia"
+# Y al revés: las líneas del LTS no pueden servir de referencia para el LTS si
+# son en realidad de otro kernel (comprobación simétrica del parseo del campo).
+: > "$HIST"
+for i in 1 2 3 4 5; do _br_line_k k-test 22.0 "cizen$i" >> "$HIST"; done
+[ "$(boot_ref k-test)" = "22.0" ] \
+  && rec ok "boot_ref: con 5 muestras del kernel pedido sí construye referencia" \
+  || rec fail "boot_ref no encuentra referencias válidas del kernel pedido ('$(boot_ref k-test)')"
+unset -f float_ge boot_ref boot_check
+rm -f "$ROOT/bootref.sh" "$_br_hist" "$_br_last"
+
+# --- v27.33.0: --dry-run no puede cambiar la línea base ---
+# Se-annunciaba como "imprime sin notificar", pero sí escribía verify-last y
+# verify-history. Como boot_check y journal_check leen verify-last, una
+# auditoría manual dejaba el "previo" apuntando al ARRANQUE EN CURSO: la
+# comparación quedaba consigo misma. Y metía líneas en el historial, que es
+# justo de donde sale la referencia de boot.
+if grep -qF 'if [ "$DRY" != true ]; then' "$VERIFY_SRC" \
+   && grep -qE '^\s+printf .* > "\$LAST"' "$VERIFY_SRC" \
+   && grep -qF 'BOOT_ID="$(cat /proc/sys/kernel/random/boot_id' "$VERIFY_SRC"; then
+  rec ok "--dry-run no escribe verify-last/verify-history (ni el boot_id sin él)"
+else
+  rec fail "--dry-run sigue persistiendo estado: falsea la línea base de la verificación real"
+fi
+# El boot_id tiene que estar en la línea del historial: es lo que permite saber
+# si dos verificaciones son el mismo arranque.
+if grep -qE 'verify-history|\$HIST' "$VERIFY_SRC" && grep -q 'random/boot_id' "$VERIFY_SRC"; then
+  rec ok "el historial registra el boot_id (una línea por arranque, no por verificación)"
+else
+  rec fail "el historial no registra el boot_id: la deduplicación por arranque no puede funcionar"
+fi
+
 # --- rollback por PAQUETE, no solo por ficheros (v27.31.24) ---
 # El fallo que motivó esto: el archive de rollback guarda ficheros y krollback los
 # extraía, así que pacman seguía diciendo que estaba instalado el kernel NUEVO.

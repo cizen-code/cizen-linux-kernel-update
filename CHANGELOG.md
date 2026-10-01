@@ -1,3 +1,50 @@
+## [27.33.1] - 2026-10-01
+
+**La comparación de arranque deja de ser ruido.** El verificador notificaba un
+"boot más lento" en un arranque de 17.795 s que era exactamente la mediana del
+propio kernel, y `--dry-run` cambiaba la línea base de la verificación real.
+
+- **Por qué 17.795 no era una regresión.** El total de arranque de este host va
+  de 11.8 a 22.8 s con desviación de 2.9. El criterio anterior era `1.35x` y
+  `+3 s` contra el arranque **inmediatamente anterior**: una sola muestra, así
+  que cualquier salto de ruido cruzaba el umbral. En el historial real eso son
+  3 de 44 pares (6 %), y el caso peor era 17.795 s contra 12.823 — con una
+  mediana de 17.795 s detrás. No había regresión; había una muestra mala.
+- **Qué cambia.** `boot_ref()` calcula la **mediana de los últimos `N=7`
+  arranques del mismo kernel**, con mínimo `3` muestras
+  (`CIZEN_VERIFY_BOOT_REF_N`, `CIZEN_VERIFY_BOOT_REF_MIN`). Una mediana no se
+  desplaza por un arranque lento suelto, que es justo lo que hay que detectar
+  como anomalía y no como nuevo nivel. Sin muestras suficientes se cae al
+  arranque previo, que es el comportamiento de siempre.
+- **Solo el mismo kernel.** El 22.797 s del 27-sep era el
+  `6.18.54-1.1-lts`, no una regresión del Cizen. La referencia se filtra por
+  versión.
+- **Una línea por arranque, no por verificación.** Se registra el
+  `boot_id` al final de cada línea de `verify-history` y `boot_ref` deduplica
+  por él: una unit que corre dos veces en el mismo arranque, una verificación
+  manual y un `--dry-run` son el mismo dato. La primera versión deduplicaba por
+  "total igual al anterior" y rompía justo en el caso que más importa — con un
+  arranque determinista (5 arranques de 13.0 s seguidos) colapsaba las cinco
+  muestras en una y la mediana no se usaba nunca. El campo va al final, así que
+  las lecturas antiguas (`read -r v ke us tot j iss ts`) siguen funcionando.
+- **`--dry-run` deja de escribir.** Se anunciaba como "imprime sin notificar,
+  útil tras un reboot para auditar", pero escribía `verify-last` y
+  `verify-history`. Dos consecuencias: `verify-last` quedaba con los tiempos del
+  arranque **en curso**, así que el "previo" que leen `boot_check` y
+  `journal_check` acababa siendo el propio arranque y la comparación no
+  comprobaba nada; y metía líneas falsas en el historial, que es de donde sale
+  la referencia.
+- **Efecto medido.** Replay del historial real (77 verificaciones): el criterio
+  viejo daba **5** notificaciones de boot, el nuevo **3**, y desaparece el
+  *flapping* de "dispara y en la siguiente verificación del mismo arranque no".
+  Las 3 restantes son del tramo inicial, cuando aún no hay historial y se usa el
+  fallback.
+- **Tests.** 11 nuevos en `selftest.sh`, y la suite se comprobó en rojo contra
+  la copia instalada anterior (6 fallos, todos de este bloque). Uno de ellos
+  comprueba que un arranque verificado 5 veces no pesa como 5 arranques, con un
+  historial donde deduplicar y no deduplicar dan medianas distintas (13.000 vs
+  40.0) para que el test no pueda pasar por casualidad.
+
 ## [27.33.0] - 2026-09-30
 
 **El menú pasa `--no-btf` en todas las builds.** Decisión del usuario: este
