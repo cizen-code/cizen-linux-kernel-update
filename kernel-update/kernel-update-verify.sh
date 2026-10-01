@@ -27,7 +27,7 @@
 #   c) BOOT     : compara systemd-analyze (kernel/userspace/total) del boot
 #                 actual contra una REFERENCIA y avisa si el total la empeora
 #                 más allá de un factor/umbral. La referencia es la mediana de
-#                 los últimos N arranques del mismo kernel (v27.33.0); antes
+#                 los últimos N arranques del mismo kernel (v27.33.1); antes
 #                 era el arranque inmediatamente anterior, que con la
 #                 dispersión real de este host (11.8-22.8 s) disparaba por
 #                 azar. Sin historial suficiente se cae al arranque previo.
@@ -376,6 +376,34 @@ profile_check() {
   source "$profile" || { pc_warn "No se pudo cargar el perfil $profile; se omite perfil."; printf '%s\n' "0"; return 0; }
   load_renames
   load_retired_symbols
+
+  # v27.33.2: el desfase del perfil se averigua ANTES de contar símbolos, porque
+  # decide cómo se cuentan. "El kernel es anterior al perfil" es UN hecho, y se
+  # estaba contando dos: una vez por cada símbolo que el perfil pide y este
+  # kernel no tiene (bad[]), y otra por el sha distinto. Con un desfase real,
+  # el aviso de sha es el que explica los símbolos, así que los símbolos pasan
+  # a ser detalle de ese aviso y no incidencias aparte.
+  #
+  # Sin desfase (sha igual) NO cambia nada: cada símbolo incumplido sigue
+  # contando uno, porque entonces el kernel se compiló con este mismo perfil y
+  # no cumplirlo sí es un fallo real del build.
+  #
+  # El criterio es el SHA, no la fecha: una mtime distinta no significa nada
+  # (un `cp`, un `touch`, un checkout de git tocan el fichero sin cambiar su
+  # contenido), y avisar por eso era ruido puro. Por eso NO se usa mtime aquí.
+  local cur_sha="" profile_sha_reg="" profile_drift=false
+  if [ -f "$BUILD_SIG" ]; then
+    # shellcheck disable=SC1090,SC1091
+    # En subshell para no contaminar este ámbito con las variables del build
+    # (version, btf, patches…), que se leen más abajo con otro propósito.
+    profile_sha_reg="$( ( set +u; source "$BUILD_SIG" >/dev/null 2>&1; printf '%s' "${profile_sha:-}" ) )"
+    if [ -n "$profile_sha_reg" ]; then
+      cur_sha="$(sha256sum "$profile" 2>/dev/null | cut -d' ' -f1 || true)"
+      if [ -n "$cur_sha" ] && [ "$cur_sha" != "$profile_sha_reg" ]; then
+        profile_drift=true
+      fi
+    fi
+  fi
   local opt r st exp line
   local -a bad=() demoted=() skipped=()
 
@@ -451,9 +479,20 @@ for opt in "${OPTS_ENABLE[@]:-}"; do
 
   issue=0
   if [ "${#bad[@]}" -gt 0 ]; then
-    issues=$((issues + ${#bad[@]}))
-    pc_warn "El kernel en ejecución NO cumple el perfil (${#bad[@]}):"
-    for line in "${bad[@]}"; do pc_out "      $line"; done
+    if [ "$profile_drift" = true ]; then
+      # Un solo hecho, una sola incidencia: el kernel se compiló con un perfil
+      # anterior al vigente. Los símbolos que faltan son la consecuencia de
+      # eso, no N fallos independientes del build.
+      issues=$((issues + 1))
+      pc_warn "El kernel en ejecución se compiló con un perfil ANTERIOR al vigente: reconstruye para que lo refleje."
+      pc_out "      perfil vigente ${cur_sha:0:12} ≠ perfil del build ${profile_sha_reg:0:12}"
+      pc_out "      ${#bad[@]} símbolo(s) que el perfil pide y este kernel no cumple, por ese desfase:"
+      for line in "${bad[@]}"; do pc_out "      $line"; done
+    else
+      issues=$((issues + ${#bad[@]}))
+      pc_warn "El kernel en ejecución NO cumple el perfil (${#bad[@]}), y se compiló con este mismo perfil:"
+      for line in "${bad[@]}"; do pc_out "      $line"; done
+    fi
   else
     pc_ok "Perfil: el kernel en ejecución cumple OPTS/CRITICAL/SETVAL/SETSTR."
   fi
@@ -481,18 +520,17 @@ for opt in "${OPTS_ENABLE[@]:-}"; do
       fi
       unset btf_run
     fi
-    # El perfil con el que se firmó el último build (last-build: profile_sha) debe
-    # coincidir con el que se valida ahora; si cambió, el build no refleja el
-    # perfil vigente y conviene reconstruir. Compatible con firmas antiguas que
-    # no traen profile_sha (campo vacío → se omite).
-    if [ -n "${profile_sha:-}" ]; then
-      local cur_sha=""
-      cur_sha="$(sha256sum "$profile" | cut -d' ' -f1 2>/dev/null || true)"
-      if [ -n "$cur_sha" ] && [ "$cur_sha" != "$profile_sha" ]; then
-        pc_warn "El perfil ($profile) cambió desde el último build (sha actual $cur_sha ≠ registrado $profile_sha): reconstruye el kernel para que refleje el perfil vigente."
-        issues=$((issues + 1))
-      fi
-      unset cur_sha
+    # v27.33.2: el aviso de perfil desfasado se emite AQUÍ, pero NO se cuenta
+    # como incidencia cuando ya se ha contado arriba como desfase con símbolos
+    # incumplidos (era el mismo hecho contado dos veces). Solo se cuenta si el
+    # desfase no produjo ningún síntoma: el kernel es anterior al perfil pero
+    # cumple todo lo que el perfil vigente pide, así que no hay nada roto y solo
+    # se informa. Compatible con firmas antiguas sin profile_sha (se omite).
+    if [ "$profile_drift" = true ] && [ "${#bad[@]}" -eq 0 ]; then
+      issues=$((issues + 0))
+      pc_info "Perfil: el kernel es anterior al perfil vigente (${cur_sha:0:12} ≠ ${profile_sha_reg:0:12}) pero cumple todo lo que el perfil pide; reconstruye cuando quieras (no es una incidencia)."
+    elif [ "$profile_drift" = true ]; then
+      pc_info "Perfil: el desfase ya se ha contado arriba como una incidencia."
     fi
   fi
   printf '%s\n' "${issues:-0}"
@@ -608,7 +646,7 @@ boot_ref() { # $1 = versión de kernel -> imprime la mediana, o nada
     [ "$v" = "$want" ] || continue
     [[ "$tot" =~ ^[0-9]+(\.[0-9]+)?$ ]] || continue
     # Clave de arranque: el boot_id si la línea lo trae (formato actual), y si
-    # no, el par (timestamp, total) de las líneas escritas antes de v27.33.0.
+    # no, el par (timestamp, total) de las líneas escritas antes de v27.33.1.
     local key="${bid:-${ts:-}/$tot}"
     [ -n "${seen[$key]:-}" ] && continue
     seen[$key]=1
@@ -849,12 +887,14 @@ fp_field() { # $1 = firma, $2 = clave -> valor (vacío si no está)
 # desnuda "perfil=2" es un volcado de la firma, no un mensaje para el usuario.
 notify_field_label() {
   case "$1" in
-    # El número del perfil cuenta SÍMBOLOS de configuración que no cumplen
-    # (${#bad[@]} en profile_check), no un nivel ni un contador de arranques.
-    # Con la etiqueta a secas, "Perfil: 2 -> 0" al lado de un "Perfil: OK" se
-    # lee como dos cosas distintas y obliga a abrir el informe para saber qué
-    # cuenta. La unidad va en la etiqueta para que el número se entienda solo.
-    perfil)  printf 'Perfil (símbolos)' ;;
+    # El número del perfil cuenta incidencias de perfil, no un nivel ni un
+    # contador de arranques. Con la etiqueta a secas, "Perfil: 2 -> 0" al lado
+    # de un "Perfil: OK" se lee como dos cosas distintas y obliga a abrir el
+    # informe para saber qué cuenta.
+    # v27.33.2: ya no son SÍMBOLOS, porque el perfil desfasado cuenta 1 sola vez
+    # (los símbolos pasan a ser su detalle). Decir "símbolos" sobre un 1 que en
+    # realidad agrupa varios sería mentir sobre lo que cuenta el número.
+    perfil)  printf 'Perfil' ;;
     sched)   printf 'Scheduler' ;;
     journal) printf 'Journal' ;;
     fw)      printf 'Firmware' ;;
@@ -1078,7 +1118,7 @@ if [ "${P_VER:-}" != "$CUR_VERSION" ]; then FIRST_BOOT=true; fi
 # (2) el --dry-run documentado como auditoría tras un reboot ("imprime sin
 # notificar, útil tras un reboot para auditar") metía líneas falsas en
 # verify-history, que es de donde se saca la referencia de boot.
-# El boot_id (v27.33.0) es lo que permite saber si dos líneas son el MISMO
+# El boot_id (v27.33.1) es lo que permite saber si dos líneas son el MISMO
 # arranque: sin él, varias verificaciones dentro de un mismo arranque (la unit,
 # una manual, un --dry-run) cuentan como arranques independientes y sesgan la
 # mediana de la referencia. Va al final de la línea, así que las lecturas

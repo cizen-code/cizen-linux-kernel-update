@@ -1,3 +1,36 @@
+## [27.33.2] - 2026-10-01
+
+**«El kernel es anterior al perfil» se contaba dos veces.** Consecuencia directa
+de v27.33.1: al quedar la duplicación de perfil como única incidencia real, el
+número que acompaña a la notificación era el que inflaba el recuento.
+
+- **El defecto.** `profile_check` contaba el mismo hecho por dos lados: una
+  incidencia por cada símbolo que el perfil pide y el kernel no tiene (`bad[]`),
+  y otra por el sha distinto del perfil del build. Con un desfase real son la
+  **misma causa** y el arreglo es el mismo —reconstruir—, así que la
+  notificación de hoy ponía `Perfil: FALLO` con 2 incidencias por un único
+  hecho.
+- **Qué cambia.** El desfase se detecta **antes** de contar, porque decide cómo
+  se cuenta. Con sha distinto: una sola incidencia, y los símbolos pasan a ser
+  el detalle del aviso (`N símbolo(s) que el perfil pide y este kernel no
+  cumple, por ese desfase`), sin perder ni uno. Sin sha distinto **no cambia
+  nada**: cada símbolo incumplido sigue contando uno, porque entonces el kernel
+  se compiló con ese mismo perfil y no cumplirlo sí es un fallo del build.
+- **Desfase sin síntomas.** Si el kernel es anterior al perfil pero cumple todo
+  lo que el perfil pide —un cambio de comentario, un nombre—, se informa con
+  `pc_info` y **no** cuenta incidencia: no hay nada roto.
+- **El criterio sigue siendo el sha, nunca la `mtime`.** Un `cp`, un `touch` o
+  un checkout de git tocan el fichero sin cambiar su contenido; avisar por la
+  fecha sería ruido. Hay un test que falla si vuelve a aparecer un `stat -c %Y`
+  sobre el perfil.
+- **Etiqueta de la notificación.** `Perfil (símbolos)` → `Perfil`: el número ya
+  no cuenta símbolos (el 1 agrupa varios), y la etiqueta anterior mentía sobre
+  lo que mide.
+- **Tests.** 6 nuevos, con perfil y firma sintéticos para cubrir los dos lados
+  (con el perfil real de esta máquina solo se puede provocar uno), más el del
+  `mtime`. 534 ok / 0 fail; contra la copia v27.32 fallan 9, los de v27.33.1 y
+  los de este bloque.
+
 ## [27.33.1] - 2026-10-01
 
 **La comparación de arranque deja de ser ruido.** El verificador notificaba un

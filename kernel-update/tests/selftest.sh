@@ -3452,7 +3452,7 @@ else
   rec fail "la extracción del nombre de firmware rompe con rutas tipo i915/..."
 fi
 
-# --- v27.33.0: la comparación de boot no puede ser contra UNA muestra ---
+# --- v27.33.1: la comparación de boot no puede ser contra UNA muestra ---
 # En este host el total de arranque va de 11.8 a 22.8 s (desv 2.9). Con el
 # criterio viejo (factor 1.35x y +3 s contra el arranque INMEDIATAMENTE
 # anterior) el 17.795 s de un 1-oct se contaba como incidencia: 17.795 era la
@@ -3546,8 +3546,8 @@ for i in 1 2 3 4 5; do _br_line_k k-test 22.0 "cizen$i" >> "$HIST"; done
 unset -f float_ge boot_ref boot_check
 rm -f "$ROOT/bootref.sh" "$_br_hist" "$_br_last"
 
-# --- v27.33.0: --dry-run no puede cambiar la línea base ---
-# Se-annunciaba como "imprime sin notificar", pero sí escribía verify-last y
+# --- v27.33.1: --dry-run no puede cambiar la línea base ---
+# Se anunciaba como "imprime sin notificar", pero sí escribía verify-last y
 # verify-history. Como boot_check y journal_check leen verify-last, una
 # auditoría manual dejaba el "previo" apuntando al ARRANQUE EN CURSO: la
 # comparación quedaba consigo misma. Y metía líneas en el historial, que es
@@ -3559,6 +3559,158 @@ if grep -qF 'if [ "$DRY" != true ]; then' "$VERIFY_SRC" \
 else
   rec fail "--dry-run sigue persistiendo estado: falsea la línea base de la verificación real"
 fi
+# --- v27.33.2: "el kernel es anterior al perfil" es UN hecho, no N ---
+# Se contaba dos veces: una por cada símbolo que el perfil pide y el kernel no
+# tiene (bad[], issues += 1 por símbolo) y otra por el sha distinto del build.
+# Con un desfase real son la MISMA causa y el arreglo es el mismo (reconstruir),
+# así que se cuentan una vez y los símbolos quedan como detalle del aviso.
+#
+# El banco usa perfil y firma sintéticos para cubrir los dos lados: con
+# el perfil real de esta máquina solo se puede provocar un lado.
+_pfx="$ROOT/profcheck"
+rm -rf "$_pfx"; mkdir -p "$_pfx"
+# Perfil mínimo: un símbolo en OPTS_ENABLE y otro que el kernel sí tendrá.
+cat > "$_pfx/perfil.conf" <<'PC'
+OPTS_ENABLE=(TEST_SYM_ROTO TEST_SYM_BUENO)
+PC
+_sha_real="$(sha256sum "$_pfx/perfil.conf" | cut -d' ' -f1)"
+printf 'version=7.2.8\nprofile_sha=%s\n' "$_sha_real" > "$_pfx/firma-igual"
+printf 'version=7.2.8\nprofile_sha=%s\n' "0000000000000000000000000000000000000000000000000000000000000000" > "$_pfx/firma-distinta"
+# run_state stub: TEST_SYM_ROTO está en n, TEST_SYM_BUENO en y.
+# OJO: find_profile tiene que apuntar al perfil del banco, o profile_check
+# cargaría el perfil real de la máquina (donde casi nada falla y el contador no
+# mide lo que el test cree). Las funciones que usa profile_check y que aquí no
+# se sustituyen (build_sig_field y las del scheduler) también se extraen, o
+# fallan con «orden no encontrada» y el banco mide el fallo de bash, no el del
+# verificador.
+{
+  _sx build_sig_field
+  _sx expected_sched_from_signature
+  _sx sched_label
+  _sx retired_symbols_for_sched
+  # RETIRED es un associative array global del verificador; sin inicializarlo,
+  # load_retired_symbols explota al indexarlo y profile_check aborta a mitad.
+  printf 'declare -A RENAMES=()\ndeclare -A RETIRED=()\nRETIRED_SCHED=""; RETIRED_SRC=""; RETIRED_LIST=""; RUN_CFG_X=1\n'
+  _sx load_renames
+  _sx load_retired_symbols
+  _sx sym_retired
+  _sx retired_reason
+  _sx resolve_sym
+  _sx profile_check
+  printf 'run_state() { case "$1" in TEST_SYM_ROTO) printf "%%s\\n" n ;; *) printf "%%s\\n" y ;; esac; return 0; }\n'
+  printf 'find_profile() { printf "%%s\\n" "%s/perfil.conf"; }\n' "$_pfx"
+  # El selftest va con `set -u`, y load_renames usa RENAME_MAP_FILE tal cual.
+  # Aquí las globales no existen (el script real las define arriba del todo),
+  # así que sin esto profile_check aborta por RENAME_MAP_FILE sin asignar y el
+  # banco mide un fallo de bash en vez de la lógica del verificador. El valor
+  # apunta a un fichero inexistente, que es lo mismo que pasa en un equipo sin
+  # rename-map.
+  printf 'RENAME_MAP_FILE="%s/no-existe"\n' "$_pfx"
+} > "$_pfx/fns.sh"
+# shellcheck disable=SC1090,SC1091
+source "$_pfx/fns.sh"
+_pc() { # $1 = firma -> "incidencias|lineas de warn"
+  declare -A RUN_CFG=()
+  # El perfil del banco solo define OPTS_ENABLE. profile_check NO limpia
+  # CRITICAL_OPTS/OPTS_SETVAL/OPTS_SETSTR, y en el script real los define el
+  # perfil siempre, así que ahí no se nota; pero dentro del selftest esos
+  # arrays vienen de pruebas anteriores y si se dejan, cada fila que contengan
+  # se cuela como incidencia y el banco mide datos ajenos.
+  unset CRITICAL_OPTS OPTS_SETVAL OPTS_SETSTR
+  # El contador va por STDOUT y los avisos por STDERR (contrato de
+  # profile_check), así que se capturan por separado: si se juntan en una
+  # sola captura el número que sale es la cuenta de warnings, no la de
+  # incidencias, y el banco mide otra cosa.
+  BUILD_SIG="$1"
+  _n="$(profile_check 2>/dev/null)"
+  _out="$(profile_check 2>&1 >/dev/null)"
+  printf '%s|%s' "$_n" "$(printf '%s\n' "$_out" | grep -c '⚠')"
+}
+# Desfase: el sha del build no es el del perfil vigente.
+_r="$(_pc "$_pfx/firma-distinta")"
+_n="${_r%%|*}"; _w="${_r##*|}"
+if [ "$_n" = "1" ] && [ "$_w" = "1" ]; then
+  rec ok "perfil: con sha desfasado, 1 símbolo roto cuenta 1 sola vez (antes 2)"
+else
+  rec fail "perfil desfasado: ${_n} incidencias y ${_w} warns; debe ser 1 y 1"
+fi
+# Sin desfase: el kernel se compiló con ESE perfil, así que no cumplirlo sí es
+# un fallo del build y cada símbolo cuenta por separado.
+_r="$(_pc "$_pfx/firma-igual")"
+_n="${_r%%|*}"; _w="${_r##*|}"
+if [ "$_n" = "1" ] && [ "$_w" = "1" ]; then
+  rec ok "perfil: sin sha desfasado, cada símbolo roto cuenta aparte (como antes)"
+else
+  rec fail "perfil sin desfase: ${_n} incidencias y ${_w} warns; debe ser 1 y 1"
+fi
+# El detalle de los símbolos no puede perderse al agrupar: quien lo lea tiene
+# que saber QUÉ falta, no solo que falta algo.
+BUILD_SIG="$_pfx/firma-distinta"
+_pc_txt="$(profile_check 2>&1 >/dev/null)"
+if printf '%s\n' "$_pc_txt" | grep -q 'TEST_SYM_ROTO' \
+   && printf '%s\n' "$_pc_txt" | grep -q 'símbolo(s) que el perfil pide'; then
+  rec ok "perfil: al agrupar, los símbolos siguen apareciendo uno a uno en el aviso"
+else
+  rec fail "perfil: al agrupar se perdió el detalle de qué símbolos faltan"
+fi
+# Desfase SIN síntomas (el kernel cumple todo): se informa pero no cuenta.
+# El run_state cambia a "todo y", y con eso el perfil NO tiene nada que
+# incumplir; el resto de funciones extraídas son las mismas.
+{
+  _sx build_sig_field
+  _sx expected_sched_from_signature
+  _sx sched_label
+  _sx retired_symbols_for_sched
+  # RETIRED es un associative array global del verificador; sin inicializarlo,
+  # load_retired_symbols explota al indexarlo y profile_check aborta a mitad.
+  printf 'declare -A RENAMES=()\ndeclare -A RETIRED=()\nRETIRED_SCHED=""; RETIRED_SRC=""; RETIRED_LIST=""; RUN_CFG_X=1\n'
+  _sx load_renames
+  _sx load_retired_symbols
+  _sx sym_retired
+  _sx retired_reason
+  _sx resolve_sym
+  _sx profile_check
+  printf 'run_state() { printf "%%s\\n" y; return 0; }\n'
+  printf 'find_profile() { printf "%%s\\n" "%s/perfil.conf"; }\n' "$_pfx"
+  printf 'RENAME_MAP_FILE="%s/no-existe"\n' "$_pfx"
+} > "$_pfx/fns-ok.sh"
+# shellcheck disable=SC1090,SC1091
+source "$_pfx/fns-ok.sh"
+# El unset tiene que estar TAMBIÉN aquí: _pc lo hace, pero estas dos llamadas
+# sueltas no. El perfil sintético no define OPTS_SETVAL, y si sobrevive el del
+# perfil real (traído por otro test) aparecen filas SETVAL que este banco no
+# pidió, y entonces mide otra cosa.
+unset CRITICAL_OPTS OPTS_SETVAL OPTS_SETSTR
+_r="$(_pc "$_pfx/firma-distinta")"
+_pc_txt="$(BUILD_SIG="$_pfx/firma-distinta"; profile_check 2>&1 >/dev/null)"
+# 0 incidencias y 0 warns: sin síntomas no hay nada roto, así que ni cuenta ni
+# avisa en ⚠; el desfase solo sale como línea informativa (•).
+if [ "$_r" = "0|0" ] && printf '%s\n' "$_pc_txt" | grep -q 'anterior al perfil vigente' \
+   && printf '%s\n' "$_pc_txt" | grep -q '•'; then
+  rec ok "perfil: desfase sin síntomas se informa pero no cuenta incidencia"
+else
+  rec fail "perfil: desfase sin símbolos dio '${_r}' (debe ser 0|0)"
+fi
+# Firma antigua sin profile_sha: se omite el desfase, no se rompe. Con el
+# run_state de "todo y" (el de arriba) el perfil se cumple entero, así que sin
+# profile_sha tampoco hay nada que contar: tiene que dar 0, no 1.
+printf 'version=7.2.8\n' > "$_pfx/firma-sin-sha"
+_n="$(_pc "$_pfx/firma-sin-sha")"
+if [ "$_n" = "0|0" ]; then
+  rec ok "perfil: una firma sin profile_sha omite el desfase y no inventa nada"
+else
+  rec fail "perfil: firma sin profile_sha dio '${_n}' (debe ser 0|0)"
+fi
+# El desfase NO puede decidirse por mtime: un `touch` o un checkout de git no
+# cambian el contenido del perfil, así que avisar por la fecha sería ruido.
+if grep -qE 'stat -c *%Y.*profile|profile.*stat -c *%Y' "$VERIFY_SRC"; then
+  rec fail "el verificador vuelve a mirar el mtime del perfil: eso no significa que cambie"
+else
+  rec ok "el desfase del perfil se decide por sha, no por mtime"
+fi
+unset -f profile_check run_state load_retired_symbols sym_retired retired_reason resolve_sym load_renames
+rm -rf "$_pfx"
+
 # El boot_id tiene que estar en la línea del historial: es lo que permite saber
 # si dos verificaciones son el mismo arranque.
 if grep -qE 'verify-history|\$HIST' "$VERIFY_SRC" && grep -q 'random/boot_id' "$VERIFY_SRC"; then
