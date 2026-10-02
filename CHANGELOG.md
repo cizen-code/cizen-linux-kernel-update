@@ -1,3 +1,108 @@
+## [27.33.6] - 2026-10-02
+
+**Cerrado el ciclo de PGO de punta a punta: por primera vez en esta máquina hay
+un `.afdo` real, y el build que lo consume lo aplicó de verdad.** La primera
+mitad es lo que cuenta abajo (captura, LBR, conversión). La segunda son estos dos
+ajustes, que salieron **ejecutando** el build con el perfil en la mano, y que
+ningún test habría encontrado antes: no había nada que testear hasta que el ciclo
+llegó a cerrarse.
+
+**Primera mitad: el perfil nunca llegó a existir.** Quince minutos de captura y
+365 MB de `perf.data` tirados a la basura: el `.afdo` no llegó a existir nunca. El perfil falló en la conversión, después de
+todo el trabajo, y el `trap` de limpieza se llevó la captura con él. Tres fallos
+encadenados, ninguno de los tres visibles en el mensaje que salió.
+
+- **`llvm-profgen` sin `--kernel`.** La receta de
+  `docs.kernel.org/dev-tools/autofdo.html` para el kernel es
+  `llvm-profgen --kernel --binary=<vmlinux> --perfdata=<perf.data>`. Sin ese
+  flag, `llvm-profgen` busca binarios de **espacio de usuario** en los mmap
+  events del `perf.data`; como el muestreo es solo de kernel, no encuentra
+  ninguno y aborta con `No relevant mmap event is found in perf data`. El script
+  nunca lo pasó. (Habría bastado además `-kallsyms` en el `perf record` para que
+  saliera el mmap de `[kernel.kallsyms]`, pero la vía correcta es `--kernel`.)
+- **La captura no tenía ni una sola rama.** El script grababa
+  `perf record -F 999 -a -g`, que es una radiografía de IPs. AutoFDO no pondera
+  «cuántas veces se ejecutó una línea» sino las **predicciones** de cada bloque
+  básico, y eso solo sale de la pila de ramas: el `--help` del propio
+  `llvm-profgen` avisa («it should be profiled with `-b`») y la doc prescribe el
+  evento LBR del fabricante con periodo primo. SeSampling por frecuencia y sin
+  `-b` habría producido, como mucho, un perfil inservible.
+  Ahora `pgo_perf_event()` elige la receta de la doc según el vendor:
+  `br_inst_retired.near_taken:k -b -c 500009` en Intel con LBR,
+  `--pfm-events RETIRED_TAKEN_BRANCH_INSTRUCTIONS:k -b` en AMD Zen3 (BRS) o
+  Zen4 (`amd_lbr_v2`), y **error con explicación** donde no hay LBR, en vez de
+  capturar en balde.
+- **El reparto de argumentos se rompía por el `IFS` del propio script.** Al
+  cambiar la captura, la receta se pasaba como texto y se expandía sin comillas
+  (`$PERF_LBR`). El script declara `IFS=$'\n\t'` — **sin espacio** — así que no
+  se parte en palabras: `perf record` recibía
+  `-e "br_inst_retired.near_taken:k -b"` como **un** evento y moría con
+  `event syntax error: '..ar_taken:k -b'`, otra vez antes de muestrear. Es la
+  misma trampa que el `read -r a b c` de la v27.33.5, por el mismo motivo. La
+  receta se deja ahora en el array `PGO_PERF_ARGS` y se pasa como
+  `"${PGO_PERF_ARGS[@]}"`, con lo que el `IFS` deja de importar. Hay un test
+  que reproduce el `IFS` real y exige 3 tokens, no una frase.
+- **`trap 'rm -rf "$TMPD"' EXIT` borraba la captura justo cuando hacía falta.**
+  Ahora el `perf.data` se conserva junto al `.afdo` si la conversión falla
+  (`<salida>.perf.data`, más `--keep-perfdata` para conservarlo siempre), así
+  que un fallo de conversión se reconvierte sin volver a muestrear.
+- **El perfil salía en `/root/kernel-pgo` y en un directorio que no podías
+  tocar.** `sudo` cambia `$HOME`, así que el `.afdo` se escribía donde el paso 3
+  del ciclo (`kernel-update.sh --pgo` a secas, que busca en `$HOME/kernel-pgo`)
+  no lo ve. Se resuelve el home de `$SUDO_USER` y se deja el fichero con su
+  propietario. Y el **directorio** también: si nace de root, el `.afdo` es tuyo
+  pero no puedes borrarlo, porque unlink pide escritura en el directorio, no en
+  el fichero. Con `--out` explícito se respeta lo que digas.
+- **La receta de captura se imprimía partida en tres renglones.** El join
+  `"${PGO_PERF_ARGS[*]}"` une por el primer carácter del `IFS`, que aquí es `\n`.
+  Cosmético, pero esconde el resto de la línea: el mensaje parecía truncado.
+- **Aviso nuevo, no bloqueante:** si el kernel en marcha no se compiló con
+  `CONFIG_AUTOFDO_CLANG`, se dice. Upstream lo llama *advisable* (el perfil usa
+  números de línea relativos y tolera la diferencia), así que el ciclo puede
+  seguir; lo que no puede seguir es creerse que el perfil es de primera.
+- **El resumen anunciaba un build SIN PGO, justo en la forma que documenta el
+  README.** `ask_build_pgo` marca `PGO_CHANGED` solo en el camino interactivo y en
+  `--pgo` a secas; la rama de `--pgo <fichero>` —la que dice el README, y la que
+  se usó— entraba y salía con `PGO_CHANGED=0`. Ese flag es lo único que lee
+  `pgo_disp_suffix`, así que el bloque «Configuración lista para compilar» imprimía
+  `+ bore + clang` sin `+ PGO`. **El build llevaba `-fprofile-sample-use`
+  igualmente**: el perfil viaja por `KCONFIG_CC_OPTS` (líneas ~919 y ~11007), que
+  no mira ese flag. Un resumen que miente sobre lo que lleva la build es peor que
+  no resumir, porque es la línea donde uno comprueba si el perfil entró antes de
+  esperar media hora al compilador. Ahora la rama también marca `PGO_CHANGED=1`,
+  con la condición de que el perfil no esté vacío: sin fichero detrás no se
+  anuncia un perfil que no existe. La causa era la ambigüedad del flag, cuyo
+  comentario decía «cambió el perfil en esta llamada» cuando lo que significa de
+  verdad es «esta build lleva PGO». Es la v27.31.53 en sentido inverso: allí el
+  `+ PGO` salía siempre, aquí no salía nunca en un caso.
+- **La suite se despliega a mano, y a mano se le olvidó el `+x` a dos
+  ficheros.** No hay `PKGBUILD`, `Makefile` ni script de instalación en el repo: el
+  README documenta un `install -Dm755` **por fichero**, y el 2-oct el motor y
+  `pgo-collect.sh` quedaron en `644` en `/usr/local/bin/kernel-update/` mientras
+  los otros ocho seguían en `755`. El síntoma fue «Permiso denegado» al arrancar
+  el motor recién compilado. No es un bug corregible en el motor —es el modo de
+  despliegue—, así que lo que se hace es no volver a hacerlo: el README lleva la
+  receta completa y un test recorre la suite exigiendo el bit `+x` en los 10
+  ejecutables del repo, que es el único lado que el repo controla.
+- **Tests: 22 nuevos → 601 ok / 0 fail**, en rojo contra el commit anterior.
+  Cubren la elección de evento con cuatro cpuinfo de mentira (Intel con y sin
+  el evento, AMD con `brs`, AMD con `amd_lbr_v2`, AMD sin LBR y vendor
+  desconocido), que toda receta lleve `-b`, que los argumentos lleguen a `perf`
+  como tokens sueltos con el `IFS` real del script, que la conversión pase
+  `--kernel`, que el trap conserve la captura, el periodo primo por defecto, la
+  resolución del home con y sin `SUDO_USER`, y la detección de
+  `CONFIG_AUTOFDO_CLANG`. El arnés extrae por primera vez de
+  `pgo-collect.sh`, que no vive en el motor: si el script está pero sus
+  funciones no son extraíbles, eso se marca como **fallo**, no como «omitido».
+  Los cinco últimos cubren el cierre del ciclo: que `--pgo <fichero>` marque el
+  cambio y ponga `+ PGO` en el resumen, que `--pgo` a secas siga funcionando, que
+  sin PGO no se anuncie (el resumen no puede mentir al revés), que `--pgo` sin
+  perfil detrás no invente un perfil, y que los 10 ejecutables de la suite
+  lleguen con `+x`. Los de PGO extraen `ask_build_pgo` y `pgo_disp_suffix` y
+  comprueban el **flag** que alimenta el anuncio, no el texto impreso: un test
+  que grepa la cadena de salida pasa aunque el resumen vuelva a mentir, porque
+  el texto es una consecuencia del flag.
+
 ## [27.33.5] - 2026-10-02
 
 **El resumen de acierto de ccache no se había impreso nunca, y su error salía

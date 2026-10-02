@@ -110,6 +110,10 @@ extract_fn() { # $1 = nombre de función
       if (d==0) exit
     }' "$MOTOR"
 }
+# Igual que extract, pero de OTRO fichero: pgo-collect.sh no vive en el motor.
+extract_from() { # $1 = fichero, $2 = nombre de función
+  sed -n "/^[[:space:]]*$2() {/,/^}/p" "$1"
+}
 {
   extract bore_branch_from_version
   extract patch_desc_bore
@@ -183,6 +187,20 @@ extract_fn() { # $1 = nombre de función
   extract rollback_manifest_unset
   extract rollback_manifest_matches
   extract preserve_rollback_package
+  extract ask_build_pgo
+  extract pgo_disp_suffix
+  extract pgo_profile_dir
+  # v27.33.6: pgo-collect.sh es un script aparte, no el motor. Sus decisiones se
+  # extraen del SCRIPT hermano; si no está (la suite instalada no lo copia), los
+  # tests de PGO se omiten en vez de tumbar el arnés entero.
+  PGO="$(dirname -- "$MOTOR")/pgo-collect.sh"
+  [ -f "$PGO" ] || PGO="$HOME/Proyectos/cizen-linux-kernel-update/kernel-update/pgo-collect.sh"
+  if [ -f "$PGO" ]; then
+    extract_from "$PGO" pgo_perf_args
+    extract_from "$PGO" pgo_perf_event
+    extract_from "$PGO" pgo_target_home
+    extract_from "$PGO" pgo_running_autofdo
+  fi
 } > "$ROOT/fns.sh"
 
 if [ ! -s "$ROOT/fns.sh" ]; then
@@ -5962,6 +5980,295 @@ if sed -n '/^CCACHE_STATS=""$/,/^fi$/p' "$MOTOR" | grep -q 'ccache_snapshot_pars
   rec ok "ccache: el resumen del build usa el parseo testeable, no un read en línea"
 else
   rec fail "ccache: el resumen del build no usa ccache_snapshot_parse (IFS lo rompe)"
+fi
+
+# --- PGO: por qué la captura de 15 min no servía para nada ----------------
+# Las tres funciones viven en pgo-collect.sh, no en el motor. Se prueban en un
+# subshell con stubs, sustituyendo /proc/cpuinfo y perf porCollaboradores de
+# pega: la máquina de quien correr esto no tiene por qué ser Intel con LBR.
+if [ -f "$PGO" ] && declare -f pgo_perf_event >/dev/null 2>&1; then
+  PGT="$ROOT/pg"; mkdir -p "$PGT"
+  # La función recibe el fichero de cpuinfo como $1 (en producción, /proc/cpuinfo),
+  # así que el arnés le pasa cpuinfos de mentira y solo tiene que doblar `perf list`.
+  cat > "$PGT/ev.sh" <<'HEOF'
+set -u
+IFS=$'\n\t'   # el IFS REAL del script: sin espacio, que es la trampa
+HAS_NEAR="${HAS_NEAR:-0}"
+perf() { # imita `perf list <patrón>`: imprime los eventos que encuentra, o nada
+  case "$*" in
+    *br_inst_retired.near_taken*)
+      [ "$HAS_NEAR" = 1 ] || return 1
+      printf '  br_inst_retired.near_taken\n       [Taken branch instructions retired]\n'
+      ;;
+  esac
+  return 1
+}
+HEOF
+  sed -n "/^pgo_perf_args() {/,/^}/p" "$PGO" >> "$PGT/ev.sh"
+  printf 'PGO_PERF_ARGS=()\n' >> "$PGT/ev.sh"
+  sed -n "/^pgo_perf_event() {/,/^}/p" "$PGO" >> "$PGT/ev.sh"
+  printf 'pgo_perf_event "$1"\n' >> "$PGT/ev.sh"
+  # Y el mismo arnés pero por la variante con array: es la que llama a `perf
+  # record`, y su partición en tokens es lo que se rompió (el IFS del script no
+  # tiene espacio, así que "$var" sin comillas no parte nada).
+  cat > "$PGT/arr.sh" <<'HEOF'
+set -u
+IFS=$'\n\t'   # el IFS REAL del script: sin espacio, que es la trampa
+HAS_NEAR="${HAS_NEAR:-0}"
+perf() {
+  case "$*" in
+    *br_inst_retired.near_taken*)
+      [ "$HAS_NEAR" = 1 ] || return 1
+      printf '  br_inst_retired.near_taken\n'
+      ;;
+  esac
+  return 1
+}
+HEOF
+  sed -n "/^pgo_perf_args() {/,/^}/p" "$PGO" >> "$PGT/arr.sh"
+  cat >> "$PGT/arr.sh" <<'HEOF'
+pgo_perf_args "$1" || exit 1
+printf 'N=%s\n' "${#PGO_PERF_ARGS[@]}"
+printf '[%s]\n' "${PGO_PERF_ARGS[@]}"
+HEOF
+  arr() { HAS_NEAR="$1" bash "$PGT/arr.sh" "$2"; }
+  printf 'vendor_id\t: GenuineIntel\nmodel name\t: Intel(R) Core(TM) i5-7500\n' > "$PGT/intel-ok"
+  printf 'vendor_id\t: AuthenticAMD\nmodel name\t: AMD Ryzen 9 5950X\nflags\t: fpu vme de pse tsc\nbrs\n' > "$PGT/amd-brs"
+  printf 'vendor_id\t: AuthenticAMD\nmodel name\t: AMD Ryzen 9 5950X\nflags\t: fpu vme de pse tsc\namd_lbr_v2\n' > "$PGT/amd-lbrv2"
+  printf 'vendor_id\t: AuthenticAMD\nmodel name\t: AMD Ryzen 5 3600\nflags\t: fpu vme de pse tsc\n' > "$PGT/amd-no"
+  printf 'vendor_id\t: RISC-V\n' > "$PGT/otro"
+  ev() { HAS_NEAR="$1" bash "$PGT/ev.sh" "$2"; }
+
+  # 1. Intel con el evento LBR presente: la receta de la doc, con -b (sin -b el
+  #    perfil no tiene ramas y llvm-profgen no puede ponderar nada).
+  if [ "$(ev 1 "$PGT/intel-ok")" = "-e br_inst_retired.near_taken:k -b" ]; then
+    rec ok "pgo: Intel con LBR pide el evento de la doc y -b (rama)"
+  else
+    rec fail "pgo: Intel con LBR dio '$(ev 1 "$PGT/intel-ok")'"
+  fi
+  # 2. Intel SIN el evento en perf list: no se inventa un evento, se rinde (rc=1)
+  if ev 0 "$PGT/intel-ok" >/dev/null 2>&1; then
+    rec fail "pgo: Intel sin near_taken fingió tener LBR"
+  else
+    rec ok "pgo: Intel sin el evento LBR devuelve error en vez de capturar sin ramas"
+  fi
+  # 3. AMD Zen3 con BRS y Zen4 con amd_lbr_v2: --pfm-events, no un evento de Intel
+  if [ "$(ev 0 "$PGT/amd-brs")" = "--pfm-events RETIRED_TAKEN_BRANCH_INSTRUCTIONS:k -b" ] \
+     && [ "$(ev 0 "$PGT/amd-lbrv2")" = "--pfm-events RETIRED_TAKEN_BRANCH_INSTRUCTIONS:k -b" ]; then
+    rec ok "pgo: AMD con BRS o con amd_lbr_v2 usa --pfm-events (y no el evento de Intel)"
+  else
+    rec fail "pgo: AMD con LBR dio '$(ev 0 "$PGT/amd-brs")' / '$(ev 0 "$PGT/amd-lbrv2")'"
+  fi
+  # 4. AMD sin LBR (Zen1/Zen2) y un vendor que no sea Intel/AMD: mismo silencio
+  if ! ev 0 "$PGT/amd-no" >/dev/null 2>&1 && ! ev 0 "$PGT/otro" >/dev/null 2>&1; then
+    rec ok "pgo: AMD sin BRS/amd_lbr_v2, y un vendor desconocido, devuelven error"
+  else
+    rec fail "pgo: se fingió LBR donde no hay (amd-no u otro vendor)"
+  fi
+  # 5. La aritmética es irrelevante pero el string de args tiene que llevar -b
+  RECETA="$(ev 1 "$PGT/intel-ok")"
+  if grep -q -- '-b' <<<"$RECETA" && grep -q -- '-b' <<<"$(ev 0 "$PGT/amd-brs")"; then
+    rec ok "pgo: toda receta de captura incluye -b (llvm-profgen lo exige)"
+  else
+    rec fail "pgo: alguna receta de captura se quedó sin -b"
+  fi
+  # 5a. Y la receta se imprime en UNA línea: con el IFS del script, "${arr[*]}"
+  #     une por \n y el mensaje salía partido en tres renglones. La comparación
+  #     exacta ya lo cubre: una versión con saltos de línea no puede igualarla.
+  if [ "$RECETA" = "-e br_inst_retired.near_taken:k -b" ]; then
+    rec ok "pgo: la receta se imprime en una línea (el join no usa el IFS del script)"
+  else
+    rec fail "pgo: la receta sale partida: '$(printf %s "$RECETA" | tr '\n' '|')'"
+  fi
+  # 5b. La forma que de verdad llega a `perf record` son tokens sueltos. Con el
+  #     IFS=$'\n\t' del script, partir una cadena sin comillas no la parte:
+  #     perf llegó a recibir "-e br_inst_retired.near_taken:k -b" como UN evento
+  #     («event syntax error: '..ar_taken:k -b'») y no arrancó el muestreo.
+  A_INTEL="$(arr 1 "$PGT/intel-ok")"
+  A_AMD="$(arr 0 "$PGT/amd-brs")"
+  if [ "$(head -1 <<<"$A_INTEL")" = "N=3" ] && [ "$(head -1 <<<"$A_AMD")" = "N=3" ]; then
+    rec ok "pgo: los args de perf son 3 tokens, no una frase (el IFS del script no parte strings)"
+  else
+    rec fail "pgo: args de perf mal partidos: Intel=$(tr '\n' ' ' <<<"$A_INTEL") AMD=$(tr '\n' ' ' <<<"$A_AMD")"
+  fi
+  if [ "$(sed -n '2p' <<<"$A_INTEL")" = "[-e]" ] && [ "$(sed -n '3p' <<<"$A_INTEL")" = "[br_inst_retired.near_taken:k]" ] \
+     && [ "$(sed -n '2p' <<<"$A_AMD")" = "[--pfm-events]" ]; then
+    rec ok "pgo: -e y --pfm-events van en su propio token (perf no los traga pegados)"
+  else
+    rec fail "pgo: token mal colocado: $(tr '\n' ' ' <<<"$A_INTEL")"
+  fi
+  # 5c. Y la línea de captura tiene que expandir el array, no la cadena.
+  if grep -q '"${PGO_PERF_ARGS\[@\]}"' "$PGO" && ! grep -qE '[^-] \$PGO_PERF_ARGS[^-]' "$PGO"; then
+    rec ok "pgo: perf record expande \"\${PGO_PERF_ARGS[@]}\", no el string"
+  else
+    rec fail "pgo: perf record no expande el array: vuelve el «event syntax error»"
+  fi
+  # 6. Contrato con llvm-profgen: --kernel debe estar en la conversión. Esta es la
+  #    línea que daba «No relevant mmap event is found in perf data» tras 15 min.
+  if grep -q 'llvm-profgen --kernel' "$PGO"; then
+    rec ok "pgo: la conversión pasa --kernel (si no, no encuentra mmap events)"
+  else
+    rec fail "pgo: la conversión NO pasa --kernel: abortará con «No relevant mmap event»"
+  fi
+  # 7. Y la captura no se tira con el fallo: el trap tiene que conservar el perf.data
+  if sed -n '/^pgo_cleanup() {/,/^}/p' "$PGO" | grep -q 'pgo_keep_perfdata'; then
+    rec ok "pgo: si la conversión falla, el perf.data se conserva (no se pierde la captura)"
+  else
+    rec fail "pgo: el trap borra el perf.data aunque la conversión falle"
+  fi
+  # 8. El periodo por defecto es primo, como pide la doc
+  if grep -q 'CIZEN_PGO_PERIOD:-500009' "$PGO"; then
+    rec ok "pgo: el periodo por defecto es 500009 ciclos (primo, el de la doc)"
+  else
+    rec fail "pgo: el periodo por defecto no es 500009"
+  fi
+  # 9. El destino no es /root cuando hay un usuario detrás del sudo
+  cat > "$PGT/home.sh" <<'HEOF'
+set -u
+SUDO_USER="${SUDO_USER:-}"
+HEOF
+  sed -n '/^pgo_target_home() {/,/^}/p' "$PGO" >> "$PGT/home.sh"
+  printf 'pgo_target_home\n' >> "$PGT/home.sh"
+  H_Cizen="$(SUDO_USER=cizen bash "$PGT/home.sh")"
+  H_ROOT="$(SUDO_USER=root bash "$PGT/home.sh")"
+  H_NONE="$(SUDO_USER= bash "$PGT/home.sh")"
+  if [ -n "$H_Cizen" ] && [ "$H_Cizen" != "/root" ]; then
+    rec ok "pgo: con sudo, el .afdo va al home del usuario ($H_Cizen), no a /root"
+  else
+    rec fail "pgo: con SUDO_USER=cizen el destino fue '$H_Cizen' (debería ser el home de cizen)"
+  fi
+  if [ "$H_ROOT" = "$H_NONE" ]; then
+    rec ok "pgo: sin usuario detrás (root directo), el destino es el \$HOME de quien lo lanza"
+  else
+    rec fail "pgo: root directo dio '$H_ROOT' y sin SUDO_USER '$H_NONE'"
+  fi
+  # 10. El aviso de que el kernel en marcha no era AutoFDO se basa en el config real
+  cat > "$PGT/autofdo.sh" <<'HEOF'
+set -u
+KVER="x"
+HEOF
+  sed -n '/^pgo_running_autofdo() {/,/^}/p' "$PGO" >> "$PGT/autofdo.sh"
+  printf 'pgo_running_autofdo "$1"\n' >> "$PGT/autofdo.sh"
+  printf 'CONFIG_AUTOFDO_CLANG=y\nCONFIG_LTO_CLANG=y\n' > "$PGT/cfg-si"
+  printf '# CONFIG_AUTOFDO_CLANG is not set\nCONFIG_LTO_CLANG=y\n' > "$PGT/cfg-no"
+  A_SI="$(bash "$PGT/autofdo.sh" "$PGT/cfg-si" >/dev/null 2>&1 && echo si || echo no)"
+  A_NO="$(bash "$PGT/autofdo.sh" "$PGT/cfg-no" >/dev/null 2>&1 && echo si || echo no)"
+  A_VACIO="$(bash "$PGT/autofdo.sh" "$PGT/inexistente" >/dev/null 2>&1 && echo si || echo no)"
+  if [ "$A_SI" = si ] && [ "$A_NO" = no ] && [ "$A_VACIO" = no ]; then
+    rec ok "pgo: avisa del kernel en marcha sin CONFIG_AUTOFDO_CLANG (y calla si no hay config)"
+  else
+    rec fail "pgo: la detección de AUTOFDO da con=$A_SI sin=$A_NO inexistente=$A_VACIO"
+  fi
+  # 11. Y el motor tiene que buscar el perfil donde el colector lo dejó
+  if sed -n '/^pgo_profile_dir() {/p' "$MOTOR" | grep -q 'HOME/kernel-pgo'; then
+    rec ok "pgo: el motor (--pgo a secas) busca en ~/kernel-pgo, el mismo destino"
+  else
+    rec fail "pgo: el motor ya no busca en ~/kernel-pgo: el perfil no aparecería"
+  fi
+  # 12. El directorio de salida nace del usuario: si fuera de root, el .afdo sería
+  #     suyo pero no podría borrarlo (unlink pide escritura en el DIRECTORIO).
+  if grep -q 'OUT_DIR_NUEVO' "$PGO" && sed -n '/^if \[ -n "$OUT_DIR_NUEVO" \]/p' "$PGO" | grep -q pgo_chown; then
+    rec ok "pgo: el directorio de salida se crea con el usuario como dueño (borrar sin sudo)"
+  else
+    rec fail "pgo: el directorio de salida nace root:root: el .afdo no se puede borrar sin sudo"
+  fi
+else
+  # Ojo: que no haya nada que probar NO es lo mismo que estar bien. Si el script
+  # está pero sus decisiones no son extraíbles, el arnés está ciego y eso se dice.
+  if [ -f "$PGO" ]; then
+    rec fail "pgo: $PGO existe pero no expone pgo_perf_event/pgo_target_home: sus decisiones no son testeables"
+  else
+    rec ok "pgo: pgo-collect.sh no está junto al motor; tests de PGO omitidos"
+  fi
+fi
+
+# --- PGO: el resumen debe decir que la build lleva perfil ------------------------
+# `--pgo <fichero>` es la forma que documenta el README, y era la única que
+# llegaba al resumen sin " + PGO": el build llevaba -fprofile-sample-use igual
+# (el perfil viaja por KCONFIG_CC_OPTS, que no mira PGO_CHANGED) pero la pantalla
+# juraba que no. Un resumen que miente sobre lo que lleva la build es peor que no
+# resumir, así que aquí se comprueba el flag que lo alimenta, no el texto.
+if declare -f ask_build_pgo >/dev/null 2>&1; then
+  AP="$ROOT/ap"; mkdir -p "$AP"
+  printf 'perfil de mentira\n' > "$AP/perfil.afdo"
+  cat > "$AP/case.sh" <<'HEOF'
+set -u
+ok() { :; }
+warn() { :; }
+info() { :; }
+log() { :; }
+err() { :; }
+fatal() { return 1; }
+pgo_profile_dir() { printf '%s' "$(dirname "$1")"; }
+pgo_list_profiles() { printf '%s\n' "$PERFIL" 2>/dev/null; }
+pgo_pick_profile() { printf '%s' "$PERFIL"; }
+# Entradas: $1=PGO_EXPLICIT $2=PGO_REQUESTED $3=CIZEN_PGO_PROFILE $4=PERFIL
+PGO_EXPLICIT="$1"; PGO_REQUESTED="$2"; CIZEN_PGO_PROFILE="$3"; PERFIL="$4"
+HEOF
+  sed -n '/^pgo_profile_dir() {/,/^}/p' "$MOTOR" >> "$AP/case.sh"
+  sed -n '/^pgo_disp_suffix() {/,/^}/p' "$MOTOR" >> "$AP/case.sh"
+  sed -n '/^ask_build_pgo() {/,/^}/p' "$MOTOR" >> "$AP/case.sh"
+  # La llamada va AL FINAL: con las definiciones detrás, bash daría «command not
+  # found», el 2>/dev/null lo escondería y el test leería changed=0 siempre.
+  cat >> "$AP/case.sh" <<'HEOF'
+ask_build_pgo >/dev/null 2>&1
+printf 'changed=%s suffix=[%s]\n' "${PGO_CHANGED:-0}" "$(pgo_disp_suffix)"
+HEOF
+  apc() { bash "$AP/case.sh" "$1" "$2" "$3" "$4" 2>/dev/null; }
+  # 1. La forma del README: --pgo con ruta explícita.
+  R_EXP="$(apc true true "$AP/perfil.afdo" "$AP/perfil.afdo")"
+  if [ "$R_EXP" = "changed=1 suffix=[ + PGO]" ]; then
+    rec ok "pgo: --pgo <fichero> marca el cambio y el resumen anuncia + PGO"
+  else
+    rec fail "pgo: --pgo <fichero> dio '$R_EXP' (se esperaba changed=1 con + PGO)"
+  fi
+  # 2. --pgo a secas: sigue funcionando (auto-elige el perfil y marca el cambio).
+  R_AUTO="$(apc false true "" "$AP/perfil.afdo")"
+  if [ "$R_AUTO" = "changed=1 suffix=[ + PGO]" ]; then
+    rec ok "pgo: --pgo a secas elige perfil y también anuncia + PGO"
+  else
+    rec fail "pgo: --pgo a secas dio '$R_AUTO'"
+  fi
+  # 3. --no-pgo: ni cambio ni anuncio. Este es el caso que NO puede romperse.
+  R_NO="$(apc false false "" "")"
+  if [ "$R_NO" = "changed=0 suffix=[]" ]; then
+    rec ok "pgo: sin PGO no se anuncia (el resumen no miente al revés)"
+  else
+    rec fail "pgo: sin PGO dio '$R_NO' (no debe anunciar perfil)"
+  fi
+  # 4. Bandera explícita pero SIN perfil detrás: no se puede anunciar lo que no hay.
+  R_VACIO="$(apc true false "" "")"
+  if [ "$R_VACIO" = "changed=0 suffix=[]" ]; then
+    rec ok "pgo: --pgo sin perfil detrás no inventa un + PGO"
+  else
+    rec fail "pgo: con el perfil vacío-annunció '$R_VACIO'"
+  fi
+else
+  rec fail "pgo: no se pudo extraer ask_build_pgo: el resumen de PGO queda sin cubrir"
+fi
+
+# --- despliegue: la suite se copia a /usr/local/bin A MANO --------------------
+# No hay PKGBUILD ni script de instalación en el repo: el README documenta un
+# `install -Dm755` POR FICHERO, y esa es la trampa. El 2-oct-2026 el motor y
+# pgo-collect.sh quedaron en 644 en la suite instalada y el arranque directo
+# respondió "Permiso denegado", mientras los otros siete sí eran ejecutables:
+# nadie se dio cuenta porque el motor que avisa es el que ya no arrancaba. Aquí se
+# vigila la mitad que el repo controla (que lo que hay que ejecutar, se pueda
+# ejecutar) y el README lleva ya la receta completa para la otra mitad.
+SUITE="$(dirname -- "$MOTOR")"
+[ -f "$SUITE/pgo-collect.sh" ] || SUITE="$HOME/Proyectos/cizen-linux-kernel-update/kernel-update"
+N_DEPLOY=0; SIN_X=''
+for s in "$SUITE"/*.sh "$SUITE"/cizen-uki-sync; do
+  [ -f "$s" ] || continue
+  N_DEPLOY=$((N_DEPLOY + 1))
+  [ -x "$s" ] || SIN_X="${SIN_X}$(basename -- "$s") "
+done
+if [ "$N_DEPLOY" = 0 ]; then
+  rec fail "despliegue: no encuentro la suite en '$SUITE'; este test no vigila nada"
+elif [ -z "$SIN_X" ]; then
+  rec ok "despliegue: los $N_DEPLOY ejecutables de la suite tienen bit +x en el repo"
+else
+  rec fail "despliegue: sin bit +x en el repo: $SIN_X"
 fi
 
 # --- resumen ---

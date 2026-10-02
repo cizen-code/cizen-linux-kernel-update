@@ -51,6 +51,37 @@ con otras herramientas):
 /usr/local/bin/arch-open-terminal.sh   # helper compartido por ambas suites (plano)
 ```
 
+#### Despliegue de la suite: se copia a mano, y a mano se olvida (v27.33.6)
+
+No hay `PKGBUILD`, `Makefile` ni script de instalación en el repo: la suite se
+despliega fichero a fichero, y ese detalle es una trampa. El 2026-10-02 el motor
+y `pgo-collect.sh` quedaron en `644` en la suite instalada y arrancarlos
+respondió «Permiso denegado» mientras los otros ocho seguían bien. El motor no
+puede avisar de eso, porque es justamente el fichero que ya no se puede
+ejecutar: el síntoma lo ve quien lo ejecuta, que es quien no va a mirar.
+
+La receta completa, con los modos correctos, es una línea por tipo de fichero:
+
+```sh
+cd ~/Proyectos/cizen-linux-kernel-update
+sudo install -Dm755 kernel-update/*.sh kernel-update/cizen-uki-sync -t /usr/local/bin/kernel-update
+sudo install -Dm644 CHANGELOG.md -t /usr/local/bin/kernel-update
+sudo install -Dm644 kernel-update/profiles/*.config kernel-update/profiles/*.conf -t /usr/local/bin/kernel-update/profiles
+sudo install -Dm644 kernel-update/profiles/frags/*.frag -t /usr/local/bin/kernel-update/profiles/frags
+sudo install -Dm644 kernel-update/tests/selftest.sh -t /usr/local/bin/kernel-update/tests
+```
+
+Ejecutables a `755`; perfiles, frags, changelog y arnés a `644`. `tests/` se
+instala porque el motor busca el arnés ahí para el `--selftest` y cae a los
+espejos del repo si no lo encuentra. Y para comprobar que el despliegue quedó
+entero:
+
+```sh
+for f in /usr/local/bin/kernel-update/*.sh /usr/local/bin/kernel-update/cizen-uki-sync; do
+  [ -x "$f" ] || echo "SIN +X: $f"
+done
+```
+
 > Desde v27.30.0 la suite instala también `kernel-update-manager.sh`
 > (list/info/flip/backup/remove de kernels instalados), `kernel-update-rollback.sh`
 > y `cizen-uki-sync` (sincronización y firma del UKI para systemd-boot + sbctl).
@@ -273,9 +304,13 @@ vuelve al comportamiento anterior (solo archive de ficheros).
      colectar contra una copia a medias. Si aparece el aviso «sin su testigo»,
      reconstruye una vez con v27.33.4 o posterior.
   2. Usa el sistema con carga representativa y recoge el perfil:
-     `sudo kernel-update/pgo-collect.sh --duration 900` (captura `perf record
-     -F 999 -a -g` y convierte con `llvm-profgen`; sale en
-     `~/kernel-pgo/<kver>.afdo`).
+     `sudo kernel-update/pgo-collect.sh --duration 900` (graba con el **evento
+     LBR** del fabricante y pila de ramas `-b`, convierte con
+     `llvm-profgen --kernel`, y sale en `~/kernel-pgo/<kver>.afdo`). Requiere un
+     micro con LBR/BR: Intel hasta Kaby Lake, o AMD Zen3 (BRS)/Zen4
+     (`amd_lbr_v2`); sin eso el script lo dice en vez de capturar en balde. Si
+     la conversión falla, el `perf.data` se conserva junto al `.afdo` para
+     reconvertir sin volver a muestrear (`--keep-perfdata` lo guarda siempre).
   3. Vuelve a compilar. El motor ofrece los perfiles que haya, con el de tu
      versión recomendado: `Enter` se lo lleva, o se teclea otro. En línea de
      órdenes: `--pgo` a secas (elige el mejor), `--pgo ruta.afdo`, `--no-pgo`,

@@ -170,7 +170,7 @@ export LC_ALL=C
 #     deje de describir un estado que el power-profiles-daemon sobrescribe y el
 #     fallback sin PPD no degrade a EPP 255.
 # No se toca el motor: la cmdline se hereda, no se genera.
-SCRIPT_VERSION="27.33.5"
+SCRIPT_VERSION="27.33.6"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -11164,8 +11164,20 @@ ask_build_pgo() {
 
   # 2) Ya está decidido (--pgo con ruta, o CIZEN_PGO_PROFILE del entorno): no se
   #    pregunta. La validación temprana de las líneas ~849 ya cubrió ese caso.
+  #    v27.33.6: aquí también se marca PGO_CHANGED. Antes solo lo marcaba el
+  #    camino interactivo y el de --pgo a secas, así que `--pgo <fichero>` (justo
+  #    el que se documenta en el README) dejaba PGO_CHANGED=0 y el resumen
+  #    anunciaba "bore + clang" sin "+ PGO": el build llevaba -fprofile-sample-use
+  #    (el perfil viaja igual por KCONFIG_CC_OPTS, que no mira este flag) pero el
+  #    resumen juraba que no. El flag significa "esta build lleva PGO", no "esta
+  #    llamada me cambió la variable"; el comentario de pgo_disp_suffix lo decía
+  #    al revés y por eso el caso explícito se colaba.
   if [ "$PGO_EXPLICIT" = true ] || [ -n "${CIZEN_PGO_PROFILE:-}" ]; then
     [ -n "${CIZEN_PGO_PROFILE:-}" ] && PGO_REQUESTED=true
+    # Solo si hay perfil de verdad: PGO_CHANGED enciende el " + PGO" del resumen
+    # y hace que quien llama meta CLANG_AUTOFDO_PROFILE en el make; con la
+    # variable vacía eso sería anunciar un perfil que no existe.
+    [ -n "${CIZEN_PGO_PROFILE:-}" ] && PGO_CHANGED=1
     return 0
   fi
 
