@@ -1,3 +1,71 @@
+## [27.33.7] - 2026-10-02
+
+**Arrancar un kernel recién compilado no se anunciaba: la identidad del kernel
+era su nombre, y la suite compila varios builds con el mismo nombre.**
+
+El ciclo de PGO de la v27.33.6 arrancó `7.2.8_cizen_v3-13` y el verificador se
+calló. No era que no corriera: corrió, dio 0 incidencias y, siendo el estado
+idéntico al del arranque anterior, no había nada que notificar. El defecto está
+una línea más abajo, en **qué se considera el mismo kernel**.
+
+- **`uname -r` no distingue dos builds.** `_12` y `_13` son los dos
+  `7.2.8-cizen-v3`; solo difieren en el pkgrel. Con el nombre como identidad,
+  arrancar lo que acabas de compilar era indistinguible de reiniciar lo de
+  antes: `FIRST_BOOT` no saltaba y la firma de estado no cambiaba.
+- **El mecanismo ya existía y estaba escrito para esto.** El comentario de
+  `verify_state_fingerprint` dice que el campo `ver=` está ahí para que "arrancar
+  un kernel NUEVO con el MISMO número de incidencias" avise. Cumplía cuando el
+  *nombre* cambiaba; no cuando cambiaba el build, que es el caso normal aquí,
+  porque la suite bumpea pkgrel en cada compilación.
+- **`running_pkgv()`**: el `pkgver-pkgrel` del build en marcha, resuelto en
+  runtime por `pacman -Qo /usr/lib/modules/$(uname -r)` para no dar por supuesto
+  el nombre del paquete (funciona igual para `linux-lts`). Sin pacman, o sin
+  paquete que contenga el módulo, devuelve vacío sin fallar, y entonces no se
+  inventa etiqueta ni identidad: es una máquina sin base de datos de paquetes,
+  no un kernel distinto.
+- **`first_boot_detected()`**: compara identidades, no nombres. Es una
+  **función** y no tres líneas en el cuerpo precisamente para poder extraerla en
+  el arnés: la primera versión estaba escrita en el cuerpo, y los tests que la
+  cubrían la reimplementaban dentro del test, de modo que **pasaban contra el
+  código viejo** — no medían el script, se medían a sí mismos. Corregido, y
+  añadido un guard que falla si alguna de las tres funciones no existe, porque
+  un `if fn; then ok else ok fi` pasa en verde contra un fichero donde la
+  función no está.
+- **La identidad se guarda SIN espacios, y esto no es cosmético.**
+  `verify-last`/`verify-history` son líneas delimitadas por espacios. Una
+  identidad con un espacio dentro (`"<uname -r> <pkgver-pkgrel>"`, que fue la
+  primera versión) añade un campo de más: `read` lee 10 campos donde esperaba 9
+  y el del build queda **vacío**. La primera implementación fallaba exactamente
+  al probarla de punta a punta, con la suite entera en verde, porque los tests le
+  pasaban la identidad por la línea de comandos sin pasar por el formato. De ahí
+  que la función devuelva solo el `pkgver-pkgrel`, y de ahí el test que falla si
+  el valor lleva un espacio. **Un test que esquiva el formato no prueba el
+  formato.**
+- **La ausencia de identidad no se toma como un cambio.** Si la línea guardada
+  no tiene el campo (escrita antes de este cambio) se compara por nombre, como
+  antes: desplegar esto en una máquina que lleva semanas con el mismo kernel no
+  puede producir un "kernel arrancado" espurio. La otra lectura —tratar el
+  vacío como una identidad distinta— sí lo producía.
+- **La primera corrida tras desplegar sí anuncia**, y es correcto: la firma
+  guardada la escribió una versión que no veía el pkgrel, así que la
+  identidad ha cambiado de verdad y ahora es visible. A partir de ahí se
+  estabiliza; verificado ejecutando el script contra el `verify-last` real.
+- **`build_label()`**: " (build 13)" en los títulos de las dos notificaciones y
+  una línea `Build (paquete)` en el informe. Sin ella, "7.2.8-cizen-v3
+  arrancado" es ambiguo entre dos builds.
+- **El campo va al final de `verify-last`/`verify-history`** (noveno), por el
+  mismo motivo y con la misma regla que el `boot_id` de la v27.33.1: para no
+  desplazar lo que ya se leía. El campo 1 sigue siendo la versión a propósito,
+  porque `boot_ref` filtra por él para la mediana de arranque, y en eso un
+  pkgrel nuevo sigue siendo el mismo kernel para el usuario.
+- **Limitación documentada en el código**: esto es el build *instalado*, no el
+  de la imagen que arrancó. Un rollback a una UKI anterior sin reinstalar se
+  anunciará como nuevo. Falla hacia el aviso de más, nunca hacia el silencio.
+
+Lo que **no** cambia: con todo limpio y el mismo build, sigue sin notificarse.
+Lo nuevo es que un build nuevo se anuncia **aunque esté limpio**, que es lo que
+`notify_first_boot` siempre quiso hacer.
+
 ## [27.33.6] - 2026-10-02
 
 **Cerrado el ciclo de PGO de punta a punta: por primera vez en esta máquina hay

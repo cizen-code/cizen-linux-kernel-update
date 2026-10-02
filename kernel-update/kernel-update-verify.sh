@@ -849,6 +849,43 @@ secureboot_check() {
 }
 
 # ---------- notificación ----------
+# Identidad del build EN EJECUCIÓN, que no es lo mismo que `uname -r`.
+#
+# Por qué existe: la suite cambia de build sin cambiar de nombre. `_12` y `_13`
+# son los dos `7.2.8-cizen-v3`, y solo difieren en el pkgrel. Con el nombre solo,
+# reiniciar el kernel recién compilado era indistinguible de reiniciar el
+# anterior, así que First_boot no saltaba y la firma de estado no cambiaba: el
+# verificador se callaba en el caso para el que existe, que es enterarse de que
+# arrancó lo que acabas de compilar.
+#
+# Devuelve el `pkgver-pkgrel` del build (vacío si no se puede saber), NO la
+# identidad entera: esto se guarda en `verify-last`/`verify-history`, que son
+# líneas delimitadas por ESPACIOS, y un valor con espacio dentro añade un campo
+# de más — `read` lee 10 campos donde esperaba 9 y el campo del build sale
+# vacío. La primera versión devolvía "<uname -r> <pkgver-pkgrel>" y fallaba
+# justo al probarlo de verdad; los tests no lo cazaron porque le pasaban la
+# identidad con el espacio por la línea de comando, sin pasar por el formato.
+#
+# De dónde sale el pkgrel: del paquete INSTALADO que contiene
+# /usr/lib/modules/$(uname -r), resuelto con `pacman -Qo` para no dar por supuesto
+# el nombre del paquete (vale igual para `linux-lts`).
+#
+# LIMITACIÓN, y es a propósito no escondida: esto es el build INSTALADO, no el de
+# la imagen que arrancó. Un rollback a una UKI anterior sin reinstalar se
+# anunciará como "build nuevo" aunque sea un kernel que ya habías arrancado antes.
+# Falla hacia el aviso de más, nunca hacia el silencio, que es el lado en el que
+# conviene equivocarse. Distinguirlo de verdad exige que el propio kernel
+# underage su identidad (baked-in), y eso es un cambio del modelo de nombres de
+# la suite, no un arreglo de este script.
+running_pkgv() {
+  local rel own
+  rel="$(uname -r 2>/dev/null || true)"
+  [ -n "$rel" ] || return 0
+  if own="$(pacman -Qo "/usr/lib/modules/$rel" 2>/dev/null)"; then
+    printf '%s' "$own" | awk '{print $NF}'
+  fi
+}
+
 # Firma del estado verificable, SIN los tiempos de arranque: 15.8675 s frente a
 # 15.8671 s no es un cambio de estado, y si estuviera en la firma no se callaría
 # nunca. Refleja lo que el usuario tiene que reaccionar a: perfil, scheduler,
@@ -860,8 +897,11 @@ verify_state_fingerprint() {
   # incidencias de su kernel nuevo. Solo se notifica con kernel limpio hay
   # First_boot, que no depende de la firma — con incidencias no la había, y esa
   # es justo la clase de falso negativo que un verificador no puede permitirse.
+  # Lleva la IDENTIDAD DEL BUILD (running_pkgv), no solo CUR_VERSION: con el
+  # nombre solo, dos builds seguidos del mismo PKGVER firmaban igual y no había
+  # forma de que el verificador notara que habías cambiado de kernel.
   printf 'ver=%s|perfil=%s|sched=%s/%s|journal=%s|fw=%s|sb=%s|iss=%s' \
-    "${CUR_VERSION:-?}" "${BASE_ISSUES:-0}" "${SCHED_EXPECTED:-?}" "${SCHED_RUNNING:-?}" \
+    "${CUR_VERSION:-?}${CUR_PKGV:+ $CUR_PKGV}" "${BASE_ISSUES:-0}" "${SCHED_EXPECTED:-?}" "${SCHED_RUNNING:-?}" \
     "${JCOUNT:-0}" "${FW_COUNT:-0}" "${SB_STATE:-?}" "${ISSUES:-0}"
 }
 
@@ -1013,18 +1053,19 @@ notify_state_diff() {
 }
 
 notify_issues() {
-  local title body prof_txt sev icon
+  local title body prof_txt sev icon bl
   if [ "$PROFILE_OK" = 1 ]; then prof_txt="OK"; else prof_txt="FALLO"; fi
   local diff
   diff="$(notify_state_diff)"
+  bl="$(build_label)"
   # El nombre de la app ya es "Kernel Updater": repetir "Kernel Cizen:" en el
   # título solo consume ancho. El número de incidencias sí va en el título,
   # que es lo único que se lee sin desplegar el cuerpo.
   if [ "$ISSUES" -gt 0 ]; then
-    title="$CUR_VERSION: ${ISSUES} incidencia(s)"
+    title="$CUR_VERSION$bl: ${ISSUES} incidencia(s)"
     sev=critical; icon=dialog-warning
   else
-    title="$CUR_VERSION: sin incidencias"
+    title="$CUR_VERSION$bl: sin incidencias"
     sev=normal; icon=emblem-ok
   fi
   # Solo los datos que informan. Un "Journal: 0 patrones | FW: 0" en un
@@ -1049,12 +1090,23 @@ $diff"
   alog "Notificación de verificación: $title — $body"
 }
 
+# Etiqueta de build para títulos y para el informe: " (build 13)". Vacía si no
+# se pudo resolver el paquete, que es el caso normal en el kernel del sistema y
+# el que hace el texto no notarlo; solo aparece cuando hay algo que añadir.
+# Solo el número, no "7.2.8_cizen_v3-13": el nombre ya está en el título y
+# repetirlo consume el ancho que en una notificación escasea.
+build_label() { # imprime " (build N)" o nada
+  [ -n "${CUR_REL:-}" ] || return 0
+  printf ' (build %s)' "$CUR_REL"
+}
+
 notify_first_boot() {
-  local title body iss_txt
+  local title body iss_txt bl
+  bl="$(build_label)"
   if [ "$ISSUES" -gt 0 ]; then
-    iss_txt="$ISSUES incidencia(s)"; title="$CUR_VERSION arrancado: $iss_txt"
+    iss_txt="$ISSUES incidencia(s)"; title="$CUR_VERSION$bl arrancado: $iss_txt"
   else
-    iss_txt="sin incidencias"; title="$CUR_VERSION arrancado"
+    iss_txt="sin incidencias"; title="$CUR_VERSION$bl arrancado"
   fi
   body="$iss_txt | boot $(fmt_secs "${BT_TOT:-0}")s"
   if [ "$DRY" = true ]; then
@@ -1073,6 +1125,14 @@ notify_first_boot() {
 
 # ============================================================
 CUR_VERSION="$(uname -r 2>/dev/null || echo 'desconocido')"
+# Identidad del build instalado, para distinguir dos builds del mismo PKGVER.
+#   CUR_PKGV = "<pkgver-pkgrel>"  → firma, campo 9 de verify-last, y para mostrar
+#   CUR_REL  = "<pkgrel>"         → etiqueta corta ("build 13")
+# Vacíos si no hay paquete que contenga el módulo: es una máquina sin pacman o un
+# kernel sin paquete, no un kernel distinto, y no se inventa una etiqueta.
+CUR_PKGV="$(running_pkgv)"
+CUR_REL=""
+[ -n "$CUR_PKGV" ] && CUR_REL="${CUR_PKGV##*-}"
 ISSUES=0
 PROFILE_OK=0
 SB_STATE="?"
@@ -1106,9 +1166,38 @@ firmware_check
 secureboot_check
 SB_STATE="${SB_STATE:-—}"
 
-read -r P_VER P_KE P_US P_TOT P_J P_ISS P_TS < "$LAST"
+# ts y boot_id no se consumen aquí; se leen con `_` para no desplazarlos, igual
+# que hace boot_ref con su línea. Lo que importa de esa línea es el último
+# campo, la identidad del build.
+# ¿Es este arranque el primero de ESTE build? Se comparan identidades, no
+# nombres: `uname -r` es el mismo en `_12` y `_13`, y arrancar el kernel recién
+# compilado tiene que reconocerse como novedad aunque el nombre no haya
+# cambiado.
+#
+# Es una FUNCIÓN y no tres líneas en el cuerpo por una razón concreta: así el
+# arnés puede extraerla y ejecutarla. La primera versión de esta comprobación
+# estaba escrita en el cuerpo, y los tests que la cubrían la reimplementaban
+# dentro del propio test — que pasaban contra el código viejo, es decir, no
+# medían nada. Un test que copia la lógica que quiere comprobar no la comprueba.
+first_boot_detected() { # $1 = pkgver-pkgrel guardado (vacío = línea vieja) → true/false
+  if [ -n "${1:-}" ]; then
+    [ "$1" != "${CUR_PKGV:-}" ]
+  else
+    # SIN identidad guardada no se salta al nombre por "defecto": la ausencia de
+    # un dato no es un cambio de dato. Una línea vieja escrita antes de esta
+    # versión dice que el kernel de antes era ESTE MISMO, y lo que comparemos es
+    # el nombre, como se hacía antes. La otra lectura —tratar el vacío como una
+    # identidad distinta— anunciaba un "kernel arrancado" la primera vez que se
+    # desplegaba esto, en un equipo que llevaba semanas con el mismo kernel.
+    # Nota: si lo guardado tiene identidad pero la de ahora no (se desinstaló el
+    # paquete), la comparación de arriba sí salta, que es lo correcto.
+    [ "${P_VER:-}" != "${CUR_VERSION:-}" ]
+  fi
+}
+
+read -r P_VER P_KE P_US P_TOT P_J P_ISS _ _ P_BUILD < "$LAST"
 FIRST_BOOT=false
-if [ "${P_VER:-}" != "$CUR_VERSION" ]; then FIRST_BOOT=true; fi
+if first_boot_detected "${P_BUILD:-}"; then FIRST_BOOT=true; fi
 
 # Persistir registro. Con --dry-run NO se escribe: una simulación no puede
 # cambiar la línea base de la verificación real siguiente. Antes sí lo hacía, y
@@ -1124,11 +1213,18 @@ if [ "${P_VER:-}" != "$CUR_VERSION" ]; then FIRST_BOOT=true; fi
 # mediana de la referencia. Va al final de la línea, así que las lecturas
 # antiguas (read -r v ke us tot j iss ts) siguen funcionando: se quedan con el
 # resto de la línea en la última variable.
+#
+# La identidad del build (v27.33.7) va detrás del boot_id, por el mismo motivo
+# y con la misma regla: al final, para no desplazar nada de lo que ya se leía.
+# Es lo que permite que el próximo arranque distinga `_13` de `_12`, que con el
+# nombre solo son el mismo kernel. `boot_ref` sigue filtrando por el CAMPO 1
+# (versión) a propósito: la mediana de referencia compara tiempos de arranque,
+# y en eso un pkgrel nuevo sigue siendo el mismo kernel para el usuario.
 NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
 if [ "$DRY" != true ]; then
-  printf '%s %s %s %s %s %s %s %s\n' "$CUR_VERSION" "$KE_N" "$US_N" "$TOT_N" "$JCOUNT" "$ISSUES" "$NOW" "$BOOT_ID" > "$LAST"
-  printf '%s\n' "$CUR_VERSION $KE_N $US_N $TOT_N $JCOUNT $ISSUES $NOW $BOOT_ID" >> "$HIST" 2>/dev/null || true
+  printf '%s %s %s %s %s %s %s %s %s\n' "$CUR_VERSION" "$KE_N" "$US_N" "$TOT_N" "$JCOUNT" "$ISSUES" "$NOW" "$BOOT_ID" "$CUR_PKGV" > "$LAST"
+  printf '%s\n' "$CUR_VERSION $KE_N $US_N $TOT_N $JCOUNT $ISSUES $NOW $BOOT_ID $CUR_PKGV" >> "$HIST" 2>/dev/null || true
 fi
 
 # ----------------- salida -----------------
@@ -1143,6 +1239,7 @@ echo "${C}========================================================${N}"
 echo "${C} Verificación post-boot — kernel $CUR_VERSION${N}"
 echo "${C}========================================================${N}"
 echo " Kernel en ejecución : $CUR_VERSION"
+[ -n "${CUR_PKGV:-}" ] && echo " Build (paquete)     : $CUR_PKGV"
 echo " Perfil              : $PROFILE_OUT_TXT"
 # Sin ${VAR:+ $(...)} anidado: dentro de una expansión "${...}" las comillas
 # del comando sustituto confunden al parser de bash.

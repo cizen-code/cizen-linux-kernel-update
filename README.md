@@ -626,6 +626,15 @@ estado**:
   factor y delta), no porque el número se mueva.
 - Al **quedarse en 0 incidencias** la notificación baja a severidad `normal`
   con icono `emblem-ok`: resolver no es una alarma.
+- La identidad del kernel en marcha es **`uname -r` más el pkgrel**, no solo
+  `uname -r` (v27.33.7). La suite bumpea `pkgrel` en cada compilación, así que
+  `_12` y `_13` son el mismo nombre: con el nombre solo, arrancar el kernel
+  recién compilado no cambiaba la firma y el verificador se callaba en
+  exactamente el caso para el que existe. El pkgrel sale de
+  `pacman -Qo /usr/lib/modules/$(uname -r)` en runtime. Se anuncia el build
+  nuevo **aunque salga limpio** (`7.2.8-cizen-v3 (build 13) arrancado`), que es
+  lo que `notify_first_boot` siempre quiso hacer; con el mismo build y todo
+  limpio, silencio, como antes.
 - El **cuerpo solo informa de lo que informa** (v27.31.50): etiquetas legibles
   (`Perfil (símbolos)`, `Scheduler`, `Journal`…), sin ceros decorativos
   (`Journal: 0` en un estado limpio no dice nada), el tiempo de arranque con un

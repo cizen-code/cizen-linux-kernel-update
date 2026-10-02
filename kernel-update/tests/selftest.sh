@@ -3372,6 +3372,253 @@ else
 fi
 
 # ============================================================
+# v27.33.7: arrancar un kernel NUEVO del mismo PKGVER no se anunciaba
+# `_12` y `_13` son ambos `7.2.8-cizen-v3`. Con `uname -r` como identidad, el
+# verificador se callaba al arrancar el kernel recién compilado, que es el caso
+# para el que existe. Estos tests miran el VALOR (la firma y la comparación de
+# First_boot), no el texto impreso: un test que grepa la salida pasaría aunque
+# el comportamiento volviera a estar roto.
+# ============================================================
+_sx_v27_33_7=0
+
+# Guard de existencia. Sin él, un test que hace `if fn ...; then ok else ok fi`
+# pasa en verde contra un script donde la función NO EXISTE (la condición sale
+# falsa y el `else` dice "ok"): siete de los tests de este bloque seDeclare
+# correctos contra un fichero que no tiene la función. Se comprueba que las tres
+# se extraen y no vienen vacías.
+_sx_missing=""
+for _fn in running_pkgv first_boot_detected build_label; do
+  [ -n "$(_sx_nsc "$_fn")" ] || _sx_missing="$_sx_missing $_fn"
+done
+if [ -z "$_sx_missing" ]; then
+  rec ok "las tres funciones del bloque de identidad de build existen y son extraíbles"
+else
+  rec fail "funciones ausentes o no extraíbles:$_sx_missing (los tests que las usan pasarían en falso)"
+fi
+
+# --- running_pkgv: con paquete devuelve "<pkgver-pkgrel>", SIN espacios ---
+_rbid_bin="$ROOT/rbid-bin"; mkdir -p "$_rbid_bin"
+cat > "$_rbid_bin/uname" <<'EOF'
+#!/usr/bin/env bash
+printf '7.2.8-cizen-v3\n'
+EOF
+cat > "$_rbid_bin/pacman" <<'EOF'
+#!/usr/bin/env bash
+[ "$1" = "-Qo" ] || exit 1
+printf '/usr/lib/modules/7.2.8-cizen-v3/ está contenido en linux-cizen-v3 7.2.8_cizen_v3-13\n'
+EOF
+chmod +x "$_rbid_bin/uname" "$_rbid_bin/pacman"
+{ _sx_nsc running_pkgv; } > "$ROOT/rbid.sh"
+# shellcheck disable=SC1090,SC1091
+source "$ROOT/rbid.sh"
+_rbid_oldpath="$PATH"; PATH="$_rbid_bin:$PATH"
+_rbid="$(running_pkgv)"
+PATH="$_rbid_oldpath"
+if [ "$_rbid" = '7.2.8_cizen_v3-13' ]; then
+  rec ok "running_pkgv devuelve el pkgver-pkgrel del paquete del kernel en marcha"
+  _sx_v27_33_7=$((_sx_v27_33_7 + 1))
+elif [ -z "$_rbid" ]; then
+  rec fail "running_pkgv NO devuelve el pkgrel: volvería a no distinguir _12 de _13"
+else
+  rec fail "running_pkgv devuelve algo inesperado: '$_rbid'"
+fi
+
+# El valor NO puede llevar espacios: se guarda en verify-last/verify-history, que
+# son líneas delimitadas por ESPACIOS. Una identidad con un espacio dentro añade
+# un campo de más, `read` lee 10 campos donde esperaba 9 y el campo del build
+# queda vacío. Ese fue el bug que hizo que esta misma versión no anunciara nada
+# en su prueba de extremo a extremo, con todos los tests en verde.
+case "$_rbid" in
+  *' '*) rec fail "running_pkgv devuelve un valor con espacios: rompe el formato de verify-last" ;;
+  *)     rec ok "running_pkgv devuelve un valor sin espacios (verify-last es space-delimited)" ;;
+esac
+
+# Sin pacman (o sin base de datos de paquetes) no debe reventar: devuelve vacío.
+# Se prueba la MISMA función extraída; no una reimplementación escrita aquí, que
+# probaría el test y no el script.
+# shellcheck disable=SC2123  # PATH es el search path y aquí se aísla a propósito
+_rbid_nopath="$PATH"
+# shellcheck disable=SC2123  # idem, segundo comando de la línea anterior
+PATH=/nonexistent
+_rbid="$(running_pkgv 2>/dev/null || true)"
+PATH="$_rbid_nopath"
+if [ -z "$_rbid" ]; then
+  rec ok "sin pacman (ni uname), running_pkgv devuelve vacío sin fallar"
+else
+  rec fail "sin pacman debería devolver vacío; devolvió '$_rbid'"
+fi
+# Y con pacman presente pero sin coincidencia (base vacía, kernel sin paquete):
+# no debe inventarse un build, pero tampoco perder el nombre.
+cat > "$_rbid_bin/pacman" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$_rbid_bin/pacman"
+# shellcheck disable=SC2123  # PATH a proposito: se aísla el pacman falso
+_rbid_oldpath="$PATH"; PATH="$_rbid_bin:$PATH"
+_rbid="$(running_pkgv)"
+PATH="$_rbid_oldpath"
+if [ -z "$_rbid" ]; then
+  rec ok "pacman sin coincidencia: running_pkgv devuelve vacío en vez de inventar un build"
+else
+  rec fail "pacman sin coincidencia devolvió '$_rbid'"
+fi
+unset -f running_pkgv
+
+# --- la FIRMA cambia entre dos builds aunque todo lo demás sea idéntico ---
+# Este es el corazón del fallo: mismo perfil, mismo scheduler, 0 incidencias, y
+# aun así la firma tiene que cambiar para que salte la notificación.
+_sx_nsc verify_state_fingerprint > "$ROOT/sx_fp.sh"
+# shellcheck disable=SC1090,SC1091
+source "$ROOT/sx_fp.sh"
+BASE_ISSUES=0; SCHED_EXPECTED=bore; SCHED_RUNNING=bore; JCOUNT=0; FW_COUNT=0
+SB_STATE="yes (UKI firmada; SB HABILITADO)"; ISSUES=0
+CUR_VERSION='7.2.8-cizen-v3'
+CUR_PKGV='7.2.8_cizen_v3-12'; _fp12="$(verify_state_fingerprint)"
+CUR_PKGV='7.2.8_cizen_v3-13'; _fp13="$(verify_state_fingerprint)"
+if [ "$_fp12" != "$_fp13" ]; then
+  rec ok "la firma distingue _12 de _13 con el resto del estado idéntico (arrancar un build nuevo se anuncia)"
+  _sx_v27_33_7=$((_sx_v27_33_7 + 1))
+else
+  rec fail "la firma es idéntica entre _12 y _13: arrancar un kernel recién compilado se callaría"
+fi
+# Y al revés: con el MISMO build la firma no cambia (esto sigue siendo ruido
+# que no debe notificarse en cada arranque).
+CUR_PKGV='7.2.8_cizen_v3-13'; _fp13b="$(verify_state_fingerprint)"
+if [ "$_fp13" = "$_fp13b" ]; then
+  rec ok "la firma NO cambia entre dos verificaciones del mismo build (sin ruido)"
+else
+  rec fail "la firma cambia sin motivo: se notificaría en cada arranque"
+fi
+# La firma debe LLEVAR el build, no solo el nombre: si se usara CUR_VERSION a
+# pelo, los dos casos de arriba darían la misma cadena.
+if printf '%s' "$_fp13" | grep -qF '7.2.8_cizen_v3-13'; then
+  rec ok "la firma incluye la identidad completa del build, no solo uname -r"
+else
+  rec fail "la firma no incluye el pkgrel: no distinguiría dos builds del mismo PKGVER"
+fi
+unset -f verify_state_fingerprint
+
+# --- First_boot compara IDENTIDADES, no nombres ---
+# Se ejecuta la FUNCIÓN REAL extraída del script. La primera versión de estos
+# tres tests copiaba la comparación dentro del test, y por eso pasaban contra el
+# código viejo: no medían el script, se medían a sí mismos.
+{ _sx_nsc first_boot_detected; } > "$ROOT/sx_fbfn.sh"
+# shellcheck disable=SC1090,SC1091
+source "$ROOT/sx_fbfn.sh"
+CUR_VERSION='7.2.8-cizen-v3'
+# shellcheck disable=SC2034  # los leen las funciones extraidas (sourced), no este fichero
+CUR_PKGV='7.2.8_cizen_v3-13'
+P_VER='7.2.8-cizen-v3'
+if first_boot_detected '7.2.8_cizen_v3-12'; then
+  rec ok "build anterior _12 → ahora _13: First_boot salta aunque uname -r sea idéntico"
+  _sx_v27_33_7=$((_sx_v27_33_7 + 1))
+else
+  rec fail "primera vez que arranca _13 tras _12 no se reconoce como novedad: es el fallo original"
+fi
+if first_boot_detected '7.2.8_cizen_v3-13'; then
+  rec fail "reiniciar el mismo build se anuncia como kernel nuevo"
+else
+  rec ok "mismo build otra vez: First_boot NO salta (no se re-anuncia en cada arranque)"
+fi
+if first_boot_detected ''; then
+  rec fail "una línea vieja de verify-last provoca un falso primer arranque"
+else
+  rec ok "línea vieja de verify-last (sin campo build) y mismo kernel: no se marca como primer arranque"
+fi
+# Y al revés: línea vieja, pero el nombre SÍ es distinto (arranque de otro
+# kernel) → sí debe marcar primer arranque. Es el caso que el nombre cubría
+# antes y que no puede perderse al añadir el campo nuevo.
+CUR_VERSION='7.2.8-cizen-v3'; P_VER='6.18.54-2.1-lts'
+CUR_PKGV='7.2.8_cizen_v3-13'
+if first_boot_detected ''; then
+  rec ok "línea vieja con otro kernel de nombre: First_boot sigue saltando por el nombre"
+else
+  rec fail "el campo nuevo tapó la detección por nombre de líneas viejas"
+fi
+# Un build con la misma versión y el mismo pkgrel tampoco es novedad: es el
+# guard contra el falso positivo de re-notificar en cada arranque.
+# shellcheck disable=SC2034  # los leen las funciones extraidas (sourced), no este fichero
+CUR_PKGV='6.18.54-2.1-lts'
+# shellcheck disable=SC2034  # idem: first_boot_detected lo lee en la rama de linea vieja
+P_VER='6.18.54-2.1-lts'
+CUR_VERSION='6.18.54-2.1-lts'
+if first_boot_detected '6.18.54-2.1-lts'; then
+  rec fail "el linux-lts, cuyo pkgver ya trae su propia revisión, se anunciaría como nuevo en cada arranque"
+else
+  rec ok "un pkgver que ya incluye revisión (linux-lts) tampoco da falsos positivos"
+fi
+unset -f first_boot_detected
+
+# --- el campo nuevo va AL FINAL de la línea: no desplaza lo que ya se leía ---
+# El campo 1 tiene que seguir siendo la versión, porque boot_ref filtra por él.
+# OJO con las comillas: en comillas SIMPLES '\$' es un backslash literal, así que
+# el patrón llevaría la barra invertida y no casaría con nada (mismo tipo de
+# trampa que el IFS de v27.31.45).
+if grep -qF "printf '%s %s %s %s %s %s %s %s %s\\n' \"\$CUR_VERSION\"" "$VERIFY_SRC" \
+   && grep -qF '"$CUR_PKGV" > "$LAST"' "$VERIFY_SRC"; then
+  rec ok "la identidad del build se añade como último campo de verify-last (no desplaza los anteriores)"
+  _sx_v27_33_7=$((_sx_v27_33_7 + 1))
+else
+  rec fail "la identidad del build no está como último campo: rompería las lecturas antiguas de verify-last"
+fi
+if sed -n '/^boot_ref() {/,/^}/p' "$VERIFY_SRC" | grep -qF '[ "$v" = "$want" ] || continue'; then
+  rec ok "boot_ref sigue filtrando el historial por el campo 1 (versión): la mediana de referencia no cambia de alcance"
+else
+  rec fail "boot_ref ya no filtra por la versión: la referencia de arranque mezclaría builds"
+fi
+
+# --- la etiqueta de build se USA, no solo existe ---
+# Test del flag/valor, no del texto: comprueba que el rótulo entra en el título
+# de las dos notificaciones. Es el mismo criterio que el test de PGO_CHANGED
+# (§50.5): un test que grepea la cadena impresa pasa aunque el título vuelva a
+# esconder el número de build.
+{ _sx_nsc build_label; _sx_nsc notify_issues; _sx_nsc notify_first_boot; } > "$ROOT/sx_titles.sh"
+# shellcheck disable=SC1090,SC1091
+source "$ROOT/sx_titles.sh"
+CUR_REL='13'
+if [ "$(build_label)" = ' (build 13)' ]; then
+  rec ok "build_label produce la etiqueta ' (build 13)'"
+else
+  rec fail "build_label no produce la etiqueta esperada: '$(build_label)'"
+fi
+CUR_REL=''
+if [ -z "$(build_label)" ]; then
+  rec ok "build_label vacío sin pkgrel: no añade ruido donde no hay nada que decir"
+else
+  rec fail "build_label inventa una etiqueta sin pkgrel: '$(build_label)'"
+fi
+# shellcheck disable=SC2034  # igual: lo consume build_label, que se extrae
+CUR_REL='13'
+# notify_first_boot no necesita red: con DRY=true solo imprime lo que haría.
+if sed -n '/^notify_first_boot() {/,/^}/p' "$VERIFY_SRC" | grep -q 'title="\$CUR_VERSION\$bl arrancado'; then
+  rec ok "el aviso de kernel nuevo lleva el número de build en el título"
+  _sx_v27_33_7=$((_sx_v27_33_7 + 1))
+else
+  rec fail "el aviso de kernel nuevo no dice qué build arrancó: '7.2.8-cizen-v3 arrancado' es ambiguo entre _12 y _13"
+fi
+if sed -n '/^notify_issues() {/,/^}/p' "$VERIFY_SRC" | grep -q 'title="\$CUR_VERSION\$bl: '; then
+  rec ok "el aviso de incidencias también lleva el número de build"
+else
+  rec fail "las incidencias de un kernel nuevo no dicen en cuál"
+fi
+# Si bl se calculase pero no se usara, los dos greps de arriba pasarían: se
+# exige que exista la asignación Y que el título la interpole.
+if sed -n '/^notify_first_boot() {/,/^}/p' "$VERIFY_SRC" | grep -q 'bl="\$(build_label)"'; then
+  rec ok "notify_first_boot calcula la etiqueta y la usa en el título"
+else
+  rec fail "notify_first_boot no usa la etiqueta que debería calcular"
+fi
+unset -f build_label notify_issues notify_first_boot
+# El informe de consola también lo dice: si no, el usuario tiene que abrir el
+# log para saber que el kernel en marcha no es el que esperaba.
+if grep -qF 'echo " Build (paquete)     : $CUR_PKGV"' "$VERIFY_SRC"; then
+  rec ok "el informe de consola muestra el pkgver-pkgrel del build en marcha"
+else
+  rec fail "el informe no dice qué build está en marcha"
+fi
+
+# ============================================================
 # v27.31.21: el estado real de Secure Boot (regresión)
 # ============================================================
 # El verificador daba "SB desconocido" en un equipo con Secure Boot perfectamente
