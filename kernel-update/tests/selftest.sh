@@ -5927,6 +5927,43 @@ else
   rec fail "pgo-collect: al elevar con sudo se pierde CIZEN_VMLINUX_STORE (env_reset)"
 fi
 
+# --- v27.33.5: el resumen de acierto de ccache no se imprimió NUNCA -------------
+# El IFS del motor es $'\n\t' (línea 147), sin espacio. Un `read -r a b c` de
+# tres variables NO reparte por espacios con ese IFS, así que la foto
+# "41407 34418 0" se iba entera a la primera variable y las otras dos quedaban
+# vacías: error de aritmética al final del build y `CCACHE_STATS` vacío, o sea
+# que el bloque no había impreso nada desde que existe (v27.31.52). Se comprueba
+# comprueba con la foto real que dejó el build del 2-oct.
+CCT="$ROOT/ccache"
+rm -rf "$CCT"; mkdir -p "$CCT"
+extract_fn ccache_snapshot_parse > "$CCT/fn.sh"
+cat > "$CCT/t.sh" <<'CCTSTUB'
+set -uo pipefail
+IFS=$'\n\t'   # el IFS real del motor: sin espacio, que es la trampa
+# shellcheck disable=SC1090
+. "$FNF"
+mapfile -t _cbs < <(ccache_snapshot_parse "${1:-}")
+printf '%s|%s|%s\n' "${_cbs[0]:-0}" "${_cbs[1]:-0}" "${_cbs[2]:-0}"
+CCTSTUB
+cc_parse() { FNF="$CCT/fn.sh" bash "$CCT/t.sh" "$1"; }
+if [ "$(cc_parse '41407 34418 0')" = "41407|34418|0" ]; then
+  rec ok "ccache: la foto de antes se reparte en tres cifras (no se va entera a una)"
+else
+  rec fail "ccache: la foto '41407 34418 0' se parseó como $(cc_parse '41407 34418 0')"
+fi
+if [ "$(cc_parse 'basura')" = "0|0|0" ] && [ "$(cc_parse '')" = "0|0|0" ]; then
+  rec ok "ccache: una foto vacía o no numérica da 0 y no revienta la aritmética"
+else
+  rec fail "ccache: con la foto mal formada sale $(cc_parse 'basura') / $(cc_parse '')"
+fi
+# y el contrato completo: con la foto bien leída, el delta tiene que ser un número
+# (el bloque inline que la usa es lo que se quedaba en blanco)
+if sed -n '/^CCACHE_STATS=""$/,/^fi$/p' "$MOTOR" | grep -q 'ccache_snapshot_parse'; then
+  rec ok "ccache: el resumen del build usa el parseo testeable, no un read en línea"
+else
+  rec fail "ccache: el resumen del build no usa ccache_snapshot_parse (IFS lo rompe)"
+fi
+
 # --- resumen ---
 echo
 printf 'Totales: %d ok, %d fail\n' "$PASS" "$FAIL"

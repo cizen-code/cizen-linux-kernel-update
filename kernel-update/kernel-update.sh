@@ -170,7 +170,7 @@ export LC_ALL=C
 #     deje de describir un estado que el power-profiles-daemon sobrescribe y el
 #     fallback sin PPD no degrade a EPP 255.
 # No se toca el motor: la cmdline se hereda, no se genera.
-SCRIPT_VERSION="27.33.4"
+SCRIPT_VERSION="27.33.5"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -12003,6 +12003,22 @@ store_install() { # $1=origen $2=destino
   sudo install -m644 -- "$src" "$dst" 2>/dev/null
 }
 
+# v27.33.5: separa la foto de ccache en tres enteros, uno por línea.
+# Nace de un bug real: el IFS del motor es $'\n\t' (sin espacio), así que el
+# `read -r a b c <<< "41407 34418 0"` de dentro de la aritmética se llevaba las
+# tres cifras en _cb_a y dejaba las otras dos vacías. El error salía al final
+# del build y el resumen de acierto quedaba en blanco: esta función es
+# testeable, aquel `read` en línea no lo era, y por eso nadie lo vio.
+# Un valor no numérico (o de más) se satura a 0 en vez de reventar la aritmética.
+ccache_snapshot_parse() { # $1 = "hits misses uncacheable"; imprime 3 líneas
+  local h m u v
+  IFS=$' \t\n' read -r h m u <<< "${1:-}"
+  for v in h m u; do
+    case "${!v:-}" in ''|*[!0-9]*) printf -v "$v" %s 0 ;; esac
+  done
+  printf '%s\n%s\n%s\n' "$h" "$m" "$u"
+}
+
 archive_vmlinux() {
   [ -f "$SRC/vmlinux" ] || [ -f "$SRC/vmlinux.unstripped" ] || {
     warn "PGO: el build no dejó vmlinux en el árbol; no se archiva (pgo-collect.sh no podrá colectar)."
@@ -12257,7 +12273,13 @@ fmt_time() { # segundos -> "Xm Ys" (o solo "Ys" si <60)
 # tomada antes de compilar (CCACHE_BEFORE).
 CCACHE_STATS=""
 if [ -n "${CCACHE_DIR:-}" ] && command -v ccache >/dev/null 2>&1; then
-  read -r _cb_h _cb_m _cb_u <<< "${CCACHE_BEFORE:-0 0 0}"
+  # v27.33.5: se parsea con ccache_snapshot_parse, no con un `read` en línea. El
+  # IFS del motor es $'\n\t' (sin espacio) y el `read` de tres variables se
+  # llevaba "41407 34418 0" entero a _cb_h: error de aritmética al final del
+  # build y `CCACHE_STATS` vacío, o sea que este resumen no se había impreso
+  # nunca. mapfile evita además depender del IFS.
+  mapfile -t _cbs < <(ccache_snapshot_parse "${CCACHE_BEFORE:-}")
+  _cb_h="${_cbs[0]:-0}"; _cb_m="${_cbs[1]:-0}"; _cb_u="${_cbs[2]:-0}"
   _ca_h="$(ccache_read_counter hits)"
   _ca_m="$(ccache_read_counter misses)"
   _ca_u="$(ccache_read_counter uncacheable)"

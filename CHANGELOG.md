@@ -1,3 +1,32 @@
+## [27.33.5] - 2026-10-02
+
+**El resumen de acierto de ccache no se había impreso nunca, y su error salía
+en la última línea del build.** Todo por un `read` de tres variables con el IFS
+del motor, que no incluye el espacio.
+
+- **`IFS=$'\n\t'` (línea 147) y `read -r a b c`.** Con ese IFS, `read` **no**
+  reparte por espacios: la foto que `CCACHE_BEFORE` tomaba antes de compilar
+  («41407 34418 0») se iba **entera** a `_cb_h` y `_cb_m`/`_cb_u` quedaban
+  vacías. La línea siguiente es una aritmética, así que el build terminaba con
+  `arithmetic syntax error in expression (error token is "34418 0 ")` y
+  `_d_h` nunca se asignaba: `CCACHE_STATS` quedaba **vacío** y el bloque —que
+  existe desde v27.31.52 precisamente para decir si esta build ha reutilizado
+  la caché— no imprimió ni una vez. En el build del 2-oct, el primer indicio fue
+  ese error suelto después de «Configuración final guardada».
+- **Se parsea con `ccache_snapshot_parse()`**, una función que imprime las tres
+  cifras en líneas separadas y satura a 0 lo que no sea numérico, y el resumen
+  las lee con `mapfile` (que no depende del IFS). La función existe **para poder
+  testearla**: el `read` en línea era imposible de cubrir, y un bloque no
+  testeable es exactamente cómo llegó esto a producción. Un `for` de cinturón
+  convierte cualquier foto futura mal formada en ceros en vez de un error de
+  aritmética.
+- **Tests: 3 nuevos → 579 ok / 0 fail**, 2 de ellos en rojo contra el commit
+  anterior. El montaje pone el IFS real del motor (`$'\n\t'`), que es la
+  trampa, y comprueba con la foto exacta que dejó el build del 2-oct.
+- **Nada de esto afecta al kernel compilado**: es un resumen. Se corrigió porque
+  un error de aritmética al final de un build de 32 minutos es exactamente el
+  tipo de ruido que hace mirar para otro lado el siguiente aviso.
+
 ## [27.33.4] - 2026-10-02
 
 **El store de `vmlinux` nunca se escribía en este host, y el README lo prometía
