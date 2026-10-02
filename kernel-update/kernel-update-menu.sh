@@ -120,6 +120,22 @@ fi
 ROLLBACK_SCRIPT="${CIZEN_KROLLBACK_SCRIPT:-/usr/local/bin/kernel-update/kernel-update-rollback.sh}"
 ROLLBACK_DIR="${CIZEN_ROLLBACK_DIR:-/var/lib/kernel-update/rollback}"
 
+# v27.33.3: el gestor se resolvia como el rollback, no con una ruta fija. La
+# opción 17 tenía "/usr/local/bin/kernel-update/kernel-update-manager.sh" escrito
+# a pelo: con el menú ejecutándose desde el repo (CIZEN_KERNEL_SCRIPT) o con el
+# gestor instalado en otro sitio, el `exec` fallaba con el error de bash y sin
+# decir dónde lo busca. Ahora: hermano del motor, variable de entorno y, en
+# último término, la ruta de instalación.
+MANAGER_SCRIPT="${CIZEN_KMANAGER_SCRIPT:-}"
+if [ -z "$MANAGER_SCRIPT" ]; then
+  for _cand in "$(dirname -- "${SCRIPT:-$0}")/kernel-update-manager.sh" \
+               /usr/local/bin/kernel-update/kernel-update-manager.sh; do
+    if [ -x "$_cand" ]; then MANAGER_SCRIPT="$_cand"; break; fi
+  done
+  unset _cand
+fi
+[ -n "$MANAGER_SCRIPT" ] || MANAGER_SCRIPT="/usr/local/bin/kernel-update/kernel-update-manager.sh"
+
 rollback_resumen() { # una línea para la etiqueta de la opción 9
   local mf="$ROLLBACK_DIR/rollback.info" pkgbase pkgver sched pkgfile
   if [ ! -r "$mf" ]; then
@@ -352,7 +368,13 @@ while true; do
        exec "$SCRIPT" $args ${btf_arg:+"$btf_arg"} ;;
     15) build_and_exec baja ask --absorb-rebels --ntsync ;;
     16) build_and_exec baja ask --absorb-rebels --cachy ;;
-    17) exec /usr/local/bin/kernel-update/kernel-update-manager.sh ;;
+    17) if [ -x "$MANAGER_SCRIPT" ]; then
+         exec "$MANAGER_SCRIPT"
+       else
+         printf '  %s✗%s No está %s\n' "$R" "$N" "$MANAGER_SCRIPT"
+         printf '    Instálalo con:  sudo install -Dm755 kernel-update/kernel-update-manager.sh %s\n' "$MANAGER_SCRIPT"
+         printf '    (o usa CIZEN_KMANAGER_SCRIPT si vive en otra ruta)\n'
+       fi ;;
     # --pgo sin ruta: el motor busca el mejor .afdo para la versión objetivo.
     # Con --pgo RUTA se usa ese fichero concreto. Pide clang si hace falta.
     18) build_and_exec baja ask --absorb-rebels --pgo ;;

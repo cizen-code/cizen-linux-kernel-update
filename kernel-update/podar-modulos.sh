@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# podar-modulos.sh — Poda de módulos del kernel Cizen v1.1.1
+# podar-modulos.sh — Poda de módulos del kernel Cizen v1.1.2
 #
 # Elimina de un árbol de módulos (lib/modules/<release>) los módulos que este
 # hardware no necesita, conservando únicamente:
@@ -16,6 +16,15 @@
 #   no tienen archivo .ko: la poda nunca los afecta - el arranque sin UKI
 #   initramfs depende de ellos y el perfil los fija como boot_critical.
 #
+# v1.1.2 (2026-10-01): dos correcciones de la auditoría del 1-oct.
+#   1) La poda ABORTABA (bash: "subíndice de matriz incorrecto") en cuanto un
+#      módulo conservado no tenía dependencias, porque `for x in "${arr[@]:-}"`
+#      itera una vez con la cadena vacía y esa se usaba como subíndice. Con el
+#      `|| true` con el que el motor inyecta este script en package(), el paquete
+#      se instalaba sin poda y sin regenerar los índices, sin aviso.
+#   2) Las líneas de /etc/modules-load.d con comentario ("kvm_intel   # KVM")
+#      llegaban al allowlist con los espacios pegados y no casaban con el nombre
+#      canónico: la poda borraba un módulo que el arranque pedía.
 # v1.1.1 (2026-09-22): TODAS las comparaciones claves del podador se hacen por
 # NOMBRE CANÓNICO de módulo (el de modprobe/depmod, guiones bajos). Antes el
 # inventario, el cierre de dependencias y la poda física comparaban el basename
@@ -102,6 +111,13 @@ declare -A KEEP=()
 # comparación de la poda física (mismo esquema) no pierda módulos.
 keep_mod() { [ -n "$1" ] && KEEP["${1//-/_}"]=1; }
 
+# v1.1.2: /etc/modules-load.d admite líneas como "kvm_intel   # para KVM". El
+# comentario se quita con sed, pero los espacios que lo precedían se quedaban
+# pegados al nombre ("kvm_intel   "), de modo que la clave del allowlist no
+# casaba con el nombre canónico real y la poda se llevaba un módulo que el
+# arranque pedía explícitamente. Por eso el recorte de espacios va en el sed de
+# arriba y aquí se deja la normalización por si el nombre llega por otra vía.
+
 # ------------------------------------------------------------
 # 0) Inventario del árbol objetivo (nombres de módulo -> fichero .ko*)
 #    (se omite en modo --keep-list: no hay árbol que inventariar)
@@ -147,7 +163,8 @@ if [ -d /etc/modules-load.d ]; then
       ''|\#*) continue ;;
       *) keep_mod "$_ml" ;;
     esac
-  done < <(sed -E 's/[#].*$//' /etc/modules-load.d/* 2>/dev/null || true)
+  done < <(sed -E 's/[[:space:]]*#.*$//; s/^[[:space:]]+//; s/[[:space:]]+$//' \
+             /etc/modules-load.d/* 2>/dev/null || true)
 fi
 
 # ------------------------------------------------------------
@@ -299,7 +316,16 @@ while [ "${#STACK[@]}" -gt 0 ]; do
   [ -z "${FILE_BY_NAME[$_cur]:-}" ] && continue
   KEEP["$_cur"]=1
   IFS=' ' read -r -a _deparr <<< "${DEPS[$_cur]:-}" 2>/dev/null || true
-  for _d in "${_deparr[@]:-}"; do
+  # v1.1.2: `for _d in "${_deparr[@]:-}"` itera UNA vez con cadena vacía cuando
+  # el módulo no tiene dependencias, y la línea siguiente la usaba como subíndice
+  # (VISITED[""]), que bash rechaza con "bad array subscript": la poda se
+  # abortaba enteramente —antes de borrar nada— en cuanto un módulo conservado
+  # no tenía `depends=` en modules.dep, que es el caso normal. Como el motor
+  # inyecta este script con `|| true`, el resultado era un paquete instalado sin
+  # poda y sin índice de dependencias, sin un solo aviso. Con `${_deparr[@]+...}`
+  # un array vacío no itera ninguna vez.
+  for _d in ${_deparr[@]+"${_deparr[@]}"}; do
+    [ -n "$_d" ] || continue
     if [ -z "${VISITED[$_d]:-}" ] && [ -n "${FILE_BY_NAME[$_d]:-}" ]; then
       STACK+=("$_d")
     fi

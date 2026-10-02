@@ -97,8 +97,13 @@ resumen_datos() {
       }
       next
     }
-    /^1 hilo/       { un = num_ms(); next }
-    /^[0-9]+ hilos/  { par = num_ms(); next }
+    # `/^1 hilo/` (sin ancla al final) también casa con la línea "1 hilos : ..."
+    # del brazo paralelo cuando SCHED_BENCH_LOAD_N=1, que se consumía antes de
+    # llegar a la regla siguiente: `par` nunca se fijaba y flush() descartaba
+    # TODAS las muestras (contadas=0, descartadas=n). Se ancla a "hilo" +
+    # espacio, que es exactamente como las imprime este script.
+    /^1 hilo[ ]/      { un = num_ms(); next }
+    /^[0-9]+ hilos[ ]/ { par = num_ms(); next }
     /^latencia fg/  { lat = num_ms(); next }
     END {
       flush()

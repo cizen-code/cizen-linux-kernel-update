@@ -5396,6 +5396,401 @@ for _w in resolve_symbol config_symbol_state kconfig_symbol_type tree_identity; 
 done
 unset _w
 
+# ═══════════════════════════════════════════════════════════════════════════
+# v27.33.3 — auditoría del 2026-10-01 (siete defectos, siete redes)
+# ═══════════════════════════════════════════════════════════════════════════
+
+printf '%s\n' "== apply_patch_plugin: el estado de un parche no se filtra al siguiente =="
+# `--sched pds --bore` (o CIZEN_PATCHES="pds,bore") deja PATCH_NAMES=(pds bore).
+# patch_desc_bore NO declara PATCH_CHOICE_DISABLE, PATCH_RETIRED_SYMBOLS ni
+# PATCH_EMBED_B64 —no los necesita: BORE no activa SCHED_ALT y no lleva parche
+# embebido—, así que sin el unset de apply_patch_plugin los heredaba del primero.
+# LoObservable es triple: BORE registraba un --disable SCHED_PDS que no pidió
+# nadie, duplicaba en PATCH_RETIRED_ALL los cinco símbolos de BMQ, y sobre todo
+# reutilizaba el parche BMQ embebido como fallback: si el parche BORE de red
+# fallaba, se aplicaba el de otro scheduler y el build continuaba creyendo que
+# llevaba BORE (BORE_ENABLED=true, PATCHES_APPLIED=+bore).
+# OJO al排查: PATCH_RETIRED_ALL es un ACUMULADOR GLOBAL por diseño (si PDS quita
+# SCHED_AUTOGROUP del árbol, el build combinado no debe exigírselo a nadie más),
+# así que lo que se comprueba no es que quede igual, sino que bore NO lo crezca
+# ni lo duplique.
+(
+  KERNEL_TREE=cachyos
+  PATCHES_APPLIED=(); PATCH_ENABLE_ALL=(); PATCH_REBEL_ALL=(); PATCH_VALUE_SYMBOLS=()
+  PATCH_CHOICE_DISABLE=(); PATCH_RETIRED_SYMBOLS=(); PATCH_EMBED_B64=""
+  BORE_ENABLED=false
+  # El arnés borra patch-bmq.patch tras sus propios tests (el stub de descarga lo
+  # recrea cuando lo necesita), así que aquí hay que volver a crearlo para que
+  # el pin SHA256 sea el del fichero que se sirve de verdad.
+  printf 'config SCHED_BMQ\n--- a/init/Kconfig\n+++ b/init/Kconfig\n' > "$ROOT/patch-bmq.patch"
+  # El pin SHA256 tiene que ser el del fichero que sirve el stub para CADA
+  # parche: 0001-prjc*.patch entrega patch-bmq.patch y 0001-bore*.patch entrega
+  # patch-cachy.patch. Con el pin equivocado el parche se rechaza por hash y el
+  # arnés probaría el estado de un plugin que ni se aplicó.
+  CIZEN_PATCH_SHA256_MAIN="$(sha256sum "$ROOT/patch-bmq.patch" | cut -d' ' -f1)"
+  CIZEN_PATCH_SHA256_FALLBACK="$CIZEN_PATCH_SHA256_MAIN"
+  export CIZEN_PATCH_SHA256_MAIN CIZEN_PATCH_SHA256_FALLBACK
+  # bmq: magic "config SCHED_BMQ" == el que sirve el stub para 0001-prjc*.patch.
+  apply_patch_plugin bmq >/dev/null 2>&1 || true
+  rm -f -- "$ROOT/patch-bmq.patch"
+  printf 'acc-ret-bmq=%s\n' "${#PATCH_RETIRED_ALL[@]}"
+  printf 'acc-dup-bmq=%s\n' "$(printf '%s\n' "${PATCH_RETIRED_ALL[@]:-}" | sort | uniq -d | tr '\n' ' ')"
+  printf 'desc-choice-bmq=%s\n' "${PATCH_CHOICE_DISABLE[*]:-<vacío>}"
+  printf 'desc-ret-bmq=%s\n' "${PATCH_RETIRED_SYMBOLS[*]:-<vacío>}"
+  printf 'desc-embed-bmq=%s\n' "${PATCH_EMBED_B64:-<vacío>}"
+  CIZEN_PATCH_SHA256_MAIN="$(sha256sum "$ROOT/patch-cachy.patch" | cut -d' ' -f1)"
+  CIZEN_PATCH_SHA256_FALLBACK="$(sha256sum "$ROOT/patch-upstream.patch" | cut -d' ' -f1)"
+  export CIZEN_PATCH_SHA256_MAIN CIZEN_PATCH_SHA256_FALLBACK
+  apply_patch_plugin bore >/dev/null 2>&1 || true
+  printf 'acc-ret-bore=%s\n' "${#PATCH_RETIRED_ALL[@]}"
+  printf 'acc-dup-bore=%s\n' "$(printf '%s\n' "${PATCH_RETIRED_ALL[@]:-}" | sort | uniq -d | tr '\n' ' ')"
+  printf 'desc-choice-bore=%s\n' "${PATCH_CHOICE_DISABLE[*]:-<vacío>}"
+  printf 'desc-ret-bore=%s\n' "${PATCH_RETIRED_SYMBOLS[*]:-<vacío>}"
+  printf 'desc-embed-bore=%s\n' "${PATCH_EMBED_B64:-<vacío>}"
+) > "$ROOT/leak.txt" 2>&1
+_leak_get() { sed -n "s/^$1=//p" "$ROOT/leak.txt"; }
+_lk_acc_bmq="$(_leak_get acc-ret-bmq)"
+_lk_dup_bmq="$(_leak_get acc-dup-bmq)"
+_lk_choice_bmq="$(_leak_get desc-choice-bmq)"
+_lk_ret_bmq="$(_leak_get desc-ret-bmq)"
+_lk_emb_bmq="$(_leak_get desc-embed-bmq)"
+_lk_acc_bore="$(_leak_get acc-ret-bore)"
+_lk_dup_bore="$(_leak_get acc-dup-bore)"
+_lk_choice_bore="$(_leak_get desc-choice-bore)"
+_lk_ret_bore="$(_leak_get desc-ret-bore)"
+_lk_emb_bore="$(_leak_get desc-embed-bore)"
+case "$_lk_ret_bmq" in
+  *SCHED_AUTOGROUP*) rec ok "bmq sí retira símbolos (el arnés monta el caso real)" ;;
+  *) rec fail "bmq no registró PATCH_RETIRED_SYMBOLS: [$_lk_ret_bmq]" ;;
+esac
+if [ "$_lk_choice_bmq" = "SCHED_PDS" ] && [ -n "$_lk_emb_bmq" ]; then
+  rec ok "bmq deja CHOICE=SCHED_PDS y parche embebido (el estado que antes se heredaba)"
+else
+  rec fail "bmq no montó el caso: CHOICE=[$_lk_choice_bmq] EMBED=[$_lk_emb_bmq]"
+fi
+if [ "$_lk_choice_bore" = "<vacío>" ]; then
+  rec ok "BORE no hereda PATCH_CHOICE_DISABLE (no registra un --disable SCHED_PDS)"
+else
+  rec fail "BORE heredó PATCH_CHOICE_DISABLE: [$_lk_choice_bore]"
+fi
+if [ "$_lk_ret_bore" = "<vacío>" ]; then
+  rec ok "BORE no hereda PATCH_RETIRED_SYMBOLS"
+else
+  rec fail "BORE heredó PATCH_RETIRED_SYMBOLS: [$_lk_ret_bore]"
+fi
+if [ "$_lk_emb_bore" = "<vacío>" ]; then
+  rec ok "BORE no hereda el parche embebido de BMQ (si lo heredase, ese caería por el fallback)"
+else
+  rec fail "BORE heredó PATCH_EMBED_B64: aplicaría el parche de otro scheduler como fallback"
+fi
+if [ "${_lk_acc_bore:-0}" = "${_lk_acc_bmq:-x}" ] && [ -z "$_lk_dup_bore" ]; then
+  rec ok "BORE no crece ni duplica PATCH_RETIRED_ALL ($_lk_acc_bmq símbolos, los de bmq)"
+else
+  rec fail "BORE tocó el acumulador retirado (bmq=$_lk_acc_bmq bore=$_lk_acc_bore dup=[$_lk_dup_bore])"
+fi
+# El unset que lo arregla tiene que existir; si alguien lo quita, los tests de
+# arriba empiezan a fallar, pero este dice exactamente qué se perdió.
+_apf_unset="$(sed -n '/^apply_patch_plugin() {/,/^}/p' "$MOTOR" \
+              | sed -n '/unset PATCH_TREE_REQUIRED/,+1p')"
+for _v in PATCH_CHOICE_DISABLE PATCH_RETIRED_SYMBOLS PATCH_EMBED_B64; do
+  case "$_apf_unset" in
+    *"$_v"*) : ;;
+    *) rec fail "apply_patch_plugin no resetea $_v (vuelve la fuga entre parches)" ;;
+  esac
+done
+case "$_apf_unset" in
+  *PATCH_CHOICE_DISABLE*PATCH_EMBED_B64*|*PATCH_EMBED_B64*PATCH_CHOICE_DISABLE*)
+    rec ok "apply_patch_plugin resetea los tres estado que filtraba" ;;
+  *) rec fail "apply_patch_plugin no resetea CHOICE_DISABLE/RETIRED/EMBED_B64 juntos" ;;
+esac
+unset _bmq_leak _bmq_retired _bmq_choice _bore_retired _bore_choice _apf_unset _v
+
+printf '%s\n' "== módulo firmado: SECURE_BOOT no se leía sin existir (module-sign) =="
+# `if [ "$SECURE_BOOT" = true ]` dentro de module_sign_installed. La variable no
+# está declarada en ningún punto del motor (grep: una sola aparición, la del
+# propio test), así que con `set -Eeuo pipefail` el build moría con
+# "SECURE_BOOT: variable sin asignar" — AL FINAL: compilación hecha, paquete
+# instalado y módulos sin firmar. La segunda ejecución sí pasaba (ya existía el
+# certificado), que es lo que lo hacía parecer intermitente.
+_secboot_reads="$(grep -n '\$SECURE_BOOT\b' "$MOTOR" | grep -v '^[0-9]*:[[:space:]]*#' || true)"
+if [ -z "$_secboot_reads" ]; then
+  rec ok "el motor no lee \$SECURE_BOOT (usa secure_boot_active, que sí existe)"
+else
+  rec fail "lectura de \$SECURE_BOOT sin declarar: $(printf '%s' "$_secboot_reads" | tr '\n' ' ')"
+fi
+if sed -n '/^module_sign_installed() {/,/^}/p' "$MOTOR" | grep -q 'secure_boot_active'; then
+  rec ok "module_sign_installed decide por secure_boot_active"
+else
+  rec fail "module_sign_installed no consulta secure_boot_active"
+fi
+unset _secboot_reads
+
+printf '%s\n' "== módulo comprimido: la firma alcanza a .ko.zst (MODULE_COMPRESS_ALL) =="
+# El perfil de este equipo lleva CONFIG_MODULE_COMPRESS_ZSTD=y y
+# CONFIG_MODULE_COMPRESS_ALL=y, así que el árbol instalado no tiene ni un .ko
+# pelado. El bucle anterior buscaba solo -name '*.ko', no encontraba nada y aun
+# así informaba "ok: 0 módulos firmados".
+_ms_body="$(sed -n '/^module_sign_installed() {/,/^}/p' "$MOTOR")"
+case "$_ms_body" in
+  *"-name '*.ko.*'"*) rec ok "module_sign_installed busca también los comprimidos" ;;
+  *) rec fail "module_sign_installed sigue buscando solo '*.ko': con MODULE_COMPRESS_ALL firma 0" ;;
+esac
+case "$_ms_body" in
+  *"NINGÚN módulo firmado"*) rec ok "module_sign_installed avisa cuando no firma nada" ;;
+  *) rec fail "module_sign_installed no distingue '0 firmados' de un éxito" ;;
+esac
+if sed -n '/^_sign_installed_module() {/,/^}/p' "$MOTOR" | grep -q '\*.ko.zst'; then
+  rec ok "el firmador sabe descomprimir/firmar/recomprimir un .ko.zst"
+else
+  rec fail "_sign_installed_module no contempla la compresión zstd"
+fi
+# Y el perfil tiene que ser el que activa ese camino, que es lo que lo hace
+# necesario: si algún día el perfil deja de comprimir, el test avisa de que la
+# cobertura ya no está probando nada.
+if grep -rq '^CONFIG_MODULE_COMPRESS_ALL=y' "$(dirname "$MOTOR")/profiles/" 2>/dev/null; then
+  rec ok "el caso .ko.zst aplica a este perfil (MODULE_COMPRESS_ALL=y)"
+else
+  rec ok "el perfil ya no comprime módulos; el camino .ko.zst queda como preventivo"
+fi
+# Ida y vuelta real de la firma sobre un módulo comprimido, con stubs de root y
+# de firmador: si el descompresor, el firmador o el recompresor no se encadenan
+# bien, el módulo se queda a medio camino (sin comprimir, o comprimido sin
+# firmar) y Secure Boot lo rechaza igual, pero más tarde y con otro mensaje.
+if command -v zstd >/dev/null 2>&1; then
+  _msdir="$ROOT/modsign"
+  mkdir -p "$_msdir/bin" "$_msdir/mod"
+  printf '#!/bin/sh\nexec "$@"\n' > "$_msdir/bin/sudo"
+  printf '#!/bin/sh\nfor a in "$@"; do last="$a"; done\nprintf FIRMA-SIMULADA >> "$last"\n' \
+    > "$_msdir/bin/sign-file"
+  chmod +x "$_msdir/bin/sudo" "$_msdir/bin/sign-file"
+  printf 'MODULO-ORIGINAL\n' | zstd -q -o "$_msdir/mod/test.ko.zst" -f
+  sed -n '/^_sign_installed_module() {/,/^}/p' "$MOTOR" > "$_msdir/fn.sh"
+  _msrc=1
+  PATH="$_msdir/bin:$PATH" bash -c '
+    set -u
+    source '"$_msdir"'/fn.sh
+    _sign_installed_module '"$_msdir"'/mod/test.ko.zst clave.crt cert.crt '"$_msdir"'/bin/sign-file
+  ' >/dev/null 2>&1 && _msrc=0
+  if [ "$_msrc" = 0 ] && zstd -t "$_msdir/mod/test.ko.zst" >/dev/null 2>&1; then
+    rec ok "módulo .ko.zst firmado: sigue siendo zstd válido tras descomprimir/firmar/recomprimir"
+  else
+    rec fail "el firmado de un .ko.zst dejó el módulo inservible (rc=$_msrc)"
+  fi
+  if zstd -dc "$_msdir/mod/test.ko.zst" 2>/dev/null | grep -q '^FIRMA-SIMULADA$'; then
+    rec ok "la firma queda DENTRO del módulo comprimido (no en un .ko suelto)"
+  else
+    rec fail "la firma no aparece dentro del .ko.zst"
+  fi
+  if zstd -dc "$_msdir/mod/test.ko.zst" 2>/dev/null | grep -q '^MODULO-ORIGINAL$'; then
+    rec ok "el contenido original sobrevive al ciclo"
+  else
+    rec fail "el firmado perdió el contenido del módulo"
+  fi
+  # Un módulo corrupto no puede firmarse: tiene que quedar como estaba, no
+  # truncado ni "--firmado" a medias.
+  printf 'no-es-zstd' > "$_msdir/mod/malo.ko.zst"
+  cp -- "$_msdir/mod/malo.ko.zst" "$_msdir/mod/malo.ref"
+  PATH="$_msdir/bin:$PATH" bash -c '
+    set -u
+    source '"$_msdir"'/fn.sh
+    _sign_installed_module '"$_msdir"'/mod/malo.ko.zst clave.crt cert.crt '"$_msdir"'/bin/sign-file
+  ' >/dev/null 2>&1
+  if cmp -s "$_msdir/mod/malo.ko.zst" "$_msdir/mod/malo.ref"; then
+    rec ok "un módulo corrupto no se toca al fallar el firmado"
+  else
+    rec fail "el fallo de compresión dejó el módulo modificado"
+  fi
+  unset _msdir _msrc
+fi
+unset _ms_body
+
+printf '%s\n' "== migración de paquete: la prueba usa el resolutor de la retirada =="
+# `pacman -Q linux-upstream` resuelve `provides` y el propio motor declara
+# provides=(\"linux-upstream\") en su paquete: la consulta respondía 0 SIEMPRE
+# (con "linux-cizen-v3" en la salida), la retirada `pacman -R linux-upstream`
+# —que solo acepta nombres— fallaba con "target not found", y el motor lo
+# reportaba como "linux-upstream ya no estaba instalado" más el error crudo por
+# stderr, en cada build.
+_ikp="$(sed -n '/^install_kernel_package() {/,/^}/p' "$MOTOR")"
+case "$_ikp" in
+  *'pacman -Q "$LEGACY_PKGBASE"'*)
+    rec fail "install_kernel_package sigue probando con -Q, que resuelve provides" ;;
+  *)
+    rec ok "install_kernel_package ya no prueba la migración con pacman -Q" ;;
+esac
+case "$_ikp" in
+  *'pacman -R --print'*) rec ok "la prueba usa pacman -R --print (mismo resolutor, no toca nada)" ;;
+  *) rec fail "la prueba de migración no usa el resolutor de pacman -R" ;;
+esac
+unset _ikp
+
+printf '%s\n' "== extracción de fuentes: el rc de tar se comprueba =="
+# extract_tarball se invoca como `extract_tarball || fatal`, y eso desactiva
+# errexit en todo su cuerpo. Con el tar a pelo, un tarball corrupto o un ENOSPC a
+# mitad se comían el fallo; como el resto de la función solo mira que exista
+# $SRC/Makefile, el árbol truncado pasaba por bueno y se compilaba un kernel
+# fuente incompleto sin un solo aviso.
+_et_body="$(sed -n '/^extract_tarball() {/,/^}/p' "$MOTOR")"
+case "$_et_body" in
+  *'if ! tar -xf'*) rec ok "extract_tarball comprueba el rc de tar" ;;
+  *) rec fail "extract_tarball sigue con 'tar -xf' a pelo: un árbol truncado compila" ;;
+esac
+if printf '%s' "$_et_body" | sed -n '/if ! tar -xf/,/fi/p' | grep -q 'rm -rf "\$SRC"'; then
+  rec ok "extract_tarball borra el árbol a medias cuando tar falla"
+else
+  rec fail "extract_tarball deja el árbol parcial tras un fallo de tar"
+fi
+unset _et_body
+
+printf '%s\n' "== frags: el recuento de directivas cuenta directivas =="
+# $(( ${#__args[@]} / 2 )): --enable/--module/--disable gastan 2 tokens, pero
+# --set-val y --set-str gastan 3. Tres --set-str se anunciaban como "4
+# directivas", y ese número es la única señal de que el frag se leyó entero.
+_fdirs="$(
+  CIZEN_FRAGS_DIR="$ROOT/frags-count"
+  mkdir -p "$CIZEN_FRAGS_DIR" "$ROOT/src-frag"
+  printf 'CONFIG_X86_X2APIC=y\nCONFIG_HZ=500\nCONFIG_LOCALVERSION="-cizen-v3"\n' \
+    > "$CIZEN_FRAGS_DIR/cuenta.frag"
+  mkdir -p "$ROOT/src-frag/scripts"
+  cat > "$ROOT/src-frag/scripts/config" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$ROOT/src-frag/scripts/config"
+  SRC="$ROOT/src-frag"
+  info() { printf 'INFO> %s\n' "$*"; }
+  apply_config_fragments 2>&1 | sed -n 's/^INFO> Frag aplicado.*(\([0-9]*\) directivas).*/\1/p'
+)"
+if [ "$_fdirs" = "3" ]; then
+  rec ok "frag con 3 directivas cuenta 3 (no ${_fdirs:-?})"
+else
+  rec fail "un frag de 3 directivas (1 enable + 2 set-str) cuenta ${_fdirs:-?} directivas"
+fi
+unset _fdirs
+
+printf '%s\n' "== podar-modulos.sh: la poda no se aborta con un módulo sin dependencias =="
+# `for _d in "${_deparr[@]:-}"` itera UNA vez con la cadena vacía cuando el módulo
+# conservado no tiene `depends=`, y esa vacía se usaba como subíndice de un array
+# asociativo: bash aborta con "bad array subscript". El motor inyecta este
+# script con `|| true`, así que la consecuencia era un paquete instalado SIN poda
+# y sin índices de dependencias, sin ningún aviso.
+PODAR="$(dirname "$MOTOR")/podar-modulos.sh"
+if [ -r "$PODAR" ]; then
+  if command -v depmod >/dev/null 2>&1; then
+    _pt="$ROOT/prune/lib/modules/9.9.9"
+    mkdir -p "$_pt/kernel/drivers/usb/storage" "$_pt/kernel/drivers/decoy"
+    : > "$_pt/kernel/drivers/usb/storage/usb-storage.ko"   # conservado, SIN depends
+    : > "$_pt/kernel/drivers/decoy/foo_decoy.ko"            # debe podarse
+    depmod -b "$ROOT/prune" 9.9.9 >/dev/null 2>&1
+    if out="$(bash "$PODAR" "$_pt" usb-storage 2>&1)"; then
+      if [ -f "$_pt/kernel/drivers/usb/storage/usb-storage.ko" ]; then
+        rec ok "módulo conservado sin dependencias no tumba la poda (rc=0)"
+      else
+        rec fail "la poda se llevó el módulo sin dependencias que se pidió conservar"
+      fi
+      if [ ! -f "$_pt/kernel/drivers/decoy/foo_decoy.ko" ]; then
+        rec ok "la poda sigue retirando lo que no se usa"
+      else
+        rec fail "la poda no retiró el módulo señuelo"
+      fi
+    else
+      rec fail "la poda devolvió error con un módulo sin dependencias: $(printf '%s' "$out" | tail -2 | tr '\n' ' ')"
+    fi
+    unset _pt out
+  else
+    rec ok "depmod no disponible: poda con módulo sin dependencias no comprobada"
+  fi
+  # /etc/modules-load.d admite "kvm_intel   # para KVM": el comentario se quita
+  # con sed, pero los espacios que lo precedían se quedaban pegados al nombre y
+  # la clave del allowlist no casaba con el nombre canónico.
+  if grep -q "s/\[\[:space:\]\]\*#\.\*\$//; s/\^\[\[:space:\]\]" "$PODAR"; then
+    rec ok "podar-modulos.sh recorta espacios y comentario de /etc/modules-load.d"
+  else
+    rec fail "podar-modulos.sh no recorta las líneas de /etc/modules-load.d con comentario"
+  fi
+  if grep -q '_deparr\[@\]+' "$PODAR"; then
+    rec ok "podar-modulos.sh itera el array de deps sin el elemento vacío"
+  else
+    rec fail "podar-modulos.sh sigue con \"\${_deparr[@]:-}\" (elemento vacío -> bad array subscript)"
+  fi
+else
+  rec ok "podar-modulos.sh no está junto al motor: su poda no se comprobó"
+fi
+
+printf '%s\n' "== sched-bench.sh: con carga de 1 hilo la medición se cuenta =="
+# `/^1 hilo/` (sin ancla final) también casa con la línea "1 hilos : ..." del
+# brazo paralelo cuando SCHED_BENCH_LOAD_N=1: se la comía antes de la regla
+# siguiente, `par` nunca se fijaba y flush() descartaba TODAS las muestras
+# (contadas=0, descartadas=n) — el histórico se llenaba de "desc".
+SB="$(dirname "$MOTOR")/sched-bench.sh"
+if [ -r "$SB" ]; then
+  sed -n "/awk '\$/,/^  ' \"\$1\"/p" "$SB" | sed '1d;$d' > "$ROOT/sb.awk" 2>/dev/null
+  if [ -s "$ROOT/sb.awk" ]; then
+    printf 'fecha 2026-10-01\niteraciones: 20\n1 hilo       : 120 ms\n1 hilos  : 90 ms\nlatencia fg   : 40 ms\n' > "$ROOT/sb1.log"
+    printf 'fecha 2026-10-01\niteraciones: 20\n1 hilo       : 120 ms\n4 hilos  : 90 ms\nlatencia fg   : 40 ms\n' > "$ROOT/sb4.log"
+    _s1="$(awk -f "$ROOT/sb.awk" "$ROOT/sb1.log" 2>/dev/null | awk '{print $1}')"
+    _s4="$(awk -f "$ROOT/sb.awk" "$ROOT/sb4.log" 2>/dev/null | awk '{print $1}')"
+    if [ "${_s1:-0}" -ge 1 ]; then
+      rec ok "con SCHED_BENCH_LOAD_N=1 la muestra se cuenta (contadas=$_s1)"
+    else
+      rec fail "con 1 hilo la medición se descarta (contadas=${_s1:-0}); la regla /^1 hilo/ se come '1 hilos'"
+    fi
+    if [ "${_s4:-0}" -ge 1 ]; then
+      rec ok "con 4 hilos la muestra se cuenta (contadas=$_s4)"
+    else
+      rec fail "con 4 hilos la medición se descarta (contadas=${_s4:-0})"
+    fi
+    unset _s1 _s4
+  else
+    rec ok "no se pudo extraer el awk de sched-bench.sh: el parser no se comprobó"
+  fi
+fi
+
+printf '%s\n' "== pgo-collect.sh: --help y los argumentos no pasan por sudo =="
+# El `exec sudo` estaba ANTES de parsear: `pgo-collect.sh --help` pedía
+# contraseña para imprimir un texto, y CIZEN_PGO_DURATION/VMLINUX/OUT exportadas
+# por el usuario se perdían con el env_reset de sudo (sin env_keep), de modo que
+# un perfil de 60 s se compilaba con 600 s en silencio.
+PGOC="$(dirname "$MOTOR")/pgo-collect.sh"
+if [ -r "$PGOC" ]; then
+  mkdir -p "$ROOT/fakesudo"
+  printf '#!/bin/sh\necho "PIDIENDO-SUDO-INESPERADO" >&2\nexit 77\n' > "$ROOT/fakesudo/sudo"
+  chmod +x "$ROOT/fakesudo/sudo"
+  _hp="$(PATH="$ROOT/fakesudo:$PATH" bash "$PGOC" --help 2>&1 || true)"
+  case "$_hp" in
+    *PIDIENDO-SUDO-INESPERADO*) rec fail "pgo-collect.sh --help sigue pidiendo sudo" ;;
+    *pgo-collect.sh*) rec ok "pgo-collect.sh --help responde sin elevar" ;;
+    *) rec ok "pgo-collect.sh --help no imprime su ayuda (no se elevó, pero tampoco se ve)" ;;
+  esac
+  _bp="$(PATH="$ROOT/fakesudo:$PATH" bash "$PGOC" --bogus 2>&1 || true)"
+  case "$_bp" in
+    *"Argumento desconocido"*) rec ok "un argumento desconocido se rechaza sin pedir sudo" ;;
+    *PIDIENDO-SUDO-INESPERADO*) rec fail "un argumento desconocido pide sudo antes de comprobarlo" ;;
+    *) rec ok "argumento desconocido: sin mensaje reconocible" ;;
+  esac
+  if [ "$(grep -n 'exec "\${SUDO\[@\]}"' "$PGOC" | cut -d: -f1)" \
+       -gt "$(grep -n 'while \[ \$# -gt 0 \]' "$PGOC" | head -1 | cut -d: -f1)" ]; then
+    rec ok "pgo-collect.sh parsea los argumentos antes de elevar"
+  else
+    rec fail "pgo-collect.sh eleva antes de parsear (--help y env perdidos)"
+  fi
+  if grep -q 'CIZEN_PGO_DURATION="\$DURATION"' "$PGOC"; then
+    rec ok "pgo-collect.sh pasa el entorno de PGO al proceso elevado"
+  else
+    rec fail "pgo-collect.sh no propaga CIZEN_PGO_* a través de sudo"
+  fi
+  unset _hp _bp
+fi
+
+printf '%s\n' "== menú: el gestor de kernels se resuelve como el rollback =="
+if [ -r "$MENU" ]; then
+  if grep -q 'CIZEN_KMANAGER_SCRIPT' "$MENU" && grep -q 'if \[ -x "\$MANAGER_SCRIPT" \]' "$MENU"; then
+    rec ok "la opción 17 resuelve el gestor (env + hermano + instalación) y avisa si falta"
+  else
+    rec fail "la opción 17 sigue con la ruta fija de /usr/local/bin (sin env ni hermano)"
+  fi
+fi
+
 # --- resumen ---
 echo
 printf 'Totales: %d ok, %d fail\n' "$PASS" "$FAIL"

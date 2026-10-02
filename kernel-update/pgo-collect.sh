@@ -59,20 +59,15 @@ fatal(){ err "$*"; exit 1; }
 
 # Privilegios: `perf record -a` necesita root (o perf_event_paranoid bajo).
 # Si el usuario lanza el script sin sudo, se re-ejecuta con sudo.
-SUDO=()
-if [ "$(id -u)" != 0 ]; then
-  if command -v sudo >/dev/null 2>&1; then
-    SUDO=(sudo)
-    log "Elevando a root: ${SUDO[*]} $0 $*"
-    exec "${SUDO[@]}" "$0" "$@"
-  else
-    fatal "Se necesita root: ejecuta  sudo $0 $*  (perf record -a exige privilegios)."
-  fi
-fi
-
 DURATION="${CIZEN_PGO_DURATION:-600}"
 VMLINUX="${CIZEN_PGO_VMLINUX:-}"
 OUT="${CIZEN_PGO_OUT:-}"
+# v27.33.3: el parseo de argumentos se hace ANTES de elevar. Con el `exec sudo`
+# delante, `pgo-collect.sh --help` pedía contraseña para imprimir un texto, y un
+# argumento desconocido hacía lo mismo. Además las variables de entorno del
+# usuario se perdían al re-ejecutar con sudo (env_reset de Arch sin env_keep): un
+# CIZEN_PGO_DURATION=60 exportado se convertía en el 600 s por defecto en
+# silencio. Ahora se leen aquí y se pasan explícitamente al proceso elevado.
 while [ $# -gt 0 ]; do
   case "$1" in
     --duration) DURATION="${2:-}"; [ -n "$DURATION" ] || fatal "--duration requiere segundos"; shift 2 ;;
@@ -84,6 +79,18 @@ while [ $# -gt 0 ]; do
     *) fatal "Argumento desconocido: $1 (usa --help)" ;;
   esac
 done
+
+SUDO=()
+if [ "$(id -u)" != 0 ]; then
+  if command -v sudo >/dev/null 2>&1; then
+    SUDO=(sudo)
+    log "Elevando a root: ${SUDO[*]} $0 $*"
+    exec "${SUDO[@]}" CIZEN_PGO_DURATION="$DURATION" CIZEN_PGO_VMLINUX="$VMLINUX" \
+         CIZEN_PGO_OUT="$OUT" "$0" "$@"
+  else
+    fatal "Se necesita root: ejecuta  sudo $0 $*  (perf record -a exige privilegios)."
+  fi
+fi
 
 command -v perf >/dev/null 2>&1 || fatal "No está 'perf' (sudo pacman -S perf) — herramienta de muestreo."
 

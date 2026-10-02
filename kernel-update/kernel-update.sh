@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.33.2 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.33.3 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / XFS / systemd / KVM-libvirt / QEMU-OVMF
 #
@@ -170,7 +170,7 @@ export LC_ALL=C
 #     deje de describir un estado que el power-profiles-daemon sobrescribe y el
 #     fallback sin PPD no degrade a EPP 255.
 # No se toca el motor: la cmdline se hereda, no se genera.
-SCRIPT_VERSION="27.33.2"
+SCRIPT_VERSION="27.33.3"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -2037,6 +2037,7 @@ apply_config_fragments() {
 
   local -a __frags=() __args=()
   local f line k v parsed got=0
+  local -i __ndir=0
   shopt -s nullglob
   while IFS= read -r -d '' f; do __frags+=("$f"); done \
     < <(find "$CIZEN_FRAGS_DIR" -maxdepth 1 -type f -name '*.frag' -print0 2>/dev/null || true)
@@ -2073,9 +2074,25 @@ apply_config_fragments() {
     done < <(process_frag_file "$f")
 
     [ "${#__args[@]}" -gt 0 ] || continue
+    # v27.33.3: las directivas se cuentan en el bucle, no como ${#__args[@]}/2.
+    # --enable/--module/--disable gastan 2 tokens, pero --set-val y --set-str
+    # gastan 3 (bandera, símbolo y valor), así que el recuento mentía con los
+    # frags que llevan valores: tres directivas (1 enable + 2 set-str) se
+    # anunciaban como "4 directivas". Era la única señal de que el frag se leyó
+    # entero. Ojo al shift: 2 en el set-* dejaba el valor suelto y lo contaba
+    # como una directiva más (6 donde debía decir 3).
+    __ndir=0
+    set -- "${__args[@]}"   # la función no recibe argumentos: los gasta como lista
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --set-val|--set-str) shift 3 ;;
+        *) shift 2 ;;
+      esac
+      __ndir=$((__ndir + 1))
+    done
     if ( cd "$SRC" && scripts/config "${__args[@]}" ) >/dev/null 2>&1; then
       got=$((got + 1))
-      info "Frag aplicado: ${f##*/} ($(( ${#__args[@]} / 2 )) directivas)"
+      info "Frag aplicado: ${f##*/} ($__ndir directivas)"
     else
       warn "El frag ${f##*/} no se pudo aplicar; build continúa sin él."
     fi
@@ -3822,7 +3839,19 @@ extract_tarball() {
   log "Extrayendo fuentes en $(dirname "$SRC") ..."
   rm -f "$TMPFS_ROOT/.cizen-extracting-$VERSION" 2>/dev/null || true
   : > "$TMPFS_ROOT/.cizen-extracting-$VERSION"
-  tar -xf "$TARBALL" -C "$(dirname "$SRC")"
+  # v27.33.3: el rc de `tar` se comprueba. extract_tarball se invoca como
+  # `extract_tarball || fatal`, y eso DESACTIVA errexit en todo su cuerpo, así
+  # que un tarball corrupto o un ENOSPC a mitad (el tmpfs es justo donde cabe
+  # justo) se comían el fallo en silencio. Peor: el resto de la función solo
+  # mira que exista $SRC/Makefile, así que un árbol TRUNCADO pasaba por bueno,
+  # se escribía el testigo de "árbol limpio" y se compilaba un kernel fuente
+  # incompleto sin un solo aviso.
+  if ! tar -xf "$TARBALL" -C "$(dirname "$SRC")"; then
+    err "Falló la extracción de $TARBALL (árbol a medias o disco lleno); se descarta."
+    rm -rf "$SRC"
+    rm -f "$TMPFS_ROOT/.cizen-extracting-$VERSION" 2>/dev/null || true
+    return 1
+  fi
 
   # El tarball de kernel.org extrae linux-X.Y.Z (== basename de $SRC); el del
   # fork CachyOS/linux extrae cachyos-X.Y.Z-N. Si el árbol esperado no quedó
@@ -6469,9 +6498,23 @@ apply_patch_plugin() {
     warn "Parche '$name' desconocido o sin descriptor en el motor; se omite."
     return 1
   fi
-  # Cada descriptor decide PATCH_TREE_REQUIRED; se parte de vacío para que el
-  # valor de un parche anterior (variable global) no se filtre.
-  unset PATCH_TREE_REQUIRED PATCH_SKIP_REASON
+  # Cada descriptor decide su propio estado; se parte de vacío para que el valor
+  # de un parche anterior (variables globales) no se filtre al siguiente.
+  #
+  # v27.33.3: faltaban tres. patch_desc_bore NO declara PATCH_CHOICE_DISABLE,
+  # PATCH_RETIRED_SYMBOLS ni PATCH_EMBED_B64 (no los necesita: BORE no activa
+  # SCHED_ALT y no lleva parche embebido), así que con dos schedulers en el mismo
+  # run —`--sched pds --bore`, o CIZEN_PATCHES="pds,bore"— el descriptor de BORE
+  # heredaba los del primero y apply_patch_register acumulaba:
+  #   - PATCH_RETIRED_ALL=(PSI PSI_DEFAULT_DISABLED SCHED_AUTOGROUP ...), y
+  #     build_effective_arrays borra de EFF_CRITICAL/EFF_SETVAL justamente esos,
+  #     o sea que en un build BORE desaparecían en silencio las exigencias del
+  #     perfil para SCHED_AUTOGROUP (CRITICAL) y PSI/PSI_DEFAULT_DISABLED (SETVAL);
+  #   - PATCH_CHOICE_DISABLE=(SCHED_BMQ), que se marcaba como rebelde esperado;
+  #   - PATCH_EMBED_B64 con el blob base64 del parche PRJC, que se intentaba
+  #     decodificar como si fuera el parche de BORE.
+  unset PATCH_TREE_REQUIRED PATCH_SKIP_REASON PATCH_CHOICE_DISABLE \
+        PATCH_RETIRED_SYMBOLS PATCH_EMBED_B64
 "patch_desc_$name"
 
   # Un descriptor puede decidir que el parche NO aplica a esta versión (p. ej.
@@ -10574,6 +10617,25 @@ T_DL="$(date +%s)"
 # antes de elegir la config base porque introducen símbolos Kconfig nuevos que
 # deben existir para que olddefconfig/validación los vean.
 if [ "${#PATCH_NAMES[@]}" -gt 0 ]; then
+  # v27.33.3: dos schedulers alternativos no conviven (ambos tocan
+  # kernel/sched/fair.c y el segundo no aplica limpio sobre el primero). No es
+  # un error de sintaxis —CIZEN_PATCHES admite listas— así que no se aborta, pero
+  # se avisa: el segundo va a fallar al aplicarse y el build acabaría con el
+  # primero, que es como el motor informa del resto.
+  declare -A __sched_seen=()
+  for __ps in "${PATCH_NAMES[@]}"; do
+    case "$__ps" in
+      bore|pds|bmq|lfbmq|muqss)
+        if [ -n "${__sched_seen[$__ps]:-}" ]; then continue; fi
+        if [ "${#__sched_seen[@]}" -gt 0 ]; then
+          warn "Se han pedido varios schedulers alternativos (${!__sched_seen[*]} y $__ps):"
+          warn "  son excluyentes; se aplicarán en orden y el que no aplique limpio se pierde."
+        fi
+        __sched_seen["$__ps"]=1
+        ;;
+    esac
+  done
+  unset __sched_seen __ps
   for __patch in "${PATCH_NAMES[@]}"; do
     if apply_patch_plugin "$__patch"; then
       # Reconstruir arrays efectivos para que build_effective_arrays active los
@@ -11730,7 +11792,17 @@ install_kernel_package() {
   # conflicts=("linux-upstream"), la migración debe retirar el paquete legado
   # de forma separada antes de la primera transacción -U. Se hace aquí, y no
   # antes, para que toda la preparación/build/verificación ya haya terminado.
-  if pacman -Q "$LEGACY_PKGBASE" >/dev/null 2>&1; then
+  # v27.33.3: la prueba de "el paquete legado está instalado" usaba
+  # `pacman -Q`, que RESUELVE `provides`, mientras que la retirada usa
+  # `pacman -R`, que solo acepta NOMBRES de paquete. Como este motor declara
+  # `provides=("linux-upstream")` en su propio paquete (kernel-update.sh:7624),
+  # en cuanto el Cizen está instalado `pacman -Q linux-upstream` responde 0 con
+  # "linux-cizen-v3": la migración entraba en CADA build, `pacman -R` fallaba con
+  # "target not found", y el motor informaba de un "linux-upstream que ya no
+  # estaba instalado" más el error crudo de pacman por stderr. La prueba usa
+  # ahora el MISMO resolutor que la acción: `pacman -R --print` no toca nada y
+  # solo conoce nombres de paquete.
+  if pacman -R --print --print-format '%n' "$LEGACY_PKGBASE" >/dev/null 2>&1; then
     log "Migración de paquete: retirando $LEGACY_PKGBASE antes de instalar $CIZEN_PKGBASE ..."
     local remove_out
     if remove_out="$(sudo pacman -R --noconfirm "$LEGACY_PKGBASE" 2>&1)"; then
@@ -11807,7 +11879,7 @@ module_sign_installed() {
   [ "$CIZEN_MODULE_SIGN" = "yes" ] || return 0
   command -v openssl >/dev/null 2>&1 || { warn "module-sign: falta openssl; se omite la firma."; return 0; }
   [ -x "$SRC/scripts/sign-file" ] || { warn "module-sign: no hay scripts/sign-file en $SRC; se omite."; return 0; }
-  local rel key crt der n f
+  local rel key crt der n ncomp f
   rel="$(kernel_release)"
   key="$CIZEN_MODULE_SIGN_DIR/kernel-signing.key"
   crt="$CIZEN_MODULE_SIGN_DIR/kernel-signing.crt"
@@ -11819,18 +11891,77 @@ module_sign_installed() {
         -subj "/CN=Cizen kernel module signing" >/dev/null 2>&1 \
       || { warn "module-sign: falló generar las claves; se omite la firma."; return 0; }
     sudo openssl x509 -inform PEM -outform DER -in "$crt" -out "$der" 2>/dev/null || true
-    if [ "$SECURE_BOOT" = true ] && command -v mokutil >/dev/null 2>&1; then
+    # secure_boot_active, no $SECURE_BOOT: esa variable no existe en ninguna
+    # parte del motor (grep: una sola aparición, esta) y con `set -u` leerla
+    # tumbaba la ejecución — justo al final, con la compilación ya hecha, la
+    # instalación hecha y el módulo sin firmar.
+    if secure_boot_active && command -v mokutil >/dev/null 2>&1; then
       warn "module-sign: enrolla la MOK en el firmware (y reinicia) con:"
       warn "  sudo mokutil --import $der"
     fi
   fi
-  n=0
+n=0
+  ncomp=0
   while IFS= read -r f; do
     [ -f "$f" ] || continue
-    sudo "$SRC/scripts/sign-file" sha256 "$key" "$crt" "$f" >/dev/null 2>&1 && n=$((n + 1))
-  done < <(find "/usr/lib/modules/$rel" -type f -name '*.ko' 2>/dev/null || true)
-  ok "module-sign: $n módulos firmados en /usr/lib/modules/$rel (MOK: $CIZEN_MODULE_SIGN_DIR)."
+    _sign_installed_module "$f" "$key" "$crt" "$SRC/scripts/sign-file" \
+      && n=$((n + 1)) || ncomp=$((ncomp + 1))
+  done < <(find "/usr/lib/modules/$rel" -type f \
+             \( -name '*.ko' -o -name '*.ko.*' \) 2>/dev/null | sort || true)
+  if [ "$n" -gt 0 ]; then
+    ok "module-sign: $n módulos firmados en /usr/lib/modules/$rel (MOK: $CIZEN_MODULE_SIGN_DIR)."
+  else
+    warn "module-sign: NINGÚN módulo firmado en /usr/lib/modules/$rel (segvistos: $ncomp)."
+  fi
+  if [ "$ncomp" -gt 0 ]; then
+    warn "module-sign: $ncomp módulo(s) sin firmar. Con MODULE_COMPRESS_ALL eso ya no es"
+    warn "  lo normal (ahora se descomprime, firma y recomprime): revisa que estén"
+    warn "  instalados zstd/gzip/xz/lz4 y que el módulo se descomprima bien."
+  fi
   return 0
+}
+
+# Firma UN módulo ya instalado en /usr/lib/modules. $1=módulo $2=clave $3=crt
+# $4=sign-file. Devuelve 0 si ha quedado firmado.
+#
+# sign-file pega la firma al FINAL del ELF, así que un módulo comprimido hay que
+# descomprimirlo, firmarlo y volver a comprimirlo. El perfil de este equipo lleva
+# CONFIG_MODULE_COMPRESS_ZSTD=y y CONFIG_MODULE_COMPRESS_ALL=y: en el árbol
+# instalado no hay ni un solo .ko pelado, de modo que el bucle anterior (find
+# -name '*.ko') no encontraba nada y aun así informaba "ok: 0 módulos firmados".
+_sign_installed_module() {
+  local m="$1" key="$2" crt="$3" sf="$4" tmp dec="" omode
+  case "$m" in
+    *.ko) sudo "$sf" sha256 "$key" "$crt" "$m" >/dev/null 2>&1; return $? ;;
+    *.ko.zst) dec=zstd ;;
+    *.ko.gz)  dec=gzip ;;
+    *.ko.xz)  dec=xz ;;
+    *.ko.lz4) dec=lz4 ;;
+    *) return 1 ;;
+  esac
+  command -v "$dec" >/dev/null 2>&1 || return 1
+  tmp="$(mktemp /tmp/cizen-modsign.XXXXXX)" || return 1
+  omode="$(stat -c '%a' -- "$m" 2>/dev/null || printf '644')"
+  # Todos los pasos van con sudo: hay que LEER la clave privada (root) y
+  # ESCRIBIR en /usr/lib/modules (root).
+  sudo "$dec" -dc -- "$m" > "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+  if ! sudo "$sf" sha256 "$key" "$crt" "$tmp" >/dev/null 2>&1; then
+    rm -f -- "$tmp"; return 1
+  fi
+  # Se recomprime a un temporal y solo se mueve encima del original si el
+  # compresor sale bien: un fallo a mitad deja el módulo como estaba.
+  if sudo "$dec" -q -c "$tmp" > "$tmp.comp" 2>/dev/null \
+     && sudo mv -f -- "$tmp.comp" "$m" 2>/dev/null; then
+    # El mv viene de /tmp, así que arrastra el propietario y el modo del
+    # temporal (usuario, 600). Un módulo que no es de root ni lo puede leer el
+    # resto no es aceptable en /usr/lib/modules: depmod lo impugna y el arranque
+    # se apoya en ese permiso. Se restauran la propiedad y el modo originales.
+    sudo chown 0:0 -- "$m" 2>/dev/null || true
+    sudo chmod "$omode" -- "$m" 2>/dev/null || true
+    rm -f -- "$tmp"; return 0
+  fi
+  rm -f -- "$tmp" "$tmp.comp" 2>/dev/null
+  return 1
 }
 
 # v27.31.52: bloque rescatado de la copia INSTALADA (/usr/local/bin), que iba

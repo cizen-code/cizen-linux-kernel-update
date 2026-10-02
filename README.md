@@ -233,7 +233,7 @@ vuelve al comportamiento anterior (solo archive de ficheros).
 | frag-dir | `kernel-update.sh --frag-dir /dir` | Frags de config `.frag` (con `#include`) aplicados tras el perfil |
 | modprobed-db | `kernel-update.sh --modprobed-db` | Alimenta el build `--lite` desde la bbdd de modprobed-db (auto-descubierta) |
 | pkg-backend | `kernel-update.sh --pkg-backend deb` | Empaquetado: `arch` (pacman-pkg, default), `deb`, `rpm`, `generic`/`gentoo` (modules_install + vmlinuz directo) |
-| module-sign | `kernel-update.sh --module-sign` | Firma persistente de módulos con MOK propia (`sign-file`, claves en `/etc/cizen/kernel-sign/`) |
+| module-sign | `kernel-update.sh --module-sign` | Firma persistente de módulos con MOK propia (`sign-file`, claves en `/etc/cizen/kernel-sign/`). Desde v27.33.3 firma también los **comprimidos** (`.ko.zst`, `.ko.gz`, `.ko.xz`, `.ko.lz4`): descomprime, firma, recomprime y solo sustituye el original si el compresor sale bien, así que un módulo que no se puede descomprimir se queda intacto |
 | uki-backup | `kernel-update.sh --uki-backup` | Respalda el UKI previo antes de sobrescribirlo (`CIZEN_UKI_BACKUP_DIR`) |
 | luks-audit | `kernel-update.sh --luks-audit` | Avisa si la raíz LUKS no tiene parámetros de desbloqueo en el cmdline antes de regenerar el UKI |
 | manager | `kernel-update-manager.sh list` | Gestor de kernels instalados: `list`, `info`, `flip`, `backup`, `remove`, `guide` |

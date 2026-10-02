@@ -1,3 +1,78 @@
+## [27.33.3] - 2026-10-01
+
+**Auditoría del 1-oct: siete defectos, siete redes.** Todos comparten la misma
+forma —el motor corre con `set -Eeuo pipefail` y hay sitios donde eso convierte un
+detalle en un fallo de build o en un silencio— y todos verificados contra el
+código, no contra la lectura.
+
+- **Fuga de estado entre parches (`--sched pds --bore`).** `apply_patch_plugin`
+  reseteaba el estado del descriptor antes de cada parche, pero se le escaparon
+  tres variables: `PATCH_CHOICE_DISABLE`, `PATCH_RETIRED_SYMBOLS` y
+  `PATCH_EMBED_B64`. `patch_desc_bore` no las declara (no las necesita: BORE no
+  activa SCHED_ALT ni lleva parche embebido), así que en un run con dos
+  schedulers heredaba las del primero. Lo que se acumulaba: un
+  `--disable SCHED_PDS` que nadie pidió, los cinco símbolos de BMQ duplicados en
+  `PATCH_RETIRED_ALL` (y `build_effective_arrays` borra de `EFF_CRITICAL` /
+  `EFF_SETVAL` justo los que están en esa lista), y **el parche BMQ embebido
+  usado como fallback del parche BORE**: si el de red fallaba, se aplicaba el de
+  otro scheduler y el build continuaba creyendo que llevaba BORE.
+- **`SECURE_BOOT: variable sin asignar`, al final de un build entero.** La
+  condición de `module_sign_installed` leía `$SECURE_BOOT`, que no existe en
+  ningún punto del motor. Con `set -u` el build moría —compilación hecha,
+  paquete instalado, módulos sin firmar— y solo en la primera ejecución: para la
+  segunda el certificado ya existía y la línea no se alcanzaba. De ahí que
+  pareciera intermitente. Ahora decide por `secure_boot_active`.
+- **Módulos comprimidos sin firmar.** El perfil de esta máquina lleva
+  `CONFIG_MODULE_COMPRESS_ZSTD=y` y `CONFIG_MODULE_COMPRESS_ALL=y`, así que el
+  árbol instalado no tiene ni un `.ko` pelado; la búsqueda era solo
+  `-name '*.ko'`, no encontraba nada y aun así informaba `ok: 0 módulos
+  firmados`. Nuevo `_sign_installed_module`: descomprime (zstd/gzip/xz/lz4),
+  firma, recomprime y mueve encima del original solo si el compresor sale bien;
+  un módulo corrupto se queda como estaba. Como el temporal vive en `/tmp`, el
+  `mv` arrastraba su propietario y su modo, así que se restauran `root:root` y
+  el modo original: un módulo de usuario con modo 600 en `/usr/lib/modules` no
+  es aceptable. Y `0 firmados` es aviso, no éxito.
+- **Un árbol de fuentes truncado pasaba por bueno.** `extract_tarball` se invoca
+  como `extract_tarball || fatal`, y eso desactiva `errexit` en todo su cuerpo:
+  un `tar` a medias se comía el fallo y, como el resto de la función solo mira
+  que exista `$SRC/Makefile`, se compilaba un kernel incompleto sin un aviso.
+- **La migración de `linux-upstream` se ejecutaba en cada build.** La prueba
+  usaba `pacman -Q`, que resuelve `provides` —y el propio motor declara
+  `provides=("linux-upstream")` en su paquete—, así que respondía 0 siempre, con
+  `linux-cizen-v3` en la salida; la retirada, que solo acepta nombres, fallaba
+  con `target not found` y se reportaba como «ya no estaba instalado» más el
+  error crudo. Ahora la prueba usa `pacman -R --print`, el mismo resolutor que
+  la retirada, y no toca nada.
+- **La poda abortaba con `bad array subscript`.** Un módulo conservado sin
+  `depends=` daba un elemento vacío que se usaba como subíndice. El motor
+  inyecta el script con `|| true`, así que la consecuencia era un paquete
+  instalado **sin poda y sin índices de dependencias**, sin ningún aviso. Además
+  `/etc/modules-load.d` admite `kvm_intel   # para KVM`: se quitaba el
+  comentario pero no los espacios, y la clave del allowlist no casaba.
+  `podar-modulos.sh` pasa a v1.1.2.
+- **El histórico del banco de schedulers se llenaba de «desc».** Con
+  `SCHED_BENCH_LOAD_N=1`, la regla `/^1 hilo/` (sin ancla al final) también
+  casaba con la línea del brazo paralelo `1 hilos : ...`: se la comía,
+  `par` nunca se fijaba y `flush()` descartaba todas las muestras. Reglas
+  ancladas: `/^1 hilo[ ]/`, `/^4 hilos[ ]/`.
+- **`pgo-collect.sh` pedía contraseña para `--help`.** El `exec sudo` estaba
+  antes de parsear los argumentos, y `CIZEN_PGO_DURATION` / `_VMLINUX` / `_OUT`
+  se perdían con el `env_reset` de sudo (sin `env_keep`): un perfil de 60 s se
+  compilaba con 600 s en silencio. Ahora parsea primero y pasa el entorno de
+  forma explícita.
+- **El menú llegaba a una ruta fija inexistente.** La opción 17 (gestor de
+  kernels) ya resuelve el script como hace el rollback: `CIZEN_KMANAGER_SCRIPT`,
+  hermano por directorio y ruta instalada, con diagnóstico si no lo encuentra.
+- **Un test cazó un fallo en su propia corrección.** El recuento de directivas de
+  un `.frag` dividía tokens entre dos (`--set-str` gasta tres) y anunciaba «4
+  directivas» donde eran 3; el primer arreglo usaba `shift 2`, que dejaba el
+  valor suelto y lo contaba como una directiva más (6 donde debían ser 3). Es
+  `shift 3`, y está cubierto.
+- **Tests.** 33 nuevos, con montajes sintéticos donde hace falta (árbol de
+  módulos con `depmod`, log del banco de schedulers, stubs de root y de
+  `sign-file`). 567 ok / 0 fail; contra la v27.33.2 fallan 29, uno por cada
+  defecto y por sus variantes.
+
 ## [27.33.2] - 2026-10-01
 
 **«El kernel es anterior al perfil» se contaba dos veces.** Consecuencia directa
