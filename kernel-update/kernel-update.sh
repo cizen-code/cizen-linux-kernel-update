@@ -170,7 +170,7 @@ export LC_ALL=C
 #     deje de describir un estado que el power-profiles-daemon sobrescribe y el
 #     fallback sin PPD no degrade a EPP 255.
 # No se toca el motor: la cmdline se hereda, no se genera.
-SCRIPT_VERSION="27.33.3"
+SCRIPT_VERSION="27.33.4"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -11985,33 +11985,69 @@ _sign_installed_module() {
 VMLINUX_STORE="${CIZEN_VMLINUX_STORE:-/var/cache/cizen-kernel/vmlinux}"
 VMLINUX_STORE_KEEP="${CIZEN_VMLINUX_STORE_KEEP:-2}"
 
+# v27.33.4: escritura de un fichero en el store con lo que hay. El store vive
+# en /var/cache (raíz), así que hace falta sudo; lo que NO hace falta es que la
+# escritura dependa de un comando que la allowlist de sudo no cubra. Se probaba
+# `sudo cp` + `sudo mv` + `sudo sh -c`, y en este host (whose en
+# /etc/sudoers.d/99-cizen-build) `mv` y `sh` NO están en la lista: las tres
+# llamadas fallaban, el store quedaba vacío y el ciclo de PGO no se podía
+# cerrar. `install` sí está, así que se usa solo eso. Si el store se apunta a
+# una ruta escribible por el usuario (CIZEN_VMLINUX_STORE en $HOME...), ni
+# siquiera hace falta sudo.
+store_install() { # $1=origen $2=destino
+  local src="$1" dst="$2" d
+  d="$(dirname -- "$dst")"
+  if [ -d "$d" ] && [ -w "$d" ]; then
+    install -m644 -- "$src" "$dst" 2>/dev/null && return 0
+  fi
+  sudo install -m644 -- "$src" "$dst" 2>/dev/null
+}
+
 archive_vmlinux() {
   [ -f "$SRC/vmlinux" ] || [ -f "$SRC/vmlinux.unstripped" ] || {
     warn "PGO: el build no dejó vmlinux en el árbol; no se archiva (pgo-collect.sh no podrá colectar)."
     return 0
   }
-  local rel dst src f n=0
+  local rel dst src f mt n=0
   rel="$(kernel_release)"
   dst="$VMLINUX_STORE/$rel"
-  if ! sudo mkdir -p "$dst"; then
+  if ! { sudo mkdir -p "$dst" 2>/dev/null || mkdir -p "$dst" 2>/dev/null; }; then
     warn "PGO: no se pudo crear $dst; el vmlinux se perderá al desmontar el tmpfs."
     return 0
   fi
-  # Se escribe a .tmp y se renombra: si el build se interrumpe no queda un
-  # vmlinux truncado que pgo-collect.sh daría por bueno.
+  # `install` no es un rename, así que a primera vista se pierde la garantía de
+  # "nunca queda un vmlinux a medias". La garantía se mantiene, pero más abajo:
+  # el testigo .meta es lo que hace válido al vmlinux, y solo se escribe cuando
+  # la copia ha terminado bien. pgo-collect.sh exige ese testigo.
   for src in vmlinux vmlinux.unstripped; do
     [ -f "$SRC/$src" ] || continue
-    if sudo cp -f "$SRC/$src" "$dst/$src.tmp" 2>/dev/null \
-       && sudo mv -f "$dst/$src.tmp" "$dst/$src" 2>/dev/null; then
+    if store_install "$SRC/$src" "$dst/$src"; then
       n=$((n + 1))
     else
       warn "PGO: no se pudo archivar $src en $dst."
-      sudo rm -f "$dst/$src.tmp" 2>/dev/null || true
     fi
   done
   if [ "$n" -gt 0 ]; then
-    sudo sh -c 'printf "%s %s\n" "'"$rel"'" "$(date -Is)" > "'"$dst"'.meta"' 2>/dev/null || true
-    ok "PGO: vmlinux archivado en $dst (para  sudo pgo-collect.sh --duration 900)."
+    # Testigo de commit del store. Se escribe AL FINAL y con el tamaño real de
+    # lo archivado, para que pgo-collect.sh pueda descartar tanto un fichero a
+    # medias como uno que lesomeone cambió debajo.
+    mt="$(mktemp /tmp/cizen-vmlinux-meta.XXXXXX 2>/dev/null)" || mt=""
+    if [ -n "$mt" ]; then
+      {
+        printf 'release %s\n' "$rel"
+        printf 'date %s\n' "$(date -Is)"
+        for f in vmlinux vmlinux.unstripped; do
+          [ -f "$dst/$f" ] || continue
+          printf 'size %s %s\n' "$(stat -c %s -- "$dst/$f" 2>/dev/null || echo 0)" "$f"
+        done
+      } > "$mt" 2>/dev/null
+      if store_install "$mt" "$dst.meta"; then
+        ok "PGO: vmlinux archivado en $dst (para  sudo pgo-collect.sh --duration 900)."
+      else
+        warn "PGO: se archivó el vmlinux pero no su testigo $dst.meta; pgo-collect.sh lo ignorará."
+      fi
+      rm -f -- "$mt" 2>/dev/null || true
+    fi
   fi
   prune_vmlinux_store
   return 0

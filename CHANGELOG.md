@@ -1,3 +1,57 @@
+## [27.33.4] - 2026-10-02
+
+**El store de `vmlinux` nunca se escribía en este host, y el README lo prometía
+en contrário.** El ciclo de PGO es: compilar sin perfil → el motor archiva solo el
+`vmlinux` (el árbol vive en un tmpfs que se desmonta al final) → colectar →
+recompilar. El paso 2 fallaba en silencio y el flujo solo se cerraba si alguien
+archivaba el fichero a mano.
+
+- **`archive_vmlinux` usaba tres comandos sudo que esta máquina no tiene.** La
+  escritura era `sudo cp` a `.tmp` + `sudo mv` al final, y el testigo `.meta` con
+  `sudo sh -c 'printf ... > ...'`. En `/etc/sudoers.d/99-cizen-build` (allowlist
+  NOPASSWD de este host) están `mkdir`, `install`, `rm`, `cat`, `stat`… pero no
+  `mv` ni `sh`: las tres llamadas fallaban, el store quedaba vacío, y el propio
+  motor avisaba por log («no se pudo archivar») mientras el README prometía lo
+  contrario. Ahora escribe con `sudo install` (`store_install`), que sí está, y
+  usa `install` a secas cuando el destino es escribible por el usuario.
+- **La atomicidad no se pierde, cambia de sitio.** `install` no es un rename, así
+  que la garantía de «nunca queda un `vmlinux` a medias» la da ahora el testigo:
+  `$release.meta` se escribe DESPUÉS de copiar y con el tamaño real de lo
+  archivado, y `pgo-collect.sh` **exige** ese testigo y **comprueba el tamaño**
+  antes de usar un fichero del store. Sin él, el candidato se salta con aviso
+  (copia a medias, o build anterior a esta versión). Un `--vmlinux` explícito no
+  pasa por el filtro: ahí el usuario está señalando el fichero a mano.
+- **`CIZEN_VMLINUX_STORE` se perdía al elevar.** `pgo-collect.sh` se re-ejecuta
+  con `exec sudo`, y el `env_reset` de Arch (sin `env_keep`) borra las variables
+  del usuario: un store personalizado se transformaba en «no encuentro el
+  vmlinux» sin más explicación, siendo un fichero que el motor acababa de
+  archivar. Ahora viaja explícitamente al proceso elevado, igual que el resto del
+  entorno de PGO.
+- **Perfil de esta máquina, v5.18.0.** Poda de código que no se ejecuta nunca,
+  verificada contra el Kconfig de 7.2.8 con `olddefconfig` (no de memoria):
+  `HYPERVISOR_GUEST`, `KVM_GUEST` (esta máquina es anfitriona, no invitada),
+  `LIRC` (mando IR muerto desde 2017), `KSM` (=y pero `run=0`, nunca activado) y
+  `TCG_TIS`/`TCG_CRB` (TPM apagado en BIOS). Dos más resultaron IMPOSIBLES y
+  pasan a `EXPECTED_REBELS`: `DRM_TTM`, que `select` i915, y `KVM_COMPAT`,
+  `def_bool y` mientras KVM esté puesto. Se dejan fuera a propósito y con
+  criterio medido: `ZRAM` (red de seguridad del tmpfs de 10 GiB sobre 16 GiB de
+  RAM), `BT` (=m, nunca se carga, pero `bluetooth.service` está enabled y se
+  pondría roja al apagar `CONFIG_BT`), y las mitigaciones, que en 7.x son
+  parámetros de runtime y no de Kconfig. `COMPAT` tampoco se apaga: lo decidió el
+  usuario, y hay 77 paquetes `lib32-*` y prefijos `~/.wine`/`~/.mt5` con
+  ejecutables PE32 de 32 bits. El `.config` promovido baja de 2032 a 2011
+  símbolos activos y recoge además el arreglo del gobernador que v5.17.0 dejó
+  pendiente. Validado con `--check`: 308/308 desactivaciones resueltas, 0 avisos.
+- **Tests.** 9 nuevos (576 ok / 0 fail). El archivado se prueba de verdad, contra
+  un árbol falso: que copia `vmlinux` y `vmlinux.unstripped`, que escribe el
+  `.meta` con el tamaño real, y que con un store escribible **no pide sudo ni
+  una vez** (si lo pidiera, el fallo se vería en el log de `sudo` del montaje). Más
+  una regresión de alcance: si alguien vuelve a meter `sudo mv`/`sh`/`cp`/`rsync`
+  en el bloque del store, el test falla aunque el resto funcione. Y del lado del
+  consumidor, las dos funciones de búsqueda se extraen tal cual de
+  `pgo-collect.sh` y se comprueban los tres casos: sin `.meta` no se usa, con el
+  tamaño que no cuadra no se usa, con testigo y tamaño correcto sí.
+
 ## [27.33.3] - 2026-10-01
 
 **Auditoría del 1-oct: siete defectos, siete redes.** Todos comparten la misma

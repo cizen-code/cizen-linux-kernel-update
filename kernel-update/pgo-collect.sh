@@ -84,9 +84,14 @@ SUDO=()
 if [ "$(id -u)" != 0 ]; then
   if command -v sudo >/dev/null 2>&1; then
     SUDO=(sudo)
+    # v27.33.4: CIZEN_VMLINUX_STORE también se pasa de forma explícita. Con
+    # env_reset de Arch (sudo no lo conserva), un store personalizado se
+    # perdía al elevar y el proceso elevated buscaba en el /var/cache de
+    # siempre: el fallo era "no encuentro el vmlinux" sin explicación, siendo el
+    # fichero que el propio motor acababa de archivar.
     log "Elevando a root: ${SUDO[*]} $0 $*"
     exec "${SUDO[@]}" CIZEN_PGO_DURATION="$DURATION" CIZEN_PGO_VMLINUX="$VMLINUX" \
-         CIZEN_PGO_OUT="$OUT" "$0" "$@"
+         CIZEN_PGO_OUT="$OUT" CIZEN_VMLINUX_STORE="${CIZEN_VMLINUX_STORE:-}" "$0" "$@"
   else
     fatal "Se necesita root: ejecuta  sudo $0 $*  (perf record -a exige privilegios)."
   fi
@@ -100,12 +105,44 @@ KVER="$(uname -r)"
 # desmonta al terminar el pipeline, así que el vmlinux SOLO existe como copia
 # persistente en $VMLINUX_STORE; el enlace /lib/modules/<kver>/build no se crea).
 VMLINUX_STORE="${CIZEN_VMLINUX_STORE:-/var/cache/cizen-kernel/vmlinux}"
-if [ -z "$VMLINUX" ]; then
+
+# ¿Vale este vmlinux del store? Solo si va acompañado de su testigo "$KVER.meta",
+# que kernel-update.sh escribe DESPUÉS de copiar y con el tamaño real de lo
+# copiado. Sin testigo el fichero puede ser una copia a medias (install no es un
+# rename) y llvm-profgen produciría un perfil sin sentido o abortaría. Un
+# --vmlinux explícito NO pasa por aquí: ahí el usuario señala el fichero a mano.
+pgo_vmlinux_committed() { # $1 = ruta candidata; $KVER y VMLINUX_STORE de fuera
+  local cand="$1" meta="$VMLINUX_STORE/$KVER.meta" want have
+  [ -f "$meta" ] || {
+    warn "Ignorado $cand: sin su testigo $meta (copia a medias, o de un build anterior a v27.33.4)."
+    return 1
+  }
+  want="$(awk -v f="$(basename -- "$cand")" '$1=="size" && $3==f {print $2}' "$meta" 2>/dev/null | head -1)"
+  have="$(stat -c %s -- "$cand" 2>/dev/null)"
+  if [ -n "$want" ] && [ -n "$have" ] && [ "$want" != "$have" ]; then
+    warn "Ignorado $cand: el testigo dice $want bytes y el fichero tiene $have."
+    return 1
+  fi
+  return 0
+}
+
+# Deja el vmlinux encontrado en $VMLINUX (no imprime: con `set -e` y con warn()
+# escribiendo a stdout, una sustitución de comandos se comería los avisos).
+pgo_find_vmlinux() {
+  local cand
   for cand in "/lib/modules/$KVER/build/vmlinux" \
               "$VMLINUX_STORE/$KVER/vmlinux" \
               "$VMLINUX_STORE/$KVER/vmlinux.unstripped"; do
-    if [ -f "$cand" ]; then VMLINUX="$cand"; break; fi
+    case "$cand" in
+      "$VMLINUX_STORE"/*) pgo_vmlinux_committed "$cand" || continue ;;
+    esac
+    if [ -f "$cand" ]; then VMLINUX="$cand"; return 0; fi
   done
+  return 1
+}
+
+if [ -z "$VMLINUX" ]; then
+  pgo_find_vmlinux || true
 fi
 if [ -z "$VMLINUX" ]; then
   fatal "No encuentro el vmlinux de '$KVER'.

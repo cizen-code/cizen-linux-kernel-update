@@ -266,8 +266,12 @@ vuelve al comportamiento anterior (solo archive de ficheros).
   compilador (opción 18 del menú, o la pregunta que sale al confirmar un build).
   El ciclo es:
   1. Compila una vez **sin** PGO. Al terminar, el motor archiva solo su
-     `vmlinux` en `/var/cache/cizen-kernel/vmlinux/`, así que no hay que
-     pasárselo a mano a nadie.
+     `vmlinux` en `/var/cache/cizen-kernel/vmlinux/<kernelrelease>/`, así que no
+     hay que pasárselo a mano a nadie. Junto al directorio deja un testigo
+     `<kernelrelease>.meta` con el tamaño de lo archivado: `pgo-collect.sh` solo
+     usa un `vmlinux` del store si ese testigo existe y el tamaño cuadra, para no
+     colectar contra una copia a medias. Si aparece el aviso «sin su testigo»,
+     reconstruye una vez con v27.33.4 o posterior.
   2. Usa el sistema con carga representativa y recoge el perfil:
      `sudo kernel-update/pgo-collect.sh --duration 900` (captura `perf record
      -F 999 -a -g` y convierte con `llvm-profgen`; sale en

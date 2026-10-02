@@ -5791,6 +5791,122 @@ if [ -r "$MENU" ]; then
   fi
 fi
 
+# --- v27.33.4: el store de vmlinux se escribía con sudo cp + sudo mv + sudo sh -c
+# Este host tiene una allowlist en /etc/sudoers.d/99-cizen-build sin `mv` ni `sh`:
+# las tres llamadas fallaban, el store quedaba VACÍO y el ciclo de PGO no se
+# podía cerrar sin que alguien archivase el fichero a mano. Aquí se comprueba que
+# (a) el archivado funciona de verdad con un árbol falso, (b) solo se usan
+# comandos de la allowlist, y (c) pgo-collect.sh no se come un vmlinux a medias.
+ARCH="$ROOT/archive"
+rm -rf "$ARCH"; mkdir -p "$ARCH"
+: > "$ARCH/fns.sh"
+extract_fn store_install   >> "$ARCH/fns.sh"
+extract_fn archive_vmlinux >> "$ARCH/fns.sh"
+extract_fn prune_vmlinux_store >> "$ARCH/fns.sh"
+VMLINUX_STORE="$ARCH/store"; export VMLINUX_STORE
+VMLINUX_STORE_KEEP=2; export VMLINUX_STORE_KEEP
+cat > "$ARCH/run.sh" <<'ARCHRUN'
+set -uo pipefail
+SRC="${SRC:?}"; VMLINUX_STORE="${VMLINUX_STORE:?}"; VMLINUX_STORE_KEEP="${VMLINUX_STORE_KEEP:-2}"
+log(){ printf '  log: %s\n' "$*"; }
+ok(){ printf '  ok: %s\n' "$*"; }
+warn(){ printf '  warn: %s\n' "$*"; }
+info(){ printf '  info: %s\n' "$*"; }
+fatal(){ printf '  fatal: %s\n' "$*"; exit 1; }
+sudo(){ printf '  [sudo] %s\n' "$*" >&2; "$@"; }
+kernel_release(){ printf '%s\n' "${FAKE_REL:-7.2.8-cizen-v3-1}"; }
+# shellcheck disable=SC1090
+. "$FNS"
+archive_vmlinux
+ARCHRUN
+# (a) con un store escribible por el usuario: NO debe hacer falta sudo para nada
+mkdir -p "$ARCH/src"; printf 'ELF-vmlinux-falso\0\0\0' > "$ARCH/src/vmlinux"
+printf 'ELF-unstripped\n' > "$ARCH/src/vmlinux.unstripped"
+if ( FNS="$ARCH/fns.sh" SRC="$ARCH/src" FAKE_REL=7.2.8-test-1 VMLINUX_STORE="$ARCH/store" \
+        bash "$ARCH/run.sh" > "$ARCH/out1" 2> "$ARCH/err1" ); then
+  if cmp -s "$ARCH/src/vmlinux" "$ARCH/store/7.2.8-test-1/vmlinux" \
+     && cmp -s "$ARCH/src/vmlinux.unstripped" "$ARCH/store/7.2.8-test-1/vmlinux.unstripped" \
+     && [ -f "$ARCH/store/7.2.8-test-1.meta" ]; then
+    rec ok "store: el build archiva vmlinux y vmlinux.unstripped con su testigo .meta"
+  else
+    rec fail "store: el vmlinux o el .meta no quedaron donde tocaba"
+  fi
+  if [ ! -s "$ARCH/err1" ]; then
+    rec ok "store: con un store escribible no hace falta sudo ni una vez"
+  else
+    rec fail "store: pidió sudo aun pudiendo escribir sin él: $(tr '\n' ' ' < "$ARCH/err1")"
+  fi
+else
+  rec fail "store: archive_vmlinux no llegó al final (salida: $(tr '\n' ' ' < "$ARCH/out1" 2>/dev/null)$(tr '\n' ' ' < "$ARCH/err1" 2>/dev/null))"
+fi
+# el .meta tiene que llevar el tamaño real, que es lo que valida pgo-collect.sh
+mvsize="$(stat -c %s "$ARCH/store/7.2.8-test-1/vmlinux" 2>/dev/null)"
+if [ -n "$mvsize" ] && grep -qx "size $mvsize vmlinux" "$ARCH/store/7.2.8-test-1.meta" 2>/dev/null; then
+  rec ok "store: el testigo .meta anota el tamaño real del vmlinux"
+else
+  rec fail "store: el testigo .meta no anota el tamaño real del vmlinux"
+fi
+# (b) regresión: nadie vuelve a meter sudo mv / sudo sh / sudo cp en el store
+storeblk="$(sed -n '/^VMLINUX_STORE=/,/^}/p' "$MOTOR" | grep -vE '^[[:space:]]*#')"
+if printf '%s\n' "$storeblk" | grep -qE 'sudo[[:space:]]+(mv|sh|cp|rsync)\b'; then
+  rec fail "store: vuelve a usar un comando sudo fuera de la allowlist (mv/sh/cp/rsync)"
+elif printf '%s\n' "$storeblk" | grep -qE 'sudo[[:space:]]+install'; then
+  rec ok "store: la escritura va con 'sudo install', que sí está en la allowlist"
+else
+  rec fail "store: no se ve cómo se escribe el fichero en el store"
+fi
+# y que el store se lea igual de automático que se escribe
+if grep -q 'CIZEN_VMLINUX_STORE:-' "$PGO_" \
+   && grep -q 'pgo_vmlinux_committed' "$PGO_"; then
+  rec ok "pgo-collect: exige el testigo .meta antes de usar un vmlinux del store"
+else
+  rec fail "pgo-collect: usa el vmlinux del store sin comprobar su testigo .meta"
+fi
+# (c) un store a medias (sin .meta, o con tamaño que no cuadra) se rechaza.
+# Las dos funciones se prueban tal cual están en pgo-collect.sh, con stubs de
+# los log: no se reescriben aquí, que un test que copia el código no lo prueba.
+{
+  cat <<'FINDSTUB'
+set -uo pipefail
+KVER="${KVER:-}"; VMLINUX_STORE="${VMLINUX_STORE:-}"; VMLINUX=""
+log(){ :; }
+ok(){ :; }
+info(){ :; }
+warn(){ printf 'warn: %s\n' "$*"; }
+fatal(){ printf 'fatal: %s\n' "$*" >&2; exit 1; }
+FINDSTUB
+  sed -n '/^pgo_vmlinux_committed() {/,/^}/p' "$PGO_"
+  sed -n '/^pgo_find_vmlinux() {/,/^}/p' "$PGO_"
+  printf 'pgo_find_vmlinux || true\nprintf "VMLINUX=%%s\\n" "${VMLINUX:-<ninguno>}"\n'
+} > "$ARCH/find-real.sh"
+SD="$ARCH/sd"; rm -rf "$SD"; mkdir -p "$SD/7.2.8-k"
+printf 'vmlinux-bueno' > "$SD/7.2.8-k/vmlinux"
+find1="$(KVER=7.2.8-k VMLINUX_STORE="$SD" bash "$ARCH/find-real.sh" 2>&1)"
+if [ "$(printf '%s\n' "$find1" | grep '^VMLINUX=')" = "VMLINUX=<ninguno>" ]; then
+  rec ok "pgo-collect: sin testigo, el vmlinux del store NO se usa"
+else
+  rec fail "pgo-collect: usó un vmlinux sin testigo (salida: $find1)"
+fi
+{ printf 'release 7.2.8-k\ndate ahora\nsize 999999 vmlinux\n' > "$SD/7.2.8-k.meta"; }
+find2="$(KVER=7.2.8-k VMLINUX_STORE="$SD" bash "$ARCH/find-real.sh" 2>&1)"
+if [ "$(printf '%s\n' "$find2" | grep '^VMLINUX=')" = "VMLINUX=<ninguno>" ]; then
+  rec ok "pgo-collect: con el tamaño que no cuadra, el vmlinux del store NO se usa"
+else
+  rec fail "pgo-collect: aceptó un vmlinux con tamaño distinto del testigo (salida: $find2)"
+fi
+{ printf 'release 7.2.8-k\ndate ahora\nsize %s vmlinux\n' "$(stat -c %s "$SD/7.2.8-k/vmlinux")" > "$SD/7.2.8-k.meta"; }
+find3="$(KVER=7.2.8-k VMLINUX_STORE="$SD" bash "$ARCH/find-real.sh" 2>&1)"
+if [ "$(printf '%s\n' "$find3" | grep '^VMLINUX=')" = "VMLINUX=$SD/7.2.8-k/vmlinux" ]; then
+  rec ok "pgo-collect: con testigo y tamaño correcto, el vmlinux SÍ se usa"
+else
+  rec fail "pgo-collect: rechazó un vmlinux archivado bien (salida: $find3)"
+fi
+if grep -q 'CIZEN_VMLINUX_STORE="\${CIZEN_VMLINUX_STORE:-}" "\$0"' "$PGO_"; then
+  rec ok "pgo-collect: el store personalizado sobrevive a la elevación con sudo"
+else
+  rec fail "pgo-collect: al elevar con sudo se pierde CIZEN_VMLINUX_STORE (env_reset)"
+fi
+
 # --- resumen ---
 echo
 printf 'Totales: %d ok, %d fail\n' "$PASS" "$FAIL"
