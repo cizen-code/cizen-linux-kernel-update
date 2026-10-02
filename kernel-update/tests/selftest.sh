@@ -5846,12 +5846,32 @@ if [ -n "$mvsize" ] && grep -qx "size $mvsize vmlinux" "$ARCH/store/7.2.8-test-1
 else
   rec fail "store: el testigo .meta no anota el tamaño real del vmlinux"
 fi
-# (b) regresión: nadie vuelve a meter sudo mv / sudo sh / sudo cp en el store
-storeblk="$(sed -n '/^VMLINUX_STORE=/,/^}/p' "$MOTOR" | grep -vE '^[[:space:]]*#')"
-if printf '%s\n' "$storeblk" | grep -qE 'sudo[[:space:]]+(mv|sh|cp|rsync)\b'; then
-  rec fail "store: vuelve a usar un comando sudo fuera de la allowlist (mv/sh/cp/rsync)"
+# (b) regresión con el CONTRATO del motor, no con una lista de comandos escrita a
+# mano. El motor declara sus dependencias de sudo en SUDO_OPS_REQUERIAS /
+# _OPCIONALES, y preflight_sudo lo dice al build. El store no es una
+# funcionalidad opcional: sin su vmlinux el ciclo de PGO no existe, así que sus
+# comandos tienen que estar en las REQUERIDAS. Con el código viejo usaba
+# `sudo sh` —que no está en ninguna de las dos listas, o sea una dependencia sin
+# declarar— y `sudo mv`, que solo es opcional: por eso `preflight_sudo` no lo
+# avisaba y el store quedaba vacío en silencio.
+reqs="$(sed -n 's/^SUDO_OPS_REQUERIDOS=(\(.*\))/\1/p' "$MOTOR" | tr ' ' '\n' | sed '/^$/d')"
+# El rango va de VMLINUX_STORE= al final de prune_vmlinux_store: con un `/^}/`
+# que para en la primera llave se quedaba solo con store_install y daba una
+# cobertura aparente que no era real. Y de las líneas se descartan las llamadas
+# a los log, porque el texto de un `ok`/`warn` puede citar un comando sudo
+# (`para  sudo pgo-collect.sh …`) sin que nadie lo ejecute.
+storeblk="$(sed -n '/^VMLINUX_STORE=/,/^# Poda del store/p' "$MOTOR" \
+            | grep -vE '^[[:space:]]*(#|warn|ok|log|info|err|fatal) ')"
+storeops="$(printf '%s\n' "$storeblk" | grep -oE '\bsudo [a-z][a-z0-9-]*' | awk '{print $2}' | sort -u)"
+if [ -z "$storeops" ]; then
+  rec fail "store: no se ve cómo se escriben los ficheros (el rango de análisis no los encuentra)"
+elif printf '%s\n' "$storeops" | while read -r op; do
+        printf '%s\n' "$reqs" | grep -qx -- "$op" || { printf '%s' "$op"; break; }
+      done | grep -q .; then
+  rec fail "store: usa sudo fuera de SUDO_OPS_REQUERIDOS: $(printf '%s\n' "$storeops" \
+            | while read -r op; do printf '%s\n' "$reqs" | grep -qx -- "$op" || printf '%s ', "$op"; done)"
 elif printf '%s\n' "$storeblk" | grep -qE 'sudo[[:space:]]+install'; then
-  rec ok "store: la escritura va con 'sudo install', que sí está en la allowlist"
+  rec ok "store: sus comandos sudo ($(printf '%s' "$storeops" | tr '\n' ' ')) están todos en SUDO_OPS_REQUERIDOS"
 else
   rec fail "store: no se ve cómo se escribe el fichero en el store"
 fi

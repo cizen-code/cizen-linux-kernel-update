@@ -6,14 +6,21 @@ en contrário.** El ciclo de PGO es: compilar sin perfil → el motor archiva so
 recompilar. El paso 2 fallaba en silencio y el flujo solo se cerraba si alguien
 archivaba el fichero a mano.
 
-- **`archive_vmlinux` usaba tres comandos sudo que esta máquina no tiene.** La
-  escritura era `sudo cp` a `.tmp` + `sudo mv` al final, y el testigo `.meta` con
-  `sudo sh -c 'printf ... > ...'`. En `/etc/sudoers.d/99-cizen-build` (allowlist
-  NOPASSWD de este host) están `mkdir`, `install`, `rm`, `cat`, `stat`… pero no
-  `mv` ni `sh`: las tres llamadas fallaban, el store quedaba vacío, y el propio
-  motor avisaba por log («no se pudo archivar») mientras el README prometía lo
-  contrario. Ahora escribe con `sudo install` (`store_install`), que sí está, y
-  usa `install` a secas cuando el destino es escribible por el usuario.
+- **`archive_vmlinux` usaba tres comandos sudo que el propio motor no declara.**
+  La escritura era `sudo cp` a `.tmp` + `sudo mv` al final, y el testigo `.meta` con
+  `sudo sh -c 'printf ... > ...'`. El motor **declara** sus dependencias de sudo en
+  `SUDO_OPS_REQUERIDOS` / `_OPCIONALES` y `preflight_sudo` las dice al build, pero
+  el store usaba `sh`, que **no está en ninguna de las dos listas** (una
+  dependencia sin declarar), y `mv` y `cp`, que solo son *opcionales*: por eso
+  `preflight_sudo` no podía avisar de nada. En `/etc/sudoers.d/99-cizen-build` la
+  allowlist cubre `cp`, `mkdir`, `rm` e `install` pero no `mv` ni `sh`, así que el
+  `cp` dejaba el `.tmp`, el `mv` fallaba, y el store acababa sin `vmlinux` ni
+  testigo mientras el motor solo ponía un `warn` y el README prometía lo
+  contrario. Además la función se introdujo en v27.31.52, **después** del último
+  build de esta máquina, así que no la había ejecutado nadie aquí. Ahora escribe
+  con `sudo install` (`store_install`), y a secas si el destino es escribible por
+  el usuario: sus comandos quedan **dentro de `SUDO_OPS_REQUERIDOS`**, que es lo
+  que un store —sin el cual el ciclo de PGO no existe— debería poder exigir.
 - **La atomicidad no se pierde, cambia de sitio.** `install` no es un rename, así
   que la garantía de «nunca queda un `vmlinux` a medias» la da ahora el testigo:
   `$release.meta` se escribe DESPUÉS de copiar y con el tamaño real de lo
@@ -42,15 +49,18 @@ archivaba el fichero a mano.
   ejecutables PE32 de 32 bits. El `.config` promovido baja de 2032 a 2011
   símbolos activos y recoge además el arreglo del gobernador que v5.17.0 dejó
   pendiente. Validado con `--check`: 308/308 desactivaciones resueltas, 0 avisos.
-- **Tests.** 9 nuevos (576 ok / 0 fail). El archivado se prueba de verdad, contra
-  un árbol falso: que copia `vmlinux` y `vmlinux.unstripped`, que escribe el
-  `.meta` con el tamaño real, y que con un store escribible **no pide sudo ni
-  una vez** (si lo pidiera, el fallo se vería en el log de `sudo` del montaje). Más
-  una regresión de alcance: si alguien vuelve a meter `sudo mv`/`sh`/`cp`/`rsync`
-  en el bloque del store, el test falla aunque el resto funcione. Y del lado del
-  consumidor, las dos funciones de búsqueda se extraen tal cual de
-  `pgo-collect.sh` y se comprueban los tres casos: sin `.meta` no se usa, con el
-  tamaño que no cuadra no se usa, con testigo y tamaño correcto sí.
+- **Tests.** 9 nuevos (576 ok / 0 fail), y 6 fail contra el commit anterior
+  (cada red muerde al código viejo). El archivado se prueba de verdad, contra un
+  árbol falso: que copia `vmlinux` y `vmlinux.unstripped`, que escribe el `.meta`
+  con el tamaño real, y que con un store escribible **no pide sudo ni una vez** (si
+  lo pidiera, el fallo se vería en el log de `sudo` del montaje). La regresión de
+  alcance no es una lista de comandos escrita a mano, sino el **contrato del
+  motor**: se extrae `SUDO_OPS_REQUERIDOS` y se comprueba que el store no use
+  ningún `sudo` fuera de ahí, así que reintroducir `sudo mv` o `sudo sh` falla
+  aunque el store funcione. Y del lado del consumidor, las dos funciones de
+  búsqueda se extraen tal cual de `pgo-collect.sh` y se comprueban los tres casos:
+  sin `.meta` no se usa, con el tamaño que no cuadra no se usa, con testigo y
+  tamaño correcto sí.
 
 ## [27.33.3] - 2026-10-01
 
