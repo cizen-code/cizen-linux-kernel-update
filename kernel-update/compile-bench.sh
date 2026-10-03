@@ -117,6 +117,14 @@ export CCACHE_DISABLE=1
 # no debe dejar pasar. A 2 % solo entra una máquina de verdad quieta, que es lo
 # que se necesita para que la cifra signifique algo.
 PSI_MAX="${COMPILE_BENCH_PSI_MAX:-2}"
+
+# Hash de la cmdline en marcha. El banco no guarda la cmdline y el fichero de
+# estado se llama por uname -r, así que al reiniciar en el MISMO build el bloque
+# nuevo cae junto al viejo y no hay forma de saber si se midieron con la misma
+# cmdline. Con esto queda escrito en cada bloque y el resumen avisa si una
+# variante mezcla varias. Solo 8 hex: no es identidad, es "¿cambió?".
+CMDLINE_H="$( (sha256sum </proc/cmdline || cksum </proc/cmdline) 2>/dev/null | cut -c1-8 )"
+CMDLINE_H="${CMDLINE_H:-desconocido}"
 FORCE="${COMPILE_BENCH_FORCE:-0}"
 PSI=""; LOAD1=""
 
@@ -176,30 +184,35 @@ resumen_datos() {
     # promedio de una medición buena y una contaminada es peor que no medir.
     function flush(   lo, hi, i) {
       if (un >= 0 && par >= 0) {
-        if (fiable) { n++; U[n] = un; P[n] = par; PSI[n] = psi }
+        if (fiable) { n++; U[n] = un; P[n] = par; PSI[n] = psi; HASH[n] = h }
         else d++
       } else if (un >= 0 || par >= 0) d++
-      un = -1; par = -1; psi = -1; fiable = 1
+      un = -1; par = -1; psi = -1; fiable = 1; h = ""
     }
     /^fecha/ { flush(); next }
     # El PSI de salida va DESPUÉS del "->". "% -> 0.08" son 9 caracteres y el
     # número empieza en el 6º (índice 5), no en el 4º: con +3 salía "> 0.0", que
     # awkava a 0, y la columna de PSIneath todos los bloques a cero sin quejarse.
     /^psi cpu/ { if (match($0, /% -> [0-9.]+/)) { s = substr($0, RSTART + 5, RLENGTH - 5); psi = s + 0 } ; next }
+    /^cmdline/ { gsub(/[^0-9a-z]/, "", $3); h = ($3 == "" ? "?" : $3); next }
     /^fiabilidad/ { if ($0 !~ /^fiabilidad   : limpio/) fiable = 0; next }
     /^1 trabajo/ { un = tus(); next }
     /^[0-9]+ trabajos/ { par = tus(); next }
     END {
       flush()
-      lo = -1; hi = -1
-      for (i = 1; i <= n; i++) { if (lo < 0 || PSI[i] < lo) lo = PSI[i]; if (hi < 0 || PSI[i] > hi) hi = PSI[i] }
-      printf "%d %d %s %s %s %s\n", n + 0, d + 0, (n ? med(U, n) : "?"), (n ? med(P, n) : "?"), (lo >= 0 ? lo : "?"), (hi >= 0 ? hi : "?")
+      lo = -1; hi = -1; nh = 0; split("", visto, " ")
+      for (i = 1; i <= n; i++) {
+        if (lo < 0 || PSI[i] < lo) lo = PSI[i]
+        if (hi < 0 || PSI[i] > hi) hi = PSI[i]
+        if (!(HASH[i] in visto)) { visto[HASH[i]] = 1; nh++ }
+      }
+      printf "%d %d %s %s %s %s %d\n", n + 0, d + 0, (n ? med(U, n) : "?"), (n ? med(P, n) : "?"), (lo >= 0 ? lo : "?"), (hi >= 0 ? hi : "?"), nh
     }
   ' "$1"
 }
 
 resumen() {
-  local f base var kver fecha n desc un par psilo psihi
+  local f base var kver fecha n desc un par psilo psihi ncmd
   printf '%-24s %-26s %-20s %3s %5s %10s %10s\n' \
     kernel variante "primera medición" n desc "1 trabajo" "N trabajos"
   shopt -s nullglob
@@ -207,7 +220,7 @@ resumen() {
     base="$(basename "$f" .txt)"; base="${base#compile-bench-}"
     # <kernel>__<variante>: el kernel puede llevar guiones, la variante no.
     var="${base##*__}"; kver="${base%__$var}"
-    read -r n desc un par psilo psihi <<<"$(resumen_datos "$f")"
+    read -r n desc un par psilo psihi ncmd <<<"$(resumen_datos "$f")"
     fecha="$(grep -m1 '^fecha' "$f" | sed -E 's/^fecha *: *//; s/T[0-9:.-]+//')"
     printf '%-24s %-26s %-20s %3s %5s %8s TU/s %8s TU/s  %5s-%s%%\n' \
       "$kver" "$var" "$fecha" "$n" "$desc" "$un" "$par" "$psilo" "$psihi"
@@ -217,6 +230,12 @@ resumen() {
     if [ "$n" -ge 2 ] 2>/dev/null; then
       awk -v lo="$psilo" -v hi="$psihi" 'BEGIN{exit !(lo+0>0 && hi+0 > lo+0*5 + 0.5)}' && \
         echo "    ⚠ los bloques van de ${psilo}% a ${psihi}% de PSI: la mediana mezcla ruido. No la compares con nada."
+    fi
+    # El caso peor: bloques de la misma variante medidos con cmdlines
+    # DISTINTAS. Es el error de §53.10 en otra forma, y el nombre de la variante
+    # deja de bastar cuando alguien no lo escribe.
+    if [ "${ncmd:-0}" -ge 2 ] 2>/dev/null; then
+      echo "    ⚠ esa variante tiene ${ncmd} cmdlines distintas mezcladas: el número no es comparable con nada. Mide con CIBENCH_VARIANT distinta."
     fi
   done
   shopt -u nullglob
@@ -455,6 +474,7 @@ mkdir -p "$STATE_DIR"
   echo
   echo "fecha        : $(date -Is)"
   echo "kernel       : $(uname -r)  (build $(uname -v | awk '{print $4, $5, $6, $7, $8}'))"
+  echo "cmdline      : $CMDLINE_H"
   echo "variante     : ${CIBENCH_VARIANT:-default}"
   echo "compilador   : $ccver"
   echo "flags        : $CFLAGS   (ccache desactivado: CCACHE_DISABLE=1)"
