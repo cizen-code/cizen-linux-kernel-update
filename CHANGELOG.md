@@ -1,3 +1,48 @@
+## [27.35.2] - 2026-10-03
+
+**La poda que acompañaba al backup del UKI borraba todos los backups, siempre,
+y el log de cada build anunciaba que se habían respaldado. Detectado en el build
+de 7.2.9.**
+
+El build de 7.2.9 imprimió
+
+```
+✓ UKI previo respaldado en /var/lib/kernel-update/uki-backups/arch-linux-cizen-v3.efi.before-7.2.9-cizen-v3-20261003-174234
+```
+
+y `/var/lib/kernel-update/uki-backups/` está **vacío**. No falló la copia: la
+poda que venía justo después en la misma función la borró.
+
+Dos bugs apilados en `uki_backup_prev`:
+
+1. El glob era `-name "$(basename "$f")*"`, y `basename` incluye el timestamp
+   (`…efi.before-7.2.9-cizen-v3-20261003-174234`), así que el patrón **solo
+   encontraba el propio fichero**. La lista de «los 8 más recientes» nunca
+   llegaba a formarse.
+2. Aun formándose, la decisión estaba **invertida**: `head -n -8` devuelve los
+   más **antiguos**, y el código conservaba los que estaban en esa lista.
+
+Con 8 backups o menos `head -n -8` no imprime nada, así que todo caía en la rama
+de borrar. Comprobado con una simulación de la poda: con 1, con 2, con 8, con 9 y
+con 10 backups, **sobran 0**. Es decir, la función nunca ha dejado una sola copia
+viva, desde que existe.
+
+Es la **segunda** vez que esta función falla (§56: `find_cizen_uki_targets` sin
+argumento, `find -iname ""` no encuentra nada y el bucle no iteraba nunca). Las
+dos veces el síntoma fue el mismo: el directorio quedaba creado y vacío detrás de
+un mensaje de éxito. Por eso ahora la poda es una función aparte,
+`uki_backup_prune()`, con `CIZEN_UKI_BACKUP_KEEP` (8 por defecto), testeable sin
+montar nada: ordena por nombre —el timestamp `YYYYMMDD-HHMMSS` ordena
+lexicográficamente igual que cronológicamente— y conserva los 8 últimos.
+
+Lo que **no** se rompe: `~/kernel-pgo/ukis/auto/` (UKI de 7.2.9 archivado, 27 582 008 B)
+y `/var/lib/kernel-update/rollback/7.2.8-cizen-v3.tar.xz` (62 MB) sí están. El
+respaldo del que se lamentaba la poda sí funcionaba.
+
+8 tests nuevos. El primero es el caso real —un backup recién creado no puede
+evaporarse— y los demás cubren el tope de 8, que no se borre nada por debajo, que
+sobreviva el **más reciente**, y que el glob malo no vuelva. **688 ok / 0 fail**.
+
 ## [27.35.1] - 2026-10-03
 
 **El aviso de seguridad que decía «si instalas libvirt, sus perfiles AppArmor

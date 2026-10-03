@@ -170,7 +170,7 @@ export LC_ALL=C
 #     deje de describir un estado que el power-profiles-daemon sobrescribe y el
 #     fallback sin PPD no degrade a EPP 255.
 # No se toca el motor: la cmdline se hereda, no se genera.
-SCRIPT_VERSION="27.35.1"
+SCRIPT_VERSION="27.35.2"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -11900,6 +11900,41 @@ install_kernel_package() {
   return 1
 }
 
+# v27.35.2: la poda que acompañaba a uki_backup_prev BORRABA TODOS los backups en
+# cada llamada, y el log decía "UKI previo respaldado". Dos bugs apilados:
+#   (1) el glob era -name "$(basename "$f")*", y basename incluye el timestamp
+#       (arch-...efi.before-7.2.9-cizen-v3-20261003-174234), así que el patrón
+#       solo encontraba el propio fichero y la lista de los "8 más recientes"
+#       nunca llegaba a formarse;
+#   (2) aun formándose, la decisión estaba invertida: `head -n -8` devuelve los
+#       más ANTIGUOS, y el código conservaba los que estaban en esa lista.
+# Con 8 backups o menos `head -n -8` no imprime nada, así que todo caía en la
+# rama de borrar: el backup se creaba y se borraba en la misma llamada, y
+# /var/lib/kernel-update/uki-backups quedaba vacío detrás de un "✓".
+# Comprobado contra el build de 7.2.9 del 3-oct: el log dice respaldado y el
+# directorio está vacío. Es la segunda vez que esta función falla (§56: no
+# iteraba nunca); ahora es una función aparte para poder testearla.
+#
+# Se ordena por NOMBRE a propósito: el timestamp es YYYYMMDD-HHMMSS, que
+# ordena lexicográficamente igual que cronológicamente, y así no hace falta
+# stat de cada fichero.
+uki_backup_prune() { # conserva los CIZEN_UKI_BACKUP_KEEP más recientes
+  local todos keep viejo
+  local keep_n="${CIZEN_UKI_BACKUP_KEEP:-8}"
+  todos="$(sudo find "$CIZEN_UKI_BACKUP_DIR" -maxdepth 1 -type f -name '*.efi.before-*' 2>/dev/null | sort || true)"
+  [ -n "$todos" ] || return 0
+  keep="$(printf '%s\n' "$todos" | tail -n "$keep_n")"
+  # head -n -8 = "todos menos los 8 últimos" = los más antiguos, que son
+  # justo los que se borran. (Con -9 se quedaban 9: un backup de más.)
+  for viejo in $(printf '%s\n' "$todos" | head -n "-$keep_n"); do
+    case "\n$keep\n" in
+      *"\n$viejo\n"*) continue ;;
+    esac
+    sudo rm -f -- "$viejo" 2>/dev/null || true
+  done
+  return 0
+}
+
 # v27.30.0 (feature LinuxLocker): respalda el UKI previo a sobrescribirlo.
 # v27.33.9: este NO hacía nada. find_cizen_uki_targets se llamaba SIN argumento y
 # `find -iname ""` no encuentra ningún fichero (los otros tres call sites sí
@@ -11928,14 +11963,7 @@ uki_backup_prev() {
       warn "No se pudo respaldar el UKI previo en $dst."
     fi
   done < <(find_cizen_uki_targets "$(cizen_uki_efi_name)" 2>/dev/null || true)
-  # Poda defensiva: conservar solo las 8 copias mas recientes por nombre.
-  for f in $(sudo find "$CIZEN_UKI_BACKUP_DIR" -type f -name '*.efi.before-*' 2>/dev/null || true); do
-    n=1
-    for older in $(sudo find "$CIZEN_UKI_BACKUP_DIR" -maxdepth 1 -type f -name "$(basename "$f")*" 2>/dev/null | sort | head -n -8); do
-      [ "$older" = "$f" ] && n=0 && break
-    done
-    [ "$n" = 0 ] || sudo rm -f -- "$f" 2>/dev/null || true
-  done
+  uki_backup_prune
   return 0
 }
 

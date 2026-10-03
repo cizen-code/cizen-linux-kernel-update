@@ -7233,6 +7233,81 @@ if declare -f mac_desactivado >/dev/null 2>&1 || grep -q '^mac_desactivado() {' 
 fi
 rec ok "mac: $_mg_mac/4 pruebas del aviso de AppArmor"
 
+# ═══ v27.35.2: la poda de uki-backups borraba TODOS los backups, cada vez ═══
+# El build de 7.2.9 anunció "✓ UKI previo respaldado" y el directorio quedó
+# vacío. No es un fallo de la copia: la poda que venía justo después la borraba
+# en la misma llamada. Y el log decía lo contrario de lo que pasó, que es lo
+# peor: una red de seguridad que se desmonta a sí misma mientras anuncia que
+# está puesta.
+_pr=0
+sed -n '/^uki_backup_prune() {/,/^}/p' "$MOTOR" > "$ROOT/prune.sh"
+if [ -s "$ROOT/prune.sh" ]; then
+  _mk() { # $1 = cuántos backups crear; los nombres llevan timestamp, como los reales
+    rm -rf "$ROOT/ubk"; mkdir -p "$ROOT/ubk"
+    local i
+    for i in $(seq -w 1 "$1" 2>/dev/null); do
+      : > "$ROOT/ubk/arch-linux-cizen-v3.efi.before-7.2.9-cizen-v3-20261001-0000$i"
+    done
+  }
+  _poda() { # cuenta cuántos backups sobreviven a la poda
+    bash -c 'set -Eeuo pipefail
+      sudo() { "$@"; }            # find/rm sobre un directorio del usuario
+      . "$1"; CIZEN_UKI_BACKUP_DIR="$2"; uki_backup_prune' _ "$ROOT/prune.sh" "$ROOT/ubk" 2>/dev/null
+    find "$ROOT/ubk" -type f -name '*.efi.before-*' 2>/dev/null | wc -l
+  }
+  # 1) EL CASO REAL: un backup recién creado no puede evaporarse.
+  _mk 1
+  if [ "$(_poda)" -eq 1 ]; then
+    rec ok "uki: un backup sobrevive a la poda (el bug que vació uki-backups el 3-oct)"; _pr=$((_pr+1))
+  else
+    rec fail "uki: la poda se lleva el único backup que hay"
+  fi
+  # 2) Con 8 o menos no se borra nada: no hay nada que podar.
+  for _n in 2 8; do
+    _mk "$_n"
+    if [ "$(_poda)" -eq "$_n" ]; then
+      rec ok "uki: con $_n backups la poda no borra ninguno"; _pr=$((_pr+1))
+    else
+      rec fail "uki: con $_n backups la poda borró alguno"
+    fi
+  done
+  # 3) Pasado el tope, conserva el tope y NO uno de más (el -9 que sobraba).
+  for _n in 9 12; do
+    _mk "$_n"
+    if [ "$(_poda)" -eq 8 ]; then
+      rec ok "uki: de $_n backups conserva 8, ni uno más"; _pr=$((_pr+1))
+    else
+      rec fail "uki: de $_n backups no conserva exactamente 8"
+    fi
+  done
+  # 4) Y el que se conserva es el MÁS RECIENTE, que es el que sirve para volver.
+  _mk 12
+  _poda >/dev/null
+  if [ -f "$ROOT/ubk/arch-linux-cizen-v3.efi.before-7.2.9-cizen-v3-20261001-000012" ]; then
+    rec ok "uki: el backup más reciente es el que sobrevive a la poda"; _pr=$((_pr+1))
+  else
+    rec fail "uki: la poda se queda con un backup viejo y tira el reciente"
+  fi
+  # 5) El bug original por si vuelve: el glob con basename incluía el timestamp,
+  #    así que solo encontraba el propio fichero.
+  # Solo líneas de código: el comentario que documenta el bug escribe el glob
+  # malo a propósito, y sin filtrarlo el test encuentra su propia documentación.
+  if grep -vE '^[[:space:]]*#' "$MOTOR" | grep -q 'basename "$f")\*'; then
+    rec fail "uki: vuelve el glob con basename, que solo casa con el propio fichero"
+  else
+    rec ok "uki: el prune ya no usa el glob que solo encontraba el propio fichero"; _pr=$((_pr+1))
+  fi
+  # 6) Y que la poda se siga llamando desde uki_backup_prev: sin la llamada, el
+  #    directorio crecería sin límite, que es el otro extremo.
+  if sed -n '/^uki_backup_prev() {/,/^}/p' "$MOTOR" | grep -q 'uki_backup_prune'; then
+    rec ok "uki: la poda se sigue llamando desde uki_backup_prev"; _pr=$((_pr+1))
+  else
+    rec fail "uki: uki_backup_prev ya no llama a la poda (el directorio crecerá sin límite)"
+  fi
+  rm -rf "$ROOT/ubk"
+fi
+rec ok "uki: $_pr/8 pruebas de la poda de backups del UKI"
+
 # --- resumen ---
 echo
 printf 'Totales: %d ok, %d fail\n' "$PASS" "$FAIL"
