@@ -6805,6 +6805,217 @@ else
   err "v27.33.9: solo $_sx_v27_33_9/14 pruebas del archivo local del UKI"
 fi
 
+# ═══ v5.19.0: ajuste de runtime (sysctl.d + udev), el §7 del documento maestro ═══
+_sx_rt=0
+_rt_src="${CIZEN_TEST_RUNTIME_SRC:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)/runtime}"
+
+if [ -d "$_rt_src/sysctl.d" ] && [ -d "$_rt_src/udev" ]; then
+  rec ok "runtime/: hay fuentes sysctl.d y udev que desplegar"
+  _sx_rt=$(( _sx_rt + 1 ))
+else
+  rec fail "runtime/: faltan runtime/sysctl.d o runtime/udev en el repo (dir=$_rt_src)"
+fi
+
+# Los tres sysctl que el usuario decidió no tocar están medidos en
+# /etc/sysctl.d/99-optimizaciones.conf. Si aparecen en el fichero nuevo, el
+# despliegue los sobreescribiría y se perdería la medición que los respalda.
+if ! grep -qE '^[[:space:]]*vm\.(swappiness|vfs_cache_pressure|watermark_boost_factor)[[:space:]]*=' "$_rt_src/sysctl.d/99-cizen-memory.conf" 2>/dev/null; then
+  rec ok "runtime: el fichero de memoria no toca swappiness, vfs_cache_pressure ni watermark_boost_factor"
+  _sx_rt=$(( _sx_rt + 1 ))
+else
+  rec fail "runtime: el fichero de memoria pisa un sysctl medido en 99-optimizaciones.conf"
+fi
+
+# La regla del documento maestro ponía queue/rotational=0 a todo sd[a-z], lo que
+# habría marcado como no rotacional el Kingston DataTraveler USB (rotational=1).
+# Se filtra el comentario antes de buscar: el fichero CITA la regla rota a
+# propósito, para dejar escrito lo que se corrigió, y buscar en el fichero entero
+# daría un falso positivo sobre su propia documentación.
+_rt_rules="$(grep -vE '^[[:space:]]*(#|$)' "$_rt_src/udev/99-cizen-sata-ssd.rules" 2>/dev/null)"
+if ! printf '%s' "$_rt_rules" | grep -qE 'rotational}="0"'; then
+  rec ok "runtime: la regla udev no ESCRIBE rotational=0 (solo lo exige como condición)"
+  _sx_rt=$(( _sx_rt + 1 ))
+else
+  rec fail "runtime: la regla udev sigue asignando rotational=0 y mentiría sobre el USB rotacional"
+fi
+
+if printf '%s' "$_rt_rules" | grep -q 'ACTION=="add|change"'; then
+  rec fail "runtime: la regla udev sigue con ACTION==\"add|change\"; debe ser solo add"
+else
+  rec ok "runtime: la regla udev usa ACTION==\"add\" y no se re-dispara en cada cambio"
+  _sx_rt=$(( _sx_rt + 1 ))
+fi
+
+# Sonda: stubs + las cuatro funciones reales tal cual, con los destinos en un
+# tmpdir. `sudo` se stubea como FUNCIÓN (bash prioriza funciones sobre el PATH),
+# así que se ejercita el despliegue entero sin root y sin tocar /etc.
+_rt_probe() { # $1=modo (ok|sudo-falla|sin-sudo)  $2=directorio de trabajo
+  local modo="$1" dir="$2"
+  mkdir -p "$dir"
+  {
+    cat <<'PROBE'
+set -Eeuo pipefail
+log()  { printf 'LOG %s\n' "$*"; }
+ok()   { printf 'OK  %s\n' "$*"; }
+warn() { printf 'WARN %s\n' "$*"; }
+info() { printf 'INFO %s\n' "$*"; }
+sudo() {
+  # OJO: hay que quitar '-n' y el NOMBRE del comando antes de ejecutar el resto.
+  # Con un `shift` a secas y un `command install "$@"` de después salía
+  # `install install -Dm644 ...`; como el motor llama a sudo con 2>/dev/null el
+  # error quedaba invisible y el test informaba de un fallo del motor que era
+  # del stub.
+  while [ "${1:-}" = "-n" ]; do shift; done
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    install)
+      if [ "$RT_MODO" = sudo-falla ]; then return 1; fi
+      command install "$@"
+      ;;
+    sysctl|udevadm)
+      if [ "$RT_MODO" = sin-sudo ]; then return 1; fi
+      printf 'SUDO %s\n' "$*"
+      return 0
+      ;;
+    *) return 0 ;;
+  esac
+}
+PROBE
+    for _fn in runtime_tuning_pairs runtime_tuning_state runtime_tuning_install deploy_runtime_tuning; do
+      _sx_fnm "$_fn"
+    done
+    cat <<PROBE2
+RT_MODO="$modo"
+RUNTIME_TUNING_SRC_DIR="$_rt_src"
+RUNTIME_TUNING_SYSCTL_DIR="$dir/sysctl.d"
+RUNTIME_TUNING_UDEV_DIR="$dir/udev"
+RUNTIME_TUNING_BACKUP_DIR="$dir/backups"
+CIZEN_RUNTIME_TUNING="\${RT_TOGGLE:-1}"
+PROFILE_FILE="/no/existe/perfil"
+mkdir -p "\$RUNTIME_TUNING_SYSCTL_DIR" "\$RUNTIME_TUNING_UDEV_DIR"
+"\${RT_ACTION:-deploy_runtime_tuning}"
+PROBE2
+  } > "$dir/probe.sh"
+  bash "$dir/probe.sh"
+}
+
+_rt1="$ROOT/rt1"
+if _rt_probe ok "$_rt1" >"$_rt1.log" 2>&1 \
+   && [ -f "$_rt1/sysctl.d/99-cizen-memory.conf" ] \
+   && [ -f "$_rt1/sysctl.d/99-cizen-net.conf" ] \
+   && [ -f "$_rt1/udev/99-cizen-sata-ssd.rules" ] \
+   && cmp -s "$_rt_src/sysctl.d/99-cizen-memory.conf" "$_rt1/sysctl.d/99-cizen-memory.conf"; then
+  rec ok "runtime: despliega los 3 ficheros y el contenido llega intacto"
+  _sx_rt=$(( _sx_rt + 1 ))
+else
+  rec fail "runtime: el despliegue no dejó los 3 ficheros con el contenido del repo"
+fi
+
+# Idempotencia por inode: si la segunda pasada reescribiera el fichero, el inode
+# cambiaría. Comparar contenido no valdría, porque el contenido es el mismo.
+_rt_inode1="$(stat -c%i "$_rt1/sysctl.d/99-cizen-net.conf" 2>/dev/null || echo 0)"
+if _rt_probe ok "$_rt1" >"$_rt1.log2" 2>&1 \
+   && [ "$_rt_inode1" = "$(stat -c%i "$_rt1/sysctl.d/99-cizen-net.conf" 2>/dev/null || echo 0)" ] \
+   && grep -q 'sin cambios' "$_rt1.log2"; then
+  rec ok "runtime: la segunda pasada no reescribe nada (mismo inode) y lo dice"
+  _sx_rt=$(( _sx_rt + 1 ))
+else
+  rec fail "runtime: el despliegue no es idempotente; reescribe ficheros que ya estaban al día"
+fi
+
+# Respaldo del contenido ANTERIOR cuando el destino difiere. La aserción mira
+# solo LÍNEAS ACTIVAS (`^clave=`): un grep plano de "swappiness" encuentra el
+# nombre en un comentario del fichero nuevo y daría un falso negativo.
+_rt2="$ROOT/rt2"
+mkdir -p "$_rt2/sysctl.d"
+printf 'vm.swappiness = 999\n# contenido viejo\n' > "$_rt2/sysctl.d/99-cizen-memory.conf"
+if _rt_probe ok "$_rt2" >"$_rt2.log" 2>&1 \
+   && grep -q 'vm.swappiness = 999' "$_rt2"/backups/*/etc"$_rt2"'/sysctl.d/99-cizen-memory.conf' 2>/dev/null \
+   && ! grep -qE '^[[:space:]]*vm\.swappiness[[:space:]]*=' "$_rt2/sysctl.d/99-cizen-memory.conf"; then
+  rec ok "runtime: al cambiar un destino guarda el contenido viejo en el respaldo"
+  _sx_rt=$(( _sx_rt + 1 ))
+else
+  rec fail "runtime: al sobrescribir no deja copia del contenido anterior en el respaldo"
+fi
+
+# El respaldo va a /var/lib, nunca al lado del original: systemd-sysctl se come
+# todo /etc/sysctl.d y un *.conf.bak con una clave vieja puede abortar el arranque.
+if _rt_probe ok "$_rt2" >/dev/null 2>&1 \
+   && [ -z "$(find "$_rt2/sysctl.d" "$_rt2/udev" -name '*.bak*' 2>/dev/null)" ]; then
+  rec ok "runtime: no deja *.bak* dentro de /etc/sysctl.d ni de /etc/udev/rules.d"
+  _sx_rt=$(( _sx_rt + 1 ))
+else
+  rec fail "runtime: el respaldo se ha escrito dentro del directorio de destino"
+fi
+
+# Desactivar por variable de entorno.
+_rt3="$ROOT/rt3"
+if RT_TOGGLE=0 _rt_probe ok "$_rt3" >"$_rt3.log" 2>&1 \
+   && [ ! -e "$_rt3/sysctl.d/99-cizen-memory.conf" ] \
+   && grep -q 'CIZEN_RUNTIME_TUNING=0' "$_rt3.log"; then
+  rec ok "runtime: CIZEN_RUNTIME_TUNING=0 no escribe nada y lo dice"
+  _sx_rt=$(( _sx_rt + 1 ))
+else
+  rec fail "runtime: CIZEN_RUNTIME_TUNING=0 no impide el despliegue"
+fi
+
+# sysctl y udevadm no están en el allowlist NOPASSWD de este host. El despliegue
+# tiene que avisar con el comando copiable, no quedarse mudo.
+_rt4="$ROOT/rt4"
+if _rt_probe sin-sudo "$_rt4" >"$_rt4.log" 2>&1 \
+   && grep -q 'sudo sysctl -p' "$_rt4.log" \
+   && grep -q 'udevadm control --reload-rules' "$_rt4.log"; then
+  rec ok "runtime: sin sudo para sysctl/udevadm avisa con el comando exacto para aplicar a mano"
+  _sx_rt=$(( _sx_rt + 1 ))
+else
+  rec fail "runtime: sin permisos de sudo no da el comando para aplicar los cambios"
+fi
+
+# Nada de lo que pase al desplegar puede marcar el build como fallido.
+_rt5="$ROOT/rt5"; mkdir -p "$_rt5/sysctl.d" "$_rt5/udev"
+if _rt_probe sudo-falla "$_rt5" >"$_rt5.log" 2>&1; then
+  rec ok "runtime: si no se puede escribir nada, deploy_runtime_tuning devuelve 0 igual"
+  _sx_rt=$(( _sx_rt + 1 ))
+else
+  rec fail "runtime: un despliegue fallido devuelve error y ensuciaría el veredicto del build"
+fi
+
+# runtime_tuning_pairs: formato y cobertura de los dos destinos.
+if RT_ACTION=runtime_tuning_pairs _rt_probe ok "$ROOT/rt6" 2>/dev/null \
+   | grep -q "^$ROOT/rt6/udev/99-cizen-sata-ssd.rules"$'\t' ; then
+  rec ok "runtime: runtime_tuning_pairs emite destino<TAB>origen para sysctl y udev"
+  _sx_rt=$(( _sx_rt + 1 ))
+else
+  rec fail "runtime: runtime_tuning_pairs no emite los pares destino<TAB>origen esperados"
+fi
+
+# La llamada tiene que estar antes de FULL_PIPELINE_OK, igual que el archivado.
+_rt_l_call="$(grep -nE '^[[:space:]]*deploy_runtime_tuning$' "$MOTOR" | head -1 | cut -d: -f1)"
+_rt_l_fpo="$(grep -nE '^[[:space:]]*FULL_PIPELINE_OK=true$' "$MOTOR" | head -1 | cut -d: -f1)"
+if [ -n "$_rt_l_call" ] && [ -n "$_rt_l_fpo" ] && [ "$_rt_l_call" -lt "$_rt_l_fpo" ]; then
+  rec ok "runtime: se despliega antes de FULL_PIPELINE_OK, así no ensucia el veredicto"
+  _sx_rt=$(( _sx_rt + 1 ))
+else
+  rec fail "runtime: la llamada a deploy_runtime_tuning no está antes de FULL_PIPELINE_OK (call=$_rt_l_call fpo=$_rt_l_fpo)"
+fi
+
+# Y después de instalar el paquete: si se desplegara antes, el ajuste se aplicaría
+# aunque la instalación hubiera fallado.
+_rt_l_pkg="$(grep -nE '^[[:space:]]*FULL_PIPELINE_OK=true$' "$MOTOR" | head -1 | cut -d: -f1)"
+_rt_l_mn="$(grep -n 'pacman -S --needed\|--noconfirm' "$MOTOR" | tail -1 | cut -d: -f1)"
+if [ -n "$_rt_l_mn" ] && [ -n "$_rt_l_call" ] && [ "$_rt_l_mn" -lt "$_rt_l_call" ]; then
+  rec ok "runtime: se despliega después de la instalación del paquete (L$_rt_l_mn -> L$_rt_l_call)"
+  _sx_rt=$(( _sx_rt + 1 ))
+else
+  rec fail "runtime: no se puede confirmar que el despliegue vaya tras instalar el paquete"
+fi
+
+if [ "$_sx_rt" -eq 14 ]; then
+  ok "v5.19.0: 14/14 pruebas del ajuste de runtime"
+else
+  err "v5.19.0: solo $_sx_rt/14 pruebas del ajuste de runtime"
+fi
+
 # --- resumen ---
 echo
 printf 'Totales: %d ok, %d fail\n' "$PASS" "$FAIL"

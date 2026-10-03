@@ -1,0 +1,23 @@
+# Gestionado por kernel-update (v5.19.0) — fuente en runtime/udev/ del repo.
+# NO editar a mano: el motor compara el contenido y lo sobrescribe en cada build.
+#
+# Corrección sobre el documento maestro: sus cuatro reglas eran
+#   ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/rotational}="0"
+# es decir, declaraban NO rotacional cualquier disco sd*. Aquí hay un Kingston
+# DataTraveler en sdb con rotational=1, así que esa regla le habría mentido al
+# kernel sobre un disco que sí gira, y el planificador habría dejado de usar
+# ascensores para el USB. Aquí no se escribe rotational en ningún sitio: se
+# exige que el disco YA se declare no rotacional y se ajustan solo atributos de
+# cola. Con ACTION=="add" en vez de "add|change" no hace falta re-disparar la
+# regla en cada cambio de atributo: los ajustes de cola viven toda la vida del
+# dispositivo y add se dispara una vez, al enchufarlo.
+#
+# Aplican a: el SSD SATA interno (sda, ADATA SU650, rotational=0).
+# No aplican a: el USB rotacional (sdb), ni a nvme0 (no es sd*).
+ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="0", ATTR{queue/nr_requests}="64"
+ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="0", ATTR{bdi/read_ahead_kb}="256"
+ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="0", ATTR{queue/add_random}="0"
+
+# nr_requests ya está en 64 y add_random ya está en 0 en el kernel actual: se
+# dejan escritos para que un cambio de valor por defecto no los revierta.
+# read_ahead_kb sí cambia: 128 -> 256.

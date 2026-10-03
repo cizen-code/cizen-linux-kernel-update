@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.33.9 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.34.0 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / XFS / systemd / KVM-libvirt / QEMU-OVMF
 #
@@ -170,7 +170,7 @@ export LC_ALL=C
 #     deje de describir un estado que el power-profiles-daemon sobrescribe y el
 #     fallback sin PPD no degrade a EPP 255.
 # No se toca el motor: la cmdline se hereda, no se genera.
-SCRIPT_VERSION="27.33.9"
+SCRIPT_VERSION="27.34.0"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -12167,6 +12167,159 @@ store_install() { # $1=origen $2=destino
   sudo install -m644 -- "$src" "$dst" 2>/dev/null
 }
 
+# ═══ v5.19.0: §7 del documento maestro — ajuste de runtime (sysctl.d + udev) ═══
+# Hasta v27.33.9 el motor solo tocaba el Kconfig y el UKI: los sysctl y las reglas
+# udev que pide el §7 del documento maestro no tenían ninguna forma automatizada
+# de llegar al rootfs, así que el usuario se los tenía que copiar a mano.
+#
+# RUNTIME_TUNING_SRC_DIR es el directorio de fuentes del repo (runtime/sysctl.d y
+# runtime/udev). Los DESTINOS son variables aparte para que el selftest pueda
+# apuntarlos a un tmpdir y ejercitar la función entera sin root y sin escribir en
+# /etc, igual que se hace con las raíces falsas en otras pruebas.
+RUNTIME_TUNING_SRC_DIR="${CIZEN_RUNTIME_TUNING_SRC_DIR:-$SCRIPT_DIR/runtime}"
+RUNTIME_TUNING_SYSCTL_DIR="${CIZEN_RUNTIME_TUNING_SYSCTL_DIR:-/etc/sysctl.d}"
+RUNTIME_TUNING_UDEV_DIR="${CIZEN_RUNTIME_TUNING_UDEV_DIR:-/etc/udev/rules.d}"
+RUNTIME_TUNING_BACKUP_DIR="${CIZEN_RUNTIME_TUNING_BACKUP_DIR:-/var/lib/kernel-update/runtime-backups}"
+
+# Empareja cada fichero de origen con su destino: "destino<TAB>origen" por
+# línea, en orden de globs (léxico, determinista) para que la salida sea estable
+# entre ejecuciones y comparable en las pruebas.
+runtime_tuning_pairs() {
+  local f b
+  for f in "$RUNTIME_TUNING_SRC_DIR"/sysctl.d/*.conf; do
+    [ -f "$f" ] || continue
+    b="${f##*/}"
+    printf '%s\t%s\n' "$RUNTIME_TUNING_SYSCTL_DIR/$b" "$f"
+  done
+  for f in "$RUNTIME_TUNING_SRC_DIR"/udev/*.rules; do
+    [ -f "$f" ] || continue
+    b="${f##*/}"
+    printf '%s\t%s\n' "$RUNTIME_TUNING_UDEV_DIR/$b" "$f"
+  done
+}
+
+# Estado de un par destino/origen: NUEVO | IGUAL | CAMBIA.
+# IGUAL importa tanto como los otros dos: el motor compara contenido en vez de
+# reescribir a ciegas, para no tocar la mtime de un fichero de /etc que el
+# administrador acaba de retocar y para no ensuciar backups con copias idénticas.
+runtime_tuning_state() { # $1=destino $2=origen
+  if [ ! -e "$1" ]; then printf 'NUEVO\n'; return 0; fi
+  if cmp -s -- "$2" "$1"; then printf 'IGUAL\n'; else printf 'CAMBIA\n'; fi
+}
+
+# Igual que store_install: si el directorio de destino es escribible por el
+# usuario se copia sin sudo. Es lo que permite que el selftest ejercite el
+# despliegue completo contra un tmpdir sin permisos de administrador.
+runtime_tuning_install() { # $1=origen $2=destino
+  local d
+  d="$(dirname -- "$2")"
+  if [ -d "$d" ] && [ -w "$d" ]; then
+    install -Dm644 -- "$1" "$2" 2>/dev/null && return 0
+  fi
+  sudo -n install -Dm644 -- "$1" "$2" 2>/dev/null
+}
+
+# Despliega los ficheros de runtime y los aplica sin reiniciar. NO propaga error
+# nunca: un sysctl que no se puede cargar es un ajuste que no se aplica hasta el
+# próximo arranque, y eso no puede convertir un build correcto en fallo.
+deploy_runtime_tuning() {
+  if [ "${CIZEN_RUNTIME_TUNING:-1}" = "0" ]; then
+    info "Ajuste de runtime: omitido por CIZEN_RUNTIME_TUNING=0"
+    return 0
+  fi
+  if [ ! -d "$RUNTIME_TUNING_SRC_DIR" ]; then
+    warn "Ajuste de runtime: no existe el directorio fuente $RUNTIME_TUNING_SRC_DIR"
+    return 0
+  fi
+
+  local dst src estado nombre cambios=0 nuevos=0 iguales=0 respaldos=0
+  local stamp
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  local -a sysctl_pendientes=() udev_pendientes=()
+
+  log "Ajuste de runtime del rootfs (§7 del documento maestro)..."
+  while IFS=$'\t' read -r dst src; do
+    [ -n "$dst" ] || continue
+    nombre="${dst##*/}"
+    estado="$(runtime_tuning_state "$dst" "$src")"
+    case "$estado" in
+      IGUAL)
+        iguales=$((iguales+1))
+        info "$nombre: sin cambios"
+        continue
+        ;;
+      CAMBIA)
+        # El respaldo se va a /var/lib y NO al lado del original a propósito:
+        # systemd-sysctl se come todo lo que hay en /etc/sysctl.d, así que un
+        # "99-cizen-memory.conf.bak-<stamp>" colgado ahí puede abortar el
+        # arranque con una clave que ya no existe. En /var/lib no muerde.
+        if runtime_tuning_install "$dst" "$RUNTIME_TUNING_BACKUP_DIR/$stamp/etc$dst"; then
+          respaldos=$((respaldos+1))
+        else
+          warn "No pude respaldar $nombre antes de sobrescribirlo; sigo igualmente."
+        fi
+        ;;
+    esac
+
+    if runtime_tuning_install "$src" "$dst"; then
+      cambios=$((cambios+1))
+      [ "$estado" = NUEVO ] && nuevos=$((nuevos+1))
+      ok "$nombre: $estado ($(stat -c%s -- "$src") B)"
+      case "$dst" in
+        "$RUNTIME_TUNING_UDEV_DIR"/*) udev_pendientes+=("$dst") ;;
+        *)                          sysctl_pendientes+=("$dst") ;;
+      esac
+    else
+      warn "No pude escribir $nombre en ${dst%/*} (¿sudo sin contraseña para 'install'?)"
+    fi
+  done < <(runtime_tuning_pairs)
+
+  # sysctl: cargar solo los ficheros que han cambiado, uno a uno, para poder decir
+  # cuál falló. 'sudo -n' a propósito: sysctl NO está en el allowlist de este
+  # host, y sin '-n' sudo intentaría pedir contraseña en un contexto sin TTY.
+  local t
+  for t in ${sysctl_pendientes[@]+"${sysctl_pendientes[@]}"}; do
+    if [ ! -e "$t" ]; then continue; fi
+    if sudo -n sysctl -p -- "$t" >/dev/null 2>&1; then
+      ok "sysctl aplicado: ${t##*/}"
+    else
+      warn "No pude aplicar ${t##*/} en caliente (sysctl fuera del allowlist NOPASSWD?)."
+      warn "  Aplícalo a mano:  sudo sysctl -p $t"
+    fi
+  done
+
+  # udev: recargar reglas y, además, dispararlas sobre los discos YA conectados.
+  # Sin lo segundo el fichero sería correcto y no surtiría efecto hasta el
+  # próximo reinicio, que es justo cuando el usuario ya se ha olvidado.
+  if [ ${#udev_pendientes[@]} -gt 0 ]; then
+    if sudo -n udevadm control --reload-rules >/dev/null 2>&1; then
+      ok "Reglas udev recargadas"
+      if sudo -n udevadm trigger --subsystem-match=block --action=add >/dev/null 2>&1; then
+        ok "Reglas udev aplicadas a los discos ya conectados"
+      else
+        warn "No pude dispararlas sobre los discos ya conectados:"
+        warn "  sudo udevadm trigger --subsystem-match=block --action=add"
+      fi
+    else
+      warn "udevadm fuera del allowlist NOPASSWD: las reglas llegarán al próximo arranque."
+      warn "  sudo udevadm control --reload-rules"
+      warn "  sudo udevadm trigger --subsystem-match=block --action=add"
+    fi
+  fi
+
+  if [ "$cambios" -eq 0 ] && [ "$iguales" -gt 0 ]; then
+    ok "Ajuste de runtime: $iguales fichero(s) ya estaban al día"
+  elif [ "$cambios" -gt 0 ]; then
+    ok "Ajuste de runtime: $cambios escrito(s), $nuevos nuevo(s), $iguales sin cambios, $respaldos respaldo(s)"
+    # Aviso de seguridad del §6-B, aquí donde toca: si alguien instala libvirt
+    # con sus perfiles AppArmor después de este build, se quedan inertes.
+    if grep -qx 'SECURITY_APPARMOR' "$PROFILE_FILE" 2>/dev/null; then
+      info "Sin MAC en el kernel (v5.19.0): los perfiles AppArmor de libvirt, si los instalas, quedarán inertes sin avisar."
+    fi
+  fi
+  return 0
+}
+
 # v27.33.5: separa la foto de ccache en tres enteros, uno por línea.
 # Nace de un bug real: el IFS del motor es $'\n\t' (sin espacio), así que el
 # `read -r a b c <<< "41407 34418 0"` de dentro de la aritmética se llevaba las
@@ -12393,6 +12546,13 @@ if [ "$UKI_SYNC_FAILED" = false ] && [ "$CIZEN_UKI_SYNC_FAILED" = false ]; then
 else
   warn "No archivo copia local del UKI: la sincronización falló y el ESP conserva el UKI anterior."
 fi
+
+# Ajuste de runtime del rootfs (v5.19.0, §7 del documento maestro). Va DESPUÉS
+# de instalar el paquete y antes del veredicto, y no propaga error: son ajustes
+# de rendimiento que también se aplican en el próximo arranque si esto falla.
+# Que una escritura en /etc/sysctl.d o /etc/udev/rules.d falle no vuelve malo un
+# kernel que se acaba de compilar bien.
+deploy_runtime_tuning
 
 FULL_PIPELINE_OK=true
 

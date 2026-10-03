@@ -1,3 +1,68 @@
+## [27.34.0] - 2026-10-03
+
+**El §7 del documento de optimización no tenía ninguna forma de llegar al
+rootfs: `sysctl.d` y las reglas udev había que copiarlos a mano. Nuevo paso
+`deploy_runtime_tuning()` en el pipeline. Y el perfil `cizen-optiplex7050`
+pasa a v5.19.0 con 14 símbolos del documento verificados uno a uno contra el
+Kconfig real de 7.2.9.**
+
+`~/Descargas/Optimizacion-kernel.txt` (v5.19.0) pedía 65 símbolos de Kconfig y
+14 claves de runtime. Verificados contra el Kconfig real —árbol de 7.2.9 de
+cdn.kernel.org, `sha256 b4c5dfbe…d8d8ba`, verificado contra `sha256sums.asc`,
+con `scripts/config` + `make olddefconfig`—, **solo 14 son necesarios**:
+
+- **Bloque A**: `SUSPEND`, `HIBERNATION`. Apagan 11 en cascada
+  (`ACPI_SLEEP`, `PM_SLEEP_SMP`, `HIBERNATION_COMP_LZO`, …). Se pierden
+  `systemctl suspend` y `systemctl hibernate`; en un sobremesa sin tapa ni
+  batería el coste es nulo.
+- **Bloque B**: `SECURITY_SELINUX`, `SECURITY_APPARMOR`, `SECURITY_SMACK`,
+  `SECURITY_TOMOYO`, `SECURITY_LOADPIN`, `SECURITY_LOCKDOWN_LSM`,
+  `SECURITY_SAFESETID`, `INTEGRITY`. Sin nada en uso hoy (`/etc/apparmor.d`
+  vacío, sin `security=` en el cmdline, lockdown `[none]`, IMA/EVM ya
+  apagados). **Riesgo anotado**: si se instala libvirt con sus perfiles
+  AppArmor, quedarán inertes sin avisar, y este host virtualiza KVM. La firma
+  de módulos no se rompe: `MODULE_SIG_KEY="certs/signing_key.pem"` es la clave
+  embebida de la build, no la db de UEFI.
+- **Bloque C**: `TMPFS_QUOTA`, `XFS_FS`, `QUOTA`, `QUOTACTL`.
+- **Bloque D**: nada. Los 18 ya estaban apagados o no existen.
+- **No existen en 7.2.9**: `SYSV_FS`, `REISERFS_FS`, `IP_DCCP`, `CAIF`,
+  `ISDN`, `HAMRADIO`, `IRDA`.
+- **`AUTOFS_FS` NO se desactiva**, aunque el documento lo pida: systemd monta
+  `/proc/sys/fs/binfmt_misc` con automount y ahí está el handler `DOSWin` de
+  `/usr/lib/binfmt.d/wine.conf`; sin él, un `.exe` deja de ejecutarse con un
+  doble clic.
+- **`QUOTA` no se apaga poniéndolo a `n`**: `TMPFS_QUOTA` (`fs/Kconfig:238`) y
+  `XFS_FS` (`fs/xfs/Kconfig:80`) lo `select`ean, y `olddefconfig` conserva el
+  `=y` viejo si no se retiran las raíces.
+- **0 `EXPECTED_REBELS` nuevos**. Impacto sobre el `.config`: 46 símbolos `=y`
+  → `n`, 0 módulos. Los MB y segundos que estima el documento **no se afirman**
+  hasta que exista la build que los mida.
+
+Del §7 se aplican **3 claves de memoria y 2 de red**. Los tres sysctl que el
+usuario tiene medidos (`vm.swappiness=10`, `vm.vfs_cache_pressure=100`,
+`vm.watermark_boost_factor=0`) se respetan y se quedan en
+`/etc/sysctl.d/99-optimizaciones.conf`; el nuevo fichero no solapa ni una
+clave con él. De red, el documento **rebajaba** `net.ipv4.tcp_rmem` de 32 MiB
+a 4 MiB, lo cual no es una mejora, y `core.rmem_max`/`wmem_max` ya estaban en
+el valor pedido.
+
+La regla udev del documento declaraba `ATTR{queue/rotational}="0"` a **todo**
+`sd[a-z]`, con lo que el Kingston DataTraveler de `sdb` —que es
+`rotational=1`— quedaba declarado no rotacional y el planificador habría
+dejado de usar ascensores para el USB. Aquí ese atributo **no se escribe**: se
+exige como condición, y con `ACTION=="add"` en vez de `"add|change"`.
+
+**`deploy_runtime_tuning()`** despliega `runtime/{sysctl.d,udev}/` a `/etc`
+comparando contenido (no reescribe lo que ya está bien), respalda lo anterior
+**en `/var/lib/kernel-update/runtime-backups/<sello>/`** y nunca al lado del
+original —systemd-sysctl se come todo `/etc/sysctl.d`, y un `*.conf.bak` con
+una clave vieja puede abortar el arranque—, aplica en caliente con
+`sudo -n sysctl -p` y `udevadm` y **da el comando copiable** cuando no están en
+el allowlist NOPASSWD (en este host no lo están). Dispara
+`udevadm trigger --subsystem-match=block` para que no espere a un reinicio.
+**Nunca propaga error**: un sysctl que no carga no ensucia el veredicto de un
+kernel bien compilado. `CIZEN_RUNTIME_TUNING=0` lo desactiva.
+
 ## [27.33.9] - 2026-10-03
 
 **El UKI del ESP es `-rwx------ root`: una copia hecha con `sudo cp` al home del
