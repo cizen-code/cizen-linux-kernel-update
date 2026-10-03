@@ -7224,6 +7224,19 @@ if declare -f mac_desactivado >/dev/null 2>&1 || grep -q '^mac_desactivado() {' 
   else
     rec ok "mac: sin perfil cargado el aviso calla en vez de suponer"; _mg_mac=$((_mg_mac+1))
   fi
+  # v27.35.3: el aviso estaba dentro del `elif [ "$cambios" -gt 0 ]`, así que solo
+  # salía el primer build. Depender de cuántos ficheros de runtime cambiaron es
+  # una condición de runtime colgada de un aviso de kernel.
+  _dep="$(sed -n '/^deploy_runtime_tuning() {/,/^}/p' "$MOTOR" | grep -n 'mac_desactivado SECURITY_APPARMOR' | head -1 | cut -d: -f1)"
+  if [ -n "$_dep" ]; then
+    if sed -n "1,$_dep p" "$MOTOR" | sed -n '/^deploy_runtime_tuning() {/,$ p' | grep -q 'elif \[ "\$cambios" -gt 0 \]'; then
+      rec fail "mac: el aviso de AppArmor vuelve a depender de si cambiaron ficheros de runtime"
+    else
+      rec ok "mac: el aviso de AppArmor no depende de si cambiaron los ficheros de runtime"; _mg_mac=$((_mg_mac+1))
+    fi
+  else
+    rec fail "mac: no encuentro el aviso de AppArmor en deploy_runtime_tuning"
+  fi
   # Y el bug original, por si alguien lo reintroduce como grep.
   if grep -q "grep -qx 'SECURITY_APPARMOR'" "$MOTOR"; then
     rec fail "mac: el aviso ha vuelto al grep -x que no matchea con el array del perfil"
@@ -7231,7 +7244,7 @@ if declare -f mac_desactivado >/dev/null 2>&1 || grep -q '^mac_desactivado() {' 
     rec ok "mac: el aviso ya no depende del grep -x que nunca matcheó"; _mg_mac=$((_mg_mac+1))
   fi
 fi
-rec ok "mac: $_mg_mac/4 pruebas del aviso de AppArmor"
+rec ok "mac: $_mg_mac/5 pruebas del aviso de AppArmor"
 
 # ═══ v27.35.2: la poda de uki-backups borraba TODOS los backups, cada vez ═══
 # El build de 7.2.9 anunció "✓ UKI previo respaldado" y el directorio quedó

@@ -1,3 +1,35 @@
+## [27.35.3] - 2026-10-03
+
+**El aviso de AppArmor de v27.35.1 solo salía el primer build. Estaba en el sitio
+equivocado, y eso no se ve leyendo la condición.**
+
+El build de 7.2.9 (3-oct) imprimió `3 fichero(s) ya estaban al día` y **no
+imprimió el aviso**. La causa: estaba dentro del
+
+```
+elif [ "$cambios" -gt 0 ]; then
+```
+
+de `deploy_runtime_tuning`, así que solo se ejecutaba cuando algún fichero de
+runtime cambiaba — que es el primer build y ningún otro. Es un aviso sobre el
+**perfil del kernel** colgado de una condición sobre **ficheros de runtime** que
+no tienen nada que ver: después del primer build se iba solo, que es la forma más
+fácil de que un aviso deje de avisar.
+
+v27.35.1 lo arregló por dentro (la pregunta era la correcta: el estado del perfil
+en vez de un `grep -x` que nunca casaba) pero lo dejó dentro del `elif`. Por eso
+§60.6 lo daba por verificado solo porque la condición ya no mentía, sin mirar
+dónde estaba.
+
+Ahora el aviso va **después** del `if/elif/fi`, así que se emite en todos los
+builds. Verificado además que el perfil está cargado cuando
+`deploy_runtime_tuning` corre (`load_profile` en el pipeline, línea 1616, muy
+antes), que es lo que hace que `mac_desactivado` tenga respuesta en vez de callar
+por prudencia.
+
+1 test nuevo (5/5 del bloque `mac`) que exige que la llamada no esté dentro de la
+rama de `$cambios`. **689 ok / 0 fail**.
+
 ## [27.35.2] - 2026-10-03
 
 **La poda que acompañaba al backup del UKI borraba todos los backups, siempre,

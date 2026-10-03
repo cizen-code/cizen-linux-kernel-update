@@ -170,7 +170,7 @@ export LC_ALL=C
 #     deje de describir un estado que el power-profiles-daemon sobrescribe y el
 #     fallback sin PPD no degrade a EPP 255.
 # No se toca el motor: la cmdline se hereda, no se genera.
-SCRIPT_VERSION="27.35.2"
+SCRIPT_VERSION="27.35.3"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -12354,11 +12354,19 @@ deploy_runtime_tuning() {
     ok "Ajuste de runtime: $iguales fichero(s) ya estaban al día"
   elif [ "$cambios" -gt 0 ]; then
     ok "Ajuste de runtime: $cambios escrito(s), $nuevos nuevo(s), $iguales sin cambios, $respaldos respaldo(s)"
-    # Aviso de seguridad del §6-B, aquí donde toca: si alguien instala libvirt
-    # con sus perfiles AppArmor después de este build, se quedan inertes.
-    if mac_desactivado SECURITY_APPARMOR; then
-      info "Sin AppArmor en el kernel (v5.19.0): los perfiles AppArmor de libvirt, si los instalas, quedarán inertes sin avisar."
-    fi
+  fi
+
+  # v27.35.3: el aviso de AppArmor estaba DENTRO del elif de "$cambios > 0", así
+  # que solo salía el primer build —el único en que los ficheros de runtime
+  # cambian— y callaba en todos los siguientes. Comprobado en el build de 7.2.9
+  # (3-oct): los tres ficheros ya estaban al día y el aviso no apareció. Es un
+  # aviso sobre el PERFIL del kernel colgado de una condición sobre unos
+  # ficheros de runtime que no tienen nada que ver: después del primer build
+  # desaparecía solo, que es la forma más fácil de que un aviso deje de avisar.
+  # v27.35.1 lo arregló por dentro (la pregunta era correcta) pero lo dejó en el
+  # sitio equivocado, y el sitio equivocado no se ve leyendo la condición.
+  if mac_desactivado SECURITY_APPARMOR; then
+    info "Sin AppArmor en el kernel (v5.19.0): los perfiles AppArmor de libvirt, si los instalas, quedarán inertes sin avisar."
   fi
   return 0
 }
