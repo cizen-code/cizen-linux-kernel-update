@@ -170,7 +170,7 @@ export LC_ALL=C
 #     deje de describir un estado que el power-profiles-daemon sobrescribe y el
 #     fallback sin PPD no degrade a EPP 255.
 # No se toca el motor: la cmdline se hereda, no se genera.
-SCRIPT_VERSION="27.35.0"
+SCRIPT_VERSION="27.35.1"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -12222,6 +12222,21 @@ runtime_tuning_install() { # $1=origen $2=destino
 # Despliega los ficheros de runtime y los aplica sin reiniciar. NO propaga error
 # nunca: un sysctl que no se puede cargar es un ajuste que no se aplica hasta el
 # próximo arranque, y eso no puede convertir un build correcto en fallo.
+mac_desactivado() { # ¿el perfil deja este símbolo de MAC apagado?
+  # Esto NO puede ser un grep del fichero. `grep -qx SECURITY_APPARMOR` no
+  # matcheaba nunca, porque el perfil no lista "SYM n" sino "SYM" "SYM2" dentro
+  # de un array, y -x exige la línea entera: el aviso de seguridad del §6-B
+  # llevaba desde v27.34.0 sin emitirse una sola vez. Se lee el array que el
+  # motor ya tiene, y si el perfil no está cargado no se dice nada, porque un
+  # aviso que miente entrena a ignorarlo.
+  local sym="$1" s
+  declare -p OPTS_DISABLE >/dev/null 2>&1 || return 1
+  for s in "${OPTS_DISABLE[@]}"; do
+    [ "$s" = "$sym" ] && return 0
+  done
+  return 1
+}
+
 deploy_runtime_tuning() {
   if [ "${CIZEN_RUNTIME_TUNING:-1}" = "0" ]; then
     info "Ajuste de runtime: omitido por CIZEN_RUNTIME_TUNING=0"
@@ -12313,8 +12328,8 @@ deploy_runtime_tuning() {
     ok "Ajuste de runtime: $cambios escrito(s), $nuevos nuevo(s), $iguales sin cambios, $respaldos respaldo(s)"
     # Aviso de seguridad del §6-B, aquí donde toca: si alguien instala libvirt
     # con sus perfiles AppArmor después de este build, se quedan inertes.
-    if grep -qx 'SECURITY_APPARMOR' "$PROFILE_FILE" 2>/dev/null; then
-      info "Sin MAC en el kernel (v5.19.0): los perfiles AppArmor de libvirt, si los instalas, quedarán inertes sin avisar."
+    if mac_desactivado SECURITY_APPARMOR; then
+      info "Sin AppArmor en el kernel (v5.19.0): los perfiles AppArmor de libvirt, si los instalas, quedarán inertes sin avisar."
     fi
   fi
   return 0

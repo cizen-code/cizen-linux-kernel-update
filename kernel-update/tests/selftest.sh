@@ -7194,6 +7194,45 @@ if [ -f "$PGOF" ]; then
 fi
 rec ok "pgo: fusion: $_mg/8 pruebas de la fusión de perfiles PGO"
 
+# ═══ v27.35.1: el aviso de AppArmor no se emitía nunca ═══
+# `grep -qx SECURITY_APPARMOR` sobre el perfil no matchea: el perfil lista los
+# símbolos como "SYM" "SYM2" dentro de un array, y -x exige la línea entera. Un
+# aviso de seguridad que nunca sale es peor que no tenerlo, porque en el log
+# parece que seavisó.
+_mg_mac=0
+if declare -f mac_desactivado >/dev/null 2>&1 || grep -q '^mac_desactivado() {' "$MOTOR"; then
+  sed -n '/^mac_desactivado() {/,/^}/p' "$MOTOR" > "$ROOT/mac.sh"
+  if bash -c 'set -Eeuo pipefail; . "$1"
+    OPTS_DISABLE=("SECURITY_SELINUX" "SECURITY_APPARMOR")
+    mac_desactivado SECURITY_APPARMOR' _ "$ROOT/mac.sh" >/dev/null 2>&1; then
+    rec ok "mac: el aviso de AppArmor sale cuando el perfil lo desactiva"; _mg_mac=$((_mg_mac+1))
+  else
+    rec fail "mac: con AppArmor en OPTS_DISABLE el aviso no sale (el grep -x no matcheaba)"
+  fi
+  if bash -c 'set -Eeuo pipefail; . "$1"
+    OPTS_DISABLE=("SUSPEND")
+    mac_desactivado SECURITY_APPARMOR' _ "$ROOT/mac.sh" >/dev/null 2>&1; then
+    rec fail "mac: el aviso de AppArmor sale aunque el perfil NO lo desactive"
+  else
+    rec ok "mac: sin AppArmor en la lista el aviso calla (no avisa de lo que no sabe)"; _mg_mac=$((_mg_mac+1))
+  fi
+  # Sin perfil cargado no se dice nada: un aviso que miente entrena a ignorarlo.
+  if bash -c 'set -Eeuo pipefail; . "$1"
+    unset OPTS_DISABLE
+    mac_desactivado SECURITY_APPARMOR' _ "$ROOT/mac.sh" >/dev/null 2>&1; then
+    rec fail "mac: sin perfil cargado el aviso afirma que AppArmor está apagado sin saberlo"
+  else
+    rec ok "mac: sin perfil cargado el aviso calla en vez de suponer"; _mg_mac=$((_mg_mac+1))
+  fi
+  # Y el bug original, por si alguien lo reintroduce como grep.
+  if grep -q "grep -qx 'SECURITY_APPARMOR'" "$MOTOR"; then
+    rec fail "mac: el aviso ha vuelto al grep -x que no matchea con el array del perfil"
+  else
+    rec ok "mac: el aviso ya no depende del grep -x que nunca matcheó"; _mg_mac=$((_mg_mac+1))
+  fi
+fi
+rec ok "mac: $_mg_mac/4 pruebas del aviso de AppArmor"
+
 # --- resumen ---
 echo
 printf 'Totales: %d ok, %d fail\n' "$PASS" "$FAIL"

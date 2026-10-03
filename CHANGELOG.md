@@ -1,3 +1,34 @@
+## [27.35.1] - 2026-10-03
+
+**El aviso de seguridad que decía «si instalas libvirt, sus perfiles AppArmor
+quedarán inertes sin avisar» no se emitía nunca. Y no por culpa del aviso.**
+
+Desde v27.34.0 el motor comprueba si AppArmor está apagado con
+
+```
+grep -qx 'SECURITY_APPARMOR' "$PROFILE_FILE"
+```
+
+y eso **no matchea jamás**. El perfil no lista `SECURITY_APPARMOR n`: lista
+`"SECURITY_SELINUX" "SECURITY_APPARMOR" "SECURITY_SMACK" …`, los símbolos como
+palabras entrecomilladas de un array repartidas en varias líneas, y `-x` exige
+que la línea entera sea exactamente eso. El aviso llevaba una versión entera
+sin decir nada, y el log parecía el de un despliegue que sí avisa.
+
+Se sustituye por `mac_desactivado()`, que lee el array `OPTS_DISABLE` que el
+motor ya tiene cargado en memoria. La diferencia de fondo no es el `grep`: es que
+la pregunta correcta («¿este símbolo está apagado?») la responde el estado del
+perfil, no una coincidencia de texto en un fichero cuyo formato no es el que el
+grep daba por supuesto.
+
+Si el perfil no está cargado, la función **no dice nada**. Un aviso que afirma
+que AppArmor está apagado sin haberlo comprobado sería un aviso que puede
+mentir, y un aviso que miente entrena a ignorarlo —que es exactamente el daño
+que causaba el `grep`.
+
+4 tests nuevos, uno de ellos el bug original por si vuelve a colarse un grep:
+**679 ok / 0 fail**.
+
 ## [27.35.0] - 2026-10-03
 
 **`pgo-collect.sh --merge`: fusionar varias capturas de PGO en un perfil, sin
