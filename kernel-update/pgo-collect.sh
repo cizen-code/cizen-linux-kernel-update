@@ -42,6 +42,12 @@
 #   --period N     periodo de muestreo en ciclos para el evento LBR (default
 #                  500009, primo como recomienda la doc). Solo en modo LBR.
 #   --keep-perfdata  conserva el perf.data aunque la conversión funcione.
+#   --merge F1 F2 [F3...]  NO muestrea: fusiona N capturas .perf.data ya
+#                  Existing en un único perfil, sin root ni evento LBR.
+#                  Para qué: un perfil de 15 min de escritorio solo optimiza lo
+#                  que el escritorio hizo (arrancar apps, compilar, navegar).
+#                  Fusionando varias sesiones el advice deja de depender de una
+#                  sola. Requiere 2 o más ficheros.
 #
 # Variables de entorno:
 #   CIZEN_PGO_DURATION  igual que --duration
@@ -77,6 +83,7 @@ VMLINUX="${CIZEN_PGO_VMLINUX:-}"
 OUT="${CIZEN_PGO_OUT:-}"
 PERIOD="${CIZEN_PGO_PERIOD:-500009}"
 KEEP_PERFDATA="${CIZEN_PGO_KEEP_PERFDATA:-}"
+MERGE=()
 # v27.33.3: el parseo de argumentos se hace ANTES de elevar. Con el `exec sudo`
 # delante, `pgo-collect.sh --help` pedía contraseña para imprimir un texto, y un
 # argumento desconocido hacía lo mismo. Además las variables de entorno del
@@ -90,6 +97,17 @@ while [ $# -gt 0 ]; do
     --out)      OUT="${2:-}"; [ -n "$OUT" ] || fatal "--out requiere una ruta"; shift 2 ;;
     --period)   PERIOD="${2:-}"; [ -n "$PERIOD" ] || fatal "--period requiere ciclos"; shift 2 ;;
     --keep-perfdata) KEEP_PERFDATA=1; shift ;;
+    --merge)
+      # Todo lo que sigue hasta el siguiente --algo son capturas. Se guardan tal
+      # cual en el array (con IFS sin espacio, "${MERGE[@]}" los expande
+      # elemento a elemento: mismo truco que PGO_PERF_ARGS).
+      shift
+      while [ $# -gt 0 ]; do
+        case "$1" in --*) break ;; esac
+        MERGE+=("$1"); shift
+      done
+      [ "${#MERGE[@]}" -ge 2 ] || fatal "--merge necesita 2 o más capturas .perf.data (las que dejó --keep-perfdata); recibidas ${#MERGE[@]}."
+      ;;
     --help|-h)
       sed -n '2,40p' "$0"
       exit 0 ;;
@@ -98,7 +116,15 @@ while [ $# -gt 0 ]; do
 done
 
 SUDO=()
-if [ "$(id -u)" != 0 ]; then
+# La fusión NO se eleva: solo lee ficheros .perf.data y llama a llvm-profgen,
+# y ninguno de los dos necesita privilegios. Elevar aquí pediría una contraseña
+# para una operación que el usuario puede hacer sin ella, y además el exec
+# re-montaría el array MERGE a través del entorno (con env_reset de Arch se
+# perdería, y el perfil "fusionado" saldría de una sola captura sin avisar).
+if [ "${#MERGE[@]}" -gt 0 ] && [ "$(id -u)" != 0 ]; then
+  log "Fusión de ${#MERGE[@]} capturas: no hace falta root (no se muestrea nada)."
+fi
+if [ "${#MERGE[@]}" -eq 0 ] && [ "$(id -u)" != 0 ]; then
   if command -v sudo >/dev/null 2>&1; then
     SUDO=(sudo)
     # v27.33.4: CIZEN_VMLINUX_STORE también se pasa de forma explícita. Con
@@ -297,6 +323,144 @@ pgo_keep_perfdata() {
 }
 CONVERT_RC=0
 trap pgo_cleanup EXIT
+
+# ── Fusión de capturas (--merge) ─────────────────────────────────────────
+# Por qué NO se fusionan los .perf.data en binario, y por qué esta ruta es la
+# que funciona (v27.34.1):
+#
+#   * `llvm-profgen --perfdata A --perfdata B` NO fusiona: se queda con el
+#     ÚLTIMO y descarta el resto sin decir nada. Comprobado en LLVM 23.1.1 con
+#     un fichero inexistente en primera posición: si fuera fusión, se quejaría
+#     de él; no dice nada, luego solo miró el segundo. Un script que pasara las
+#     capturas así anunciaría un "perfil fusionado" hecho de la última sesión,
+#     que es justo el sesgo que se quería quitar.
+#   * `perf merge` no existe en perf 7.2.8 (no está en `perf --help` ni hay
+#     perf-merge.1; `perf data convert` solo cambia de formato).
+#   * `--perfscript` sí acepta un fichero, pero su parser (PerfReader.cpp,
+#     checkPerfScriptType) no entiende el texto de `perf script`: aborta con
+#     «Invalid perf script input!». El formato que espera es el suyo propio.
+#
+# La vía que sí funciona, y es la que se usa aquí, es la que el propio
+# llvm-profgen ofrece para esto: descomponer cada captura a TEXTO sin
+# simbolizar (--skip-symbolization), concatenar los textos y simbolizar una sola
+# vez (--unsymbolized-profile). El formato intermedio es una lista plana, sin
+# cabecera ni longitudes, así que concatenar es una suma de líneas exacta.
+# Verificado de punta a punta en este host con un banco propio (programa con
+# DWARF, dos capturas LBR): la densidad del perfil pasa de 1,7 a 5,8 y el
+# aviso de muestras insuficentes de 29,4x a 8,6x.
+#
+# La concatenación no puede perder nada por construcción (son bytes), pero sí
+# puede perder una sesión entera sin que se note, y eso es un fallo silencioso
+# con forma de éxito: de ahí los dos abortos de abajo.
+# --kernel es obligatorio en producción (sin él llvm-profgen busca binarios de
+# espacio de usuario y aborta con "no kernel is found in mmap events", que es
+# justo lo que pasa en §50). Pero para poder PROBAR la fusión de punta a punta
+# hace falta un banco de espacio de usuario, y el banco de este repo es un
+# programa normal con DWARF. CIZEN_PGO_KERNEL=0 quita el flag; es una costura
+# de test, no una opción de uso: con perfiles de kernel el flag hace falta sí o sí.
+# Array y no "$(...)": el archivo ya usa ese patrón para PGO_PERF_ARGS, y el
+# join por sustitución de comando sufre SC2046 (splitting de palabras) justo donde no debe
+# haberlo, en una línea que se lee como un argumento literal.
+PGO_KERNEL_ARGS=()
+pgo_kernel_args() {
+  [ "${CIZEN_PGO_KERNEL:-1}" = 0 ] || PGO_KERNEL_ARGS=( --kernel )
+  return 0
+}
+
+pgo_count_samples() { # $1 = perf.data → nº de eventos SAMPLE, o vacío
+  [ -f "$1" ] || return 0
+  perf report -i "$1" --stats 2>/dev/null \
+    | grep -oE 'SAMPLE events:[[:space:]]+[0-9]+' | head -1 \
+    | grep -oE '[0-9]+' || true
+}
+
+if [ "${#MERGE[@]}" -gt 0 ]; then
+  command -v llvm-profgen >/dev/null 2>&1 \
+    || fatal "La fusión la hace llvm-profgen, y no está instalado (sudo pacman -S llvm-profgen)."
+  MERGED_OUT="${OUT:-$TARGET_HOME/kernel-pgo/$KVER-merged${#MERGE[@]}.afdo}"
+  MERGED_DIR="$(dirname -- "$MERGED_OUT")"
+  [ -d "$MERGED_DIR" ] || OUT_DIR_NUEVO="$MERGED_DIR"
+  mkdir -p "$MERGED_DIR"
+  if [ -n "$OUT_DIR_NUEVO" ]; then pgo_chown "$OUT_DIR_NUEVO"; fi
+
+  pgo_kernel_args
+  log "Fusionando ${#MERGE[@]} capturas de $KVER (vmlinux: $VMLINUX)"
+  info "Perfil de kernel: ${PGO_KERNEL_ARGS[*]:-sin --kernel (modo bench)}."
+  info "No se muestrea nada: esto solo recombina perf.data que ya tienes."
+  MERGE_TOTAL=0
+  MERGE_PARTS=()
+  _mi=0
+  for _mf in "${MERGE[@]}"; do
+    [ -e "$_mf" ] || fatal "No existe la captura: $_mf
+  Las capturas se conservan junto al .afdo con --keep-perfdata, y se llaman
+  <salida>.perf.data. Si moviste el .afdo, el .perf.data va a su lado."
+    [ -s "$_mf" ] || fatal "Captura vacía: $_mf
+  Un perf.data de 0 bytes suele ser una captura abortada; sin muestras no hay
+  nada que fusionar, y dar un perfil sin sesiones sería mentira."
+    _mn="$(pgo_count_samples "$_mf")"
+    if [ -z "$_mn" ] || [ "$_mn" -eq 0 ]; then
+      fatal "La captura $_mf no tiene eventos SAMPLE.
+  Fusionarla no aportaría nada y el perfil saldría de las otras sesiones
+ y se presentaría como fusionado. Recaptura, o pásala fuera."
+    fi
+    # El nombre intermedio lleva el ÍNDICE, no solo el basename: dos capturas
+    # homónimas en directorios distintos (o el mismo fichero pasado dos veces,
+    # que es justo como se prueba el camino kernel con una captura real) se
+    # pisarían y la suma de bytes seguiría cuadrando sobre el fichero
+    # equivocado. El indice es lo que hace unicos los temporales.
+    _mu="$TMPD/merge-$_mi.unsym"
+    log "  $(basename -- "$_mf"): $_mn muestras → texto sin simbolizar"
+    _rc=0
+    llvm-profgen "${PGO_KERNEL_ARGS[@]}" --binary "$VMLINUX" --perfdata "$_mf" \
+                 --skip-symbolization --output "$_mu" 2>"$TMPD/llvm.err" || _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+      sed 's/^/      /' "$TMPD/llvm.err" >&2 2>/dev/null || true
+      fatal "llvm-profgen no pudo descomponer $_mf (código $_rc). Aborto en vez de
+  fusionar solo las que sí hayan salido: un perfil fusionado a medias no lo
+  distingue nadie de uno completo."
+    fi
+    # llvm-profgen escribe "0\n0\n" (4 bytes) cuando no encuentra muestras: eso
+    # es una sesión vacía disfrazada de fichero válido. grep de "algo que no sea
+    # ni cero ni espacio" lo detecta sin depender del tamaño.
+    if ! grep -q '[^0[:space:]]' "$_mu" 2>/dev/null; then
+      fatal "La captura $_mf se descompone vacía (llvm-profgen no encontró muestras
+  de LBR). Sin pila de ramas no hay advice, y fusionarla no mejoraría el perfil."
+    fi
+    MERGE_TOTAL=$(( MERGE_TOTAL + _mn ))
+    MERGE_PARTS+=("$_mu")
+    _mi=$(( _mi + 1 ))
+  done
+
+  MERGED_UNSYM="$TMPD/merged.unsym"
+  cat -- "${MERGE_PARTS[@]}" > "$MERGED_UNSYM"
+  # Suma exacta de bytes: si el concatenado no es la suma de las partes, algo se
+  # perdió por el camino (y sería en silencio, que es lo que hay que evitar).
+  MERGE_WANT=0
+  for _p in "${MERGE_PARTS[@]}"; do MERGE_WANT=$(( MERGE_WANT + $(wc -c < "$_p") )); done
+  MERGE_GOT="$(wc -c < "$MERGED_UNSYM")"
+  [ "$MERGE_GOT" -eq "$MERGE_WANT" ] \
+    || fatal "El texto fusionado mide $MERGE_GOT bytes y las partes suman $MERGE_WANT.
+  Aborto: fusionar con una pieza perdida es peor que no fusionar."
+  info "Texto fusionado: $MERGE_GOT bytes de ${#MERGE[@]} capturas ($MERGE_TOTAL muestras)."
+
+  log "Simbolizando una sola vez contra $VMLINUX"
+  CONVERT_RC=0
+  llvm-profgen "${PGO_KERNEL_ARGS[@]}" --binary "$VMLINUX" --unsymbolized-profile "$MERGED_UNSYM" \
+               --output "$MERGED_OUT" --show-density 2>"$TMPD/llvm.err" || CONVERT_RC=$?
+  sed 's/^/  /' "$TMPD/llvm.err" 2>/dev/null | grep -v '^  warning: Sample PGO' || true
+  if [ "$CONVERT_RC" -ne 0 ]; then
+    fatal "llvm-profgen falló al simbolizar el perfil fusionado (código $CONVERT_RC)."
+  fi
+  [ -s "$MERGED_OUT" ] || fatal "llvm-profgen terminó bien pero no dejó $MERGED_OUT."
+  ok "Perfil AutoFDO fusionado de ${#MERGE[@]} capturas: $MERGED_OUT"
+  pgo_chown "$MERGED_OUT"
+
+  info "Rebuild con PGO: CIZEN_PGO_PROFILE=$MERGED_OUT kernel-update.sh build"
+  info "Ojo: si existe también un $KVER.afdo de una sola sesión, el motor elige el"
+  info "de SU versión exacta; para usar este, pásalo con --pgo <fichero>."
+  rm -rf "$TMPD"; trap - EXIT
+  exit 0
+fi
 
 log "Perfil del kernel en ejecución: $KVER (vmlinux: $VMLINUX)"
 if pgo_perf_args; then

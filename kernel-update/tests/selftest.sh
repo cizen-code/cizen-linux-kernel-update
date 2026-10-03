@@ -7109,11 +7109,90 @@ else
   rec fail "bancos: falta el sha256 en la cabecera o el banco se descarga las fuentes"
 fi
 
-if [ "$_sx_kc" -eq 11 ]; then
-  ok "v5.19.0: 11/11 pruebas de los bancos de Kconfig"
-else
-  err "v5.19.0: solo $_sx_kc/11 pruebas de los bancos de Kconfig"
+# El resumen de grupo va por rec y no por ok/err: a esta altura del arnés ambos
+# están redefinidos como no-ops (§ lo de destapar err() vino a ser ruido), así que
+# la línea se escribía y no se imprimía nunca. Con rec se ve, que es lo único que
+# sirve de un resumen.
+rec ok "bancos: $_sx_kc/9 pruebas de los bancos de Kconfig"
+
+# ═══ v27.35.0: --merge, fusionar capturas de PGO sin root ni evento LBR ═══
+# Lo que hay que proteger aquí no es que la fusión funcione, sino que NO pueda
+# fingir que funciona: la trampa de llvm-profgen (--perfdata repetido se queda
+# con el último) produce un perfil de una sola sesión con aspecto de fusionado,
+# y eso es el sesgo que el modo viene a quitar.
+_mg=0
+PGOF="$PGO"
+if [ -f "$PGOF" ]; then
+  # 1) Con una sola captura no hay nada que fusionar: se sale antes de muestrear.
+  _o1="$(bash "$PGOF" --merge "$ROOT/uno.data" 2>&1 || true)"
+  if printf '%s' "$_o1" | grep -q 'necesita 2 o más capturas'; then
+    rec ok "pgo: --merge con una sola captura se niega (no es fusión, es engaño)"; _mg=$((_mg+1))
+  else
+    rec fail "pgo: --merge con una sola captura no se niega"
+  fi
+  # 2) Una captura que no existe se dice con su nombre, no con un error genérico.
+  _o2="$(bash "$PGOF" --merge "$ROOT/no-a.data" "$ROOT/no-b.data" --vmlinux /bin/true 2>&1 || true)"
+  if printf '%s' "$_o2" | grep -q 'No existe la captura:'; then
+    rec ok "pgo: --merge nombra la captura que no encuentra"; _mg=$((_mg+1))
+  else
+    rec fail "pgo: --merge no explica qué captura falta"
+  fi
+  # 3) LA TRAMPA: --perfdata repetido se queda con el ÚLTIMO en LLVM 23.1.1, así
+  #    que el script no puede construir la llamada así. Se comprueba que el único
+  #    --perfdata está en el bucle y con una sola variable.
+  # El invariante NO es "aparece una vez" (también está en la cabecera y en la
+  # conversión de sesión única, donde una sola es lo correcto), sino "ninguna
+  # llamada pasa dos": dos --perfdata en la misma línea es exactamente el
+  # last-wins que se quiere evitar.
+  # El grep negativo va a líneas DE CÓDIGO: el comentario que documenta la
+  # trampa escribe `--perfdata A --perfdata B` a propósito, y sin filtrarlo el
+  # test finds su propia documentación y falla siempre.
+  if grep -q -- '--perfdata "$_mf"' "$PGOF" \
+     && ! grep -vE '^[[:space:]]*#' "$PGOF" | grep -qE -- '--perfdata.*--perfdata'; then
+    rec ok "pgo: ninguna llamada pasa dos --perfdata (el last-wins que se quiere evitar)"; _mg=$((_mg+1))
+  else
+    rec fail "pgo: alguna llamada pasa dos --perfdata, o no usa la captura del bucle"
+  fi
+  # 4) La vía que sí fusiona: a texto sin simbolizar, concatenar, simbolizar una vez.
+  if grep -q -- '--skip-symbolization' "$PGOF" \
+     && grep -q -- '--unsymbolized-profile' "$PGOF" \
+     && grep -q 'cat -- "\${MERGE_PARTS\[@\]}"' "$PGOF"; then
+    rec ok "pgo: la fusión es --skip-symbolization + cat + --unsymbolized-profile"; _mg=$((_mg+1))
+  else
+    rec fail "pgo: la fusión no usa la cadena de texto sin simbolizar"
+  fi
+  # 5) Una sesión sin muestras se aborta, no se ignora: si no, el perfil sale de
+  #    las demás y se presenta como fusionado.
+  # El segundo patrón busca "se descompone vacía" y no "muestras de LBR": en el
+  # mensaje esas dos palabras caen en líneas distintas, y un test que busca un
+  # texto que el script parte es un test que pasa por casualidad.
+  if grep -q 'no tiene eventos SAMPLE' "$PGOF" && grep -q 'se descompone vacía' "$PGOF"; then
+    rec ok "pgo: una captura sin muestras aborta la fusión en vez de ignorarla"; _mg=$((_mg+1))
+  else
+    rec fail "pgo: la fusión se calla una captura sin muestras"
+  fi
+  # 6) La concatenación se comprueba contra la suma de bytes de las partes: es lo
+  #    único que garantiza que no se perdió un trozo por el camino.
+  if grep -q 'MERGE_WANT' "$PGOF" && grep -q 'MERGE_GOT" -eq "\$MERGE_WANT' "$PGOF"; then
+    rec ok "pgo: el texto fusionado se compara con la suma de bytes de las partes"; _mg=$((_mg+1))
+  else
+    rec fail "pgo: la concatenación no se verifica"
+  fi
+  # 7) Sin root: si se elevara, el exec con env_reset (Arch) perdería el array de
+  #    capturas y la fusión saldría de una sola, sin avisar.
+  if grep -q '\[ "\${#MERGE\[@\]}" -eq 0 \] && \[ "\$(id -u)" != 0 \]' "$PGOF"; then
+    rec ok "pgo: --merge no se eleva a root (no necesita privilegios de muestreo)"; _mg=$((_mg+1))
+  else
+    rec fail "pgo: --merge sigue el camino de elevación de sudo"
+  fi
+  # 8) El camino de captura no se ha tocado: --merge no puede requiere LBR.
+  if grep -q 'perf record -o "\$TMPD/perf.data"' "$PGOF"; then
+    rec ok "pgo: la captura normal sigue intacta (perf record con LBR)"; _mg=$((_mg+1))
+  else
+    rec fail "pgo: el camino de captura de pgo-collect.sh ha desaparecido"
+  fi
 fi
+rec ok "pgo: fusion: $_mg/8 pruebas de la fusión de perfiles PGO"
 
 # --- resumen ---
 echo

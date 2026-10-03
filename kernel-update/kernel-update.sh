@@ -170,7 +170,7 @@ export LC_ALL=C
 #     deje de describir un estado que el power-profiles-daemon sobrescribe y el
 #     fallback sin PPD no degrade a EPP 255.
 # No se toca el motor: la cmdline se hereda, no se genera.
-SCRIPT_VERSION="27.34.0"
+SCRIPT_VERSION="27.35.0"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo

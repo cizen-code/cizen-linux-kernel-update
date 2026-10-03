@@ -1,3 +1,63 @@
+## [27.35.0] - 2026-10-03
+
+**`pgo-collect.sh --merge`: fusionar varias capturas de PGO en un perfil, sin
+root y sin volver a muestrear. Y por qué la vía obvia no funciona.**
+
+Un perfil de 15 min de escritorio solo optimiza lo que el escritorio hizo.
+Fusionar varias sesiones reduce ese sesgo, así que el modo toma N capturas
+`.perf.data` ya existentes y produce un único `.afdo`.
+
+**No se fusionan los `.perf.data` en binario, y no es por elección:** en LLVM
+23.1.1 `llvm-profgen --perfdata A --perfdata B` se queda con el **último** y
+descarta el resto sin decir nada. Se comprobó con un fichero inexistente en
+primera posición: si fuera fusión se quejaría de él, y no dice nada. Un script
+que pasara las capturas así anunciaría un perfil «fusionado» hecho de la última
+sesión, que es justo el sesgo que se vino a quitar. `perf merge` tampoco existe
+en perf 7.2.8, y `--perfscript` aborta con «Invalid perf script input!» porque
+su parser (`PerfReader.cpp`, `checkPerfScriptType`) no entiende el texto de
+`perf script`.
+
+La vía que sí funciona es la del propio llvm-profgen: descomponer cada captura
+a texto sin simbolizar (`--skip-symbolization`), concatenar los textos y
+simbolizar una sola vez (`--unsymbolized-profile`). El formato intermedio es
+una lista plana sin cabecera, así que concatenar es una suma exacta.
+
+Verificado de punta a punta con un banco propio (programa con DWARF, dos
+capturas LBR): 50 + 50 muestras, 2576 bytes = la suma exacta de las partes, y
+la densidad del perfil pasa de **1,7 a 5,8** mientras el aviso de muestras
+insuficientes baja de 29,4x a 8,6x.
+
+Tres fallos que la fusión tenía que hacer ruidosos, porque todos producen un
+perfil con **apariencia** de fusionado:
+
+- Una captura sin eventos SAMPLE **aborta**: si no, el perfil saldría de las
+  demás sesiones y se presentaría como completo.
+- Una captura que se descompone vacía (llvm-profgen escribe `0\n0\n`) aborta
+  igual, en vez de aportar cero muestras sin decirlo.
+- El texto concatenado se compara con la **suma de bytes de las partes**. Si no
+  cuadra, aborta.
+
+Y `--merge` **no se eleva a root**: solo lee ficheros y llama a llvm-profgen.
+Elevar askiría contraseña para nada, y el `exec sudo` con `env_reset` de Arch
+perdería el array de capturas por el camino — otro perfil de una sola sesión,
+esta vez sin avisar.
+
+9 tests nuevos. Uno comprueba que `--perfdata` no aparece dos veces en una misma
+línea de código (el grep filtra los comentarios, porque el que documenta la
+trampa escribe `--perfdata A --perfdata B` a propósito). Arnés: **674 ok /
+0 fail** en el repo, **673 ok / 0 fail** instalado.
+
+**Lo que NO está verificado, y no se da por bueno**: la vuelta completa con una
+captura real de kernel. El banco de §27.35.0 usa un binario de espacio de usuario
+con DWARF, que valida el algoritmo (la descomposición, la concatenación, la
+suma exacta de bytes y la densidad) pero no el `--kernel`, que es cosa de
+llvm-profgen. La captura real de 484 MB de §50 y el `vmlinux` con símbolos que
+haría falta ya **no están en disco**, y rehacerlos pide `perf record -a`, que
+necesita root y no está en el allowlist. Con lo que hay, `--merge` sobre capturas
+de kernel no se ha probado de punta a punta: se ha probado la fusión, y se ha
+comprobado que `--kernel` se pasa y que llvm-profgen rechaza entradas que no son
+de kernel («Kernel is requested, but no kernel is found in mmap events»).
+
 ## [27.34.0] - 2026-10-03
 
 **El §7 del documento de optimización no tenía ninguna forma de llegar al
@@ -11,8 +71,9 @@ Kconfig real de 7.2.9.**
 cdn.kernel.org, `sha256 b4c5dfbe…d8d8ba`, verificado contra `sha256sums.asc`,
 con `scripts/config` + `make olddefconfig`—, **solo 14 son necesarios**:
 
-- **Bloque A**: `SUSPEND`, `HIBERNATION`. Apagan 11 en cascada
-  (`ACPI_SLEEP`, `PM_SLEEP_SMP`, `HIBERNATION_COMP_LZO`, …). Se pierden
+- **Bloque A**: `SUSPEND`, `HIBERNATION`. Los tres bloques juntos apagan 57
+  símbolos fuera de sus listas (ver "la cascada no es «11 símbolos»" más
+  abajo). Se pierden
   `systemctl suspend` y `systemctl hibernate`; en un sobremesa sin tapa ni
   batería el coste es nulo.
 - **Bloque B**: `SECURITY_SELINUX`, `SECURITY_APPARMOR`, `SECURITY_SMACK`,
