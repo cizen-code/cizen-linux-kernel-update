@@ -6601,6 +6601,210 @@ else
   err "v27.33.8: solo $_sx_v27_33_8/5 pruebas de la guarda anti-root"
 fi
 
+# ============================================================
+# v27.33.9: archivo local del UKI para rollback.
+#
+# Contexto real: el UKI del ESP es `-rwx------ root`, así que una copia hecha con
+# `sudo cp` sin `chown` acaba root 700 en el home del usuario: inútil para un
+# rollback. Y `~/kernel-pgo/ukis/` puede contener cosas del usuario que la poda
+# no debe tocar. Estos tests fijan las tres cosas: que se archive legible, que se
+# poden a N, y que la poda no salga de su subdirectorio.
+# ============================================================
+_sx_v27_33_9=0
+
+# _sx_nsc extrae de VERIFY_SRC; estas funciones están en el motor.
+_sx_fnm() { sed -n "/^$1() {/,/^}/p" "$MOTOR"; }
+_SX_ARC="$(_sx_fnm uki_archive_current)"
+if [ -n "$_SX_ARC" ]; then
+  rec ok "uki_archive_current existe y es extraíble"
+  _sx_v27_33_9=$(( _sx_v27_33_9 + 1 ))
+else
+  rec fail "uki_archive_current no existe o no es extraíble: el UKI nuevo no se archivaría para rollback"
+fi
+
+# Sonda: stubs + la función real tal cual. `sudo` se stubea como FUNCIÓN (bash
+# da prioridad a las funciones sobre el PATH), de modo que `sudo install ...`
+# acaba siendo `install ...` y se puede probar sin ser root.
+{
+  cat <<'PROBE'
+set -Eeuo pipefail
+IFS=$'\n\t'
+VERSION="7.2.9"; LOCALVERSION_SUFFIX="-cizen-v3"; PKGREL="${FAKEPKGREL:-1}"
+CIZEN_UKI_KEEP="${FAKEKEEP:-1}"
+CIZEN_UKI_KEEP_DIR="$ARCDIR"; CIZEN_UKI_KEEP_SUBDIR="auto"; CIZEN_UKI_KEEP_N="${FAKEKEEPN:-2}"
+FAKE_UKI="$FAKEUKI"
+ok(){ printf 'ok: %s\n' "$*"; }
+warn(){ printf 'warn: %s\n' "$*"; }
+info(){ :; }
+sudo(){ [ "$1" = sudo ] && shift; "$@"; }
+find_cizen_uki_targets(){ printf '%s\n' "$FAKE_UKI"; }
+cizen_uki_efi_name(){ printf 'arch-linux-cizen-v3.efi'; }
+cizen_uki_has_sig_section(){ [ -s "$1" ] || return 1; command -v objdump >/dev/null 2>&1 || return 2; objdump -h "$1" 2>/dev/null | grep -qE '[.][sS][iI][gG]'; }
+if [ "${LIESTAT:-0}" = 1 ]; then
+  # Miente SOLO del tamaño del origen: si mintiera también del destino, los dos
+  # valores casarían y la comprobación de descuadre no vería nada.
+  stat(){ local a; for a in "$@"; do if [ "$a" = "$FAKE_UKI" ]; then echo 999999; return 0; fi; done; command stat "$@"; }
+fi
+PROBE
+  printf '%s\n' "$_SX_ARC"
+  printf 'uki_archive_current\necho "RC=$?"\n'
+} > "$ROOT/arc-probe.sh"
+
+# --- B: archiva legible y con el contenido intacto ---
+_ARC="$ROOT/arc"; mkdir -p "$_ARC"
+_UKI="$ROOT/uki-falso.efi"
+printf 'UKI-DE-PRUEBA\n%.0s' $(seq 1 500) > "$_UKI"
+_out="$(ARCDIR="$_ARC" FAKEUKI="$_UKI" bash "$ROOT/arc-probe.sh" 2>&1 || true)"
+_f="$(find "$_ARC/auto" -name 'uki-*.efi' 2>/dev/null | head -1)"
+if [ -n "$_f" ] && [ -r "$_f" ] && [ "$(stat -c '%a' "$_f")" = 644 ] && cmp -s "$_f" "$_UKI"; then
+  rec ok "archiva el UKI en auto/ con modo 644 y el contenido intacto (leible sin sudo)"
+  _sx_v27_33_9=$(( _sx_v27_33_9 + 1 ))
+else
+  rec fail "no archiva un UKI legible e intacto en auto/ (fichero='$_f' modo=$( [ -n "$_f" ] && stat -c '%a' "$_f" 2>/dev/null || echo -)) salida: $(printf '%s' "$_out" | tr '\n' '|')"
+fi
+# La etiqueta debe llevar pkgrel: dos builds con el mismo uname -r son distintos
+# (v27.33.7) y un rollback necesita poder distinguirlos.
+if printf '%s' "$_f" | grep -q 'uki-7\.2\.9-cizen-v3-1-'; then
+  rec ok "la etiqueta del archivo incluye pkgrel (uki-7.2.9-cizen-v3-1-...)"
+  _sx_v27_33_9=$(( _sx_v27_33_9 + 1 ))
+else
+  rec fail "la etiqueta no incluye pkgrel: '$_f'. Dos builds con el mismo uname -r quedarían indistinguibles"
+fi
+if printf '%s' "$_out" | grep -q 'RC=0'; then
+  rec ok "uki_archive_current termina en RC=0: un respaldo fallido no puede tumbar el build"
+  _sx_v27_33_9=$(( _sx_v27_33_9 + 1 ))
+else
+  rec fail "uki_archive_current no devuelve 0 (salida: $(printf '%s' "$_out" | tr '\n' '|')): un fallo de archivado rompería el build ya instalado"
+fi
+
+# --- C: poda a N=2, quedándose con las dos más recientes ---
+_ARC2="$ROOT/arc2"; mkdir -p "$_ARC2"
+# Cada build escribe un UKI de prueba con un distintivo distinto, y el mtime se
+# fija a mano: los tres archivos caen en el mismo segundo y la poda ordena por
+# mtime, así que sin esto el test no sería determinista. El fichero de cada
+# iteración se localiza por su CONTENIDO, no con 'find | head -1', que con dos
+# candidatos ya no sabe cuál es el recién creado.
+for i in 1 2 3; do
+  printf 'build-%s\n' "$i" > "$_UKI"
+  ARCDIR="$_ARC2" FAKEUKI="$_UKI" FAKEPKGREL="$i" bash "$ROOT/arc-probe.sh" >/dev/null 2>&1 || true
+  _got="$(grep -l "build-$i" "$_ARC2"/auto/uki-*.efi 2>/dev/null | head -1)"
+  [ -n "$_got" ] && touch -d "2026-01-0$i 00:00:00" "$_got"
+done
+_n="$(find "$_ARC2/auto" -name 'uki-*.efi' 2>/dev/null | wc -l)"
+_keep_cur="$(grep -l 'build-3' "$_ARC2"/auto/uki-*.efi 2>/dev/null | wc -l)"
+_keep_prev="$(grep -l 'build-2' "$_ARC2"/auto/uki-*.efi 2>/dev/null | wc -l)"
+_gone_old="$(grep -l 'build-1' "$_ARC2"/auto/uki-*.efi 2>/dev/null | wc -l)"
+if [ "$_n" -eq 2 ] && [ "$_keep_cur" -eq 1 ] && [ "$_keep_prev" -eq 1 ] && [ "$_gone_old" -eq 0 ]; then
+  rec ok "poda a 2: tras tres builds quedan la anterior y la actual, y la vieja se borra"
+  _sx_v27_33_9=$(( _sx_v27_33_9 + 1 ))
+else
+  rec fail "la poda no deja la anterior y la actual (hay $_n; actual=$_keep_cur anterior=$_keep_prev, la más vieja sigue=$_gone_old)"
+fi
+
+# --- D: la poda no toca lo que hay alrededor ---
+_ARC3="$ROOT/arc3"; mkdir -p "$_ARC3/auto"
+printf 'copia manual del usuario\n' > "$_ARC3/arch-linux-cizen-v3.efi"
+printf 'notas\n' > "$_ARC3/auto/notes.txt"
+for i in 1 2 3; do
+  printf 'build-%s\n' "$i" > "$_UKI"
+  ARCDIR="$_ARC3" FAKEUKI="$_UKI" FAKEPKGREL="$i" bash "$ROOT/arc-probe.sh" >/dev/null 2>&1 || true
+  _g="$(find "$_ARC3/auto" -name 'uki-*.efi' | head -1)"; [ -n "$_g" ] && touch -d "2026-01-0$i" "$_g"
+done
+if [ -f "$_ARC3/arch-linux-cizen-v3.efi" ] && [ -f "$_ARC3/auto/notes.txt" ]; then
+  rec ok "la poda no toca la copia manual de ukis/ ni un .txt dentro de auto/"
+  _sx_v27_33_9=$(( _sx_v27_33_9 + 1 ))
+else
+  rec fail "la poda se ha comido algo del usuario: manual=$([ -f "$_ARC3/arch-linux-cizen-v3.efi" ] && echo ok || echo BORRADO) notes=$([ -f "$_ARC3/auto/notes.txt" ] && echo ok || echo BORRADO)"
+fi
+
+# --- E: copia que no cuadra con el origen -> se borra, no se deja ---
+_ARC4="$ROOT/arc4"; mkdir -p "$_ARC4"
+printf 'contenido\n' > "$_UKI"
+_out4="$(ARCDIR="$_ARC4" FAKEUKI="$_UKI" LIESTAT=1 bash "$ROOT/arc-probe.sh" 2>&1 || true)"
+if [ -z "$(find "$_ARC4" -name 'uki-*.efi' 2>/dev/null)" ] && printf '%s' "$_out4" | grep -q 'RC=0'; then
+  rec ok "si el tamaño no cuadra, borra la copia en vez de dejar un backup truncado"
+  _sx_v27_33_9=$(( _sx_v27_33_9 + 1 ))
+else
+  rec fail "deja una copia que no cuadra con el original (quedan $(find "$_ARC4" -name 'uki-*.efi' 2>/dev/null | wc -l))"
+fi
+
+# --- F: se puede desactivar ---
+_ARC5="$ROOT/arc5"; mkdir -p "$_ARC5"
+ARCDIR="$_ARC5" FAKEUKI="$_UKI" FAKEKEEP=0 bash "$ROOT/arc-probe.sh" >/dev/null 2>&1 || true
+if [ -z "$(find "$_ARC5" -name 'uki-*.efi' 2>/dev/null)" ]; then
+  rec ok "CIZEN_UKI_KEEP=0 desactiva el archivado"
+  _sx_v27_33_9=$(( _sx_v27_33_9 + 1 ))
+else
+  rec fail "CIZEN_UKI_KEEP=0 no desactiva nada: se archivan ficheros"
+fi
+
+# --- G: un N no numérico en el entorno no rompe la poda ---
+_ARC6="$ROOT/arc6"; mkdir -p "$_ARC6"
+for i in 1 2 3; do
+  printf 'build-%s\n' "$i" > "$_UKI"
+  ARCDIR="$_ARC6" FAKEUKI="$_UKI" FAKEPKGREL="$i" FAKEKEEPN=lars bash "$ROOT/arc-probe.sh" >/dev/null 2>&1 || true
+  _g="$(find "$_ARC6/auto" -name 'uki-*.efi' | head -1)"; [ -n "$_g" ] && touch -d "2026-01-0$i" "$_g"
+done
+if [ "$(find "$_ARC6/auto" -name 'uki-*.efi' 2>/dev/null | wc -l)" -eq 2 ]; then
+  rec ok "un CIZEN_UKI_KEEP_N no numérico cae a 2 en vez de romper la aritmética"
+  _sx_v27_33_9=$(( _sx_v27_33_9 + 1 ))
+else
+  rec fail "con CIZEN_UKI_KEEP_N='lars' quedan $(find "$_ARC6/auto" -name 'uki-*.efi' 2>/dev/null | wc -l) ficheros: la poda no sanea el valor"
+fi
+
+# --- H: regresión de uki_backup_prev, que llevaba años sin hacer nada ---
+_BP="$(_sx_fnm uki_backup_prev)"
+if printf '%s' "$_BP" | grep -q 'find_cizen_uki_targets "\$(cizen_uki_efi_name)"'; then
+  rec ok "uki_backup_prev pasa el nombre del UKI: antes 'find -iname \"\"' no encontraba nada y no respaldaba nunca"
+  _sx_v27_33_9=$(( _sx_v27_33_9 + 1 ))
+else
+  rec fail "uki_backup_prev sigue llamando a find_cizen_uki_targets sin nombre: el backup de /var/lib está muerto"
+fi
+# El motivo de cambiar `cp` por `install -m644` NO es el allowlist (cp sí está en
+# §3): es que `cp` sin -p hereda el modo del origen, y el UKI del ESP es 700.
+if printf '%s' "$_BP" | grep -q 'install -m644'; then
+  rec ok "uki_backup_prev copia con 'install -m644': \`cp\` sin -p heredaría el 700 del UKI del ESP"
+  _sx_v27_33_9=$(( _sx_v27_33_9 + 1 ))
+else
+  rec fail "uki_backup_prev vuelve a copiar con 'cp': la copia heredaría el modo 700 del UKI del ESP y sería ilegible"
+fi
+# --- I: el UKI del ESP está en un directorio 0700 root ---
+# Con `[ -s "$tgt" ]` a secas, el usuario no puede ni hacer stat del fichero: el
+# test da FALSO para todos los targets, el bucle no itera y la función no
+# archiva NADA sin decir nada. Los tests unitarios no lo ven porque su UKI de
+# mentira sí es legible; lo detectó una ejecución real contra el ESP de este
+# equipo. Aquí se fija el requisito en el texto, que es lo que se puede fijar.
+if printf '%s' "$_SX_ARC" | grep -q 'sudo test -s'; then
+  rec ok "uki_archive_current comprueba el tamaño con 'sudo test -s': con /boot/EFI/Linux en 0700 root, un [ -s ] a secas se salta la lista entera"
+  _sx_v27_33_9=$(( _sx_v27_33_9 + 1 ))
+else
+  rec fail "uki_archive_current usa '[ -s ]' sin sudo: con el ESP en 0700 root el test da falso y no se archiva ninguna UKI"
+fi
+# Y que no juzgue la firma: en esta máquina /boot es 0077 y `sbctl verify` no
+# lista la UKI del ESP, así que un veredicto basedo en la sección .sig daría un
+# "no arrancará" falso en cada build.
+if printf '%s' "$_SX_ARC" | grep -q 'cizen_uki_has_sig_section "$dst"'; then
+  rec fail "uki_archive_current juzga la firma por la sección .sig: aquí esa señal no es fiable y daría un aviso falso en cada build"
+else
+  rec ok "uki_archive_current no juzga la firma por la sección .sig (la verifica 'sbctl sign', un exit code que no miente)"
+  _sx_v27_33_9=$(( _sx_v27_33_9 + 1 ))
+fi
+
+_sx_l_arc="$(grep -n '^[[:space:]]*uki_archive_current$' "$MOTOR" | tail -1 | cut -d: -f1)"
+_sx_l_fpo="$(grep -n '^FULL_PIPELINE_OK=true$' "$MOTOR" | head -1 | cut -d: -f1)"
+if [ -n "$_sx_l_arc" ] && [ "$_sx_l_arc" -lt "$_sx_l_fpo" ]; then
+  rec ok "la llamada va antes de FULL_PIPELINE_OK: un respaldo fallido no ensucia el veredicto del build"
+  _sx_v27_33_9=$(( _sx_v27_33_9 + 1 ))
+else
+  rec fail "la llamada a uki_archive_current no está antes de FULL_PIPELINE_OK (arc=$_sx_l_arc fpo=$_sx_l_fpo)"
+fi
+
+if [ "$_sx_v27_33_9" -eq 14 ]; then
+  ok "v27.33.9: 14/14 pruebas del archivo local del UKI"
+else
+  err "v27.33.9: solo $_sx_v27_33_9/14 pruebas del archivo local del UKI"
+fi
+
 # --- resumen ---
 echo
 printf 'Totales: %d ok, %d fail\n' "$PASS" "$FAIL"

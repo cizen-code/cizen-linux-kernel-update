@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.33.8 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.33.9 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / XFS / systemd / KVM-libvirt / QEMU-OVMF
 #
@@ -170,7 +170,7 @@ export LC_ALL=C
 #     deje de describir un estado que el power-profiles-daemon sobrescribe y el
 #     fallback sin PPD no degrade a EPP 255.
 # No se toca el motor: la cmdline se hereda, no se genera.
-SCRIPT_VERSION="27.33.8"
+SCRIPT_VERSION="27.33.9"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -517,6 +517,15 @@ CIZEN_MODULE_SIGN_DIR="${CIZEN_MODULE_SIGN_DIR:-/etc/cizen/kernel-sign}"
 # Backup del UKI anterior en cada sincronización: 1 (default) | 0.
 CIZEN_UKI_BACKUP="${CIZEN_UKI_BACKUP:-1}"
 CIZEN_UKI_BACKUP_DIR="${CIZEN_UKI_BACKUP_DIR:-/var/lib/kernel-update/uki-backups}"
+# v27.33.9: archivo local del UKI RECIÉN COMPILADO, ya firmado, en el home del
+# usuario y sin sudo, para poder hacer rollback a mano. Conserva los N más
+# recientes (2 = la anterior y la actual). Es distinto de CIZEN_UKI_BACKUP, que
+# deja la anterior en un directorio de root y solo sirve como red si la
+# sobrescritura del ESP sale mal.
+CIZEN_UKI_KEEP="${CIZEN_UKI_KEEP:-1}"
+CIZEN_UKI_KEEP_DIR="${CIZEN_UKI_KEEP_DIR:-$HOME/kernel-pgo/ukis}"
+CIZEN_UKI_KEEP_SUBDIR="${CIZEN_UKI_KEEP_SUBDIR:-auto}"
+CIZEN_UKI_KEEP_N="${CIZEN_UKI_KEEP_N:-2}"
 # Auditoría LUKS/FDE en cada build (integración; avisa si el root cifrado
 # carece del parámetro cryptdevice/rd.luks). No cifra nada en el arranque.
 CIZEN_LUKS_AUDIT="${CIZEN_LUKS_AUDIT:-0}"
@@ -11892,6 +11901,15 @@ install_kernel_package() {
 }
 
 # v27.30.0 (feature LinuxLocker): respalda el UKI previo a sobrescribirlo.
+# v27.33.9: este NO hacía nada. find_cizen_uki_targets se llamaba SIN argumento y
+# `find -iname ""` no encuentra ningún fichero (los otros tres call sites sí
+# pasan $(cizen_uki_efi_name)), así que el bucle no iteraba nunca y
+# /var/lib/kernel-update/uki-backups quedaba creado y vacío. Arreglado pasando el
+# nombre. La copia pasa a `install -m644` en vez de `cp`: no por el allowlist
+# (`cp` sí está en §3, verificado con sudo -n -l) sino porque `cp` sin -p hereda
+# el modo del origen, y el UKI del ESP es 700 — una copia de 700 es ilegible.
+# Lo que sigue NO es un rollback cómodo: son copias de root en un directorio de
+# sistema. Para eso está uki_archive_current, más abajo.
 uki_backup_prev() {
   [ "$CIZEN_UKI_BACKUP" = "1" ] || return 0
   local tgt dst rel n
@@ -11900,14 +11918,16 @@ uki_backup_prev() {
     sudo mkdir -p "$CIZEN_UKI_BACKUP_DIR" || { warn "No se pudo crear $CIZEN_UKI_BACKUP_DIR; se omite el backup del UKI."; return 0; }
   fi
   while IFS= read -r tgt; do
-    [ -s "$tgt" ] || continue
+    # `sudo test -s`, no `[ -s ]`: con /boot/EFI/Linux en 0700 root el test sin
+    # privilegios da falso y este bucle tampoco habría iterated nunca.
+    sudo test -s "$tgt" || continue
     dst="$CIZEN_UKI_BACKUP_DIR/$(basename "$tgt").before-$rel-$(date +%Y%m%d-%H%M%S)"
-    if sudo cp -f "$tgt" "$dst" 2>/dev/null; then
+    if sudo install -m644 -- "$tgt" "$dst" 2>/dev/null; then
       ok "UKI previo respaldado en $dst"
     else
       warn "No se pudo respaldar el UKI previo en $dst."
     fi
-  done < <(find_cizen_uki_targets 2>/dev/null || true)
+  done < <(find_cizen_uki_targets "$(cizen_uki_efi_name)" 2>/dev/null || true)
   # Poda defensiva: conservar solo las 8 copias mas recientes por nombre.
   for f in $(sudo find "$CIZEN_UKI_BACKUP_DIR" -type f -name '*.efi.before-*' 2>/dev/null || true); do
     n=1
@@ -11916,6 +11936,103 @@ uki_backup_prev() {
     done
     [ "$n" = 0 ] || sudo rm -f -- "$f" 2>/dev/null || true
   done
+  return 0
+}
+
+# ============================================================
+# v27.33.9: archivo local del UKI recién compilado, para rollback.
+#
+# `uki_backup_prev` deja la UKI ANTERIOR en /var/lib, de root y con nombres
+# `.before-`: es buena red si la sobrescritura del ESP sale mal, pero no sirve
+# para volver atrás a mano, porque el UKI del ESP es `-rwx------ root` y sus
+# copias también. Esto archiva la UKI NUEVA, ya firmada, en el home del usuario,
+# legible y sin sudo, y conserva solo las N más recientes (N=2 → la anterior y la
+# actual). Con una N y una archivada basta: cada build deja una, y podar a 2
+# deja siempre el par.
+#
+# Tres detalles que no son negociables:
+#   * Se copia con `install -m644`, no con `cp`: ambos están en el allowlist
+#     (§3), pero `cp` sin -p HEREDA el modo del origen y el UKI del ESP es 700,
+#     así que una copia hecha con `cp` sale 700 — ilegible sin sudo, que es el
+#     defecto que motiva esta función. Sin `-f`: el `install` de GNU no acepta
+#     esa opción (es de BSD) y aborta con "opción inválida -- 'f'".
+#   * Se devuelve el dueño al usuario con `chown` (también en el allowlist). Sin
+#     esto el archivo es de root y el usuario no lo puede borrar ni restaurar.
+#   * La poda NUNCA sale del subdirectorio propio ni toca ficheros que no
+#     empiecen por `uki-`. Un `rm *.efi` en `~/kernel-pgo/ukis/` se llevaría por
+#     delante la copia manual que el usuario tenga ahí, que es justo el fichero
+#     que se quiere conservar.
+# ============================================================
+uki_archive_current() {
+  [ "$CIZEN_UKI_KEEP" = "1" ] || return 0
+  local dir name tgt dst ts lbl owner ogid src_size dst_size n=0 f
+  local -a _files=()
+  # Un N no numérico rompería la aritmética de la poda; se sanea aquí y no en el
+  # default, para que un valor malo en el entorno no tumbe el build.
+  [[ "$CIZEN_UKI_KEEP_N" =~ ^[0-9]+$ ]] && [ "$CIZEN_UKI_KEEP_N" -ge 1 ] || CIZEN_UKI_KEEP_N=2
+  dir="$CIZEN_UKI_KEEP_DIR/$CIZEN_UKI_KEEP_SUBDIR"
+  owner="${SUDO_USER:-$(id -un)}"
+  ogid="$(id -g)"
+  name="$(cizen_uki_efi_name)"
+  [ -n "$name" ] || { warn "No se conoce el nombre del UKI; no se archiva copia local."; return 0; }
+  # La etiqueta lleva pkgrel, no solo uname -r: dos builds distintos pueden
+  # llamarse igual (v27.33.7) y un rollback necesita saber cuál es cuál.
+  lbl="$VERSION$LOCALVERSION_SUFFIX-$PKGREL"
+  ts="$(date +%Y%m%d-%H%M%S)"
+  if ! mkdir -p -- "$dir" 2>/dev/null; then
+    warn "No se pudo crear $dir; no se archiva copia local del UKI."
+    return 0
+  fi
+  while IFS= read -r tgt; do
+    # `sudo test -s` y no `[ -s ]`: /boot/EFI/Linux es 0700 root, así que sin
+    # privilegios el test da FALSO para todos los targets y la función se
+    # saltaba la lista entera sin archivar nada ni avisar. `test` está en el
+    # allowlist (§3). Lo mismo lleva uki_backup_prev, con el mismo defecto.
+    [ -n "$tgt" ] && sudo test -s "$tgt" || continue
+    dst="$dir/uki-$lbl-$ts-$(basename "$tgt")"
+    src_size="$(sudo stat -c '%s' -- "$tgt" 2>/dev/null || echo 0)"
+    if ! sudo install -m644 -- "$tgt" "$dst" 2>/dev/null; then
+      warn "No se pudo archivar el UKI en $dst."
+      continue
+    fi
+    sudo chown "$owner:$ogid" -- "$dst" 2>/dev/null || \
+      warn "Copia creada en $dst, pero no pude dejar el dueño en $owner: el rollback pediría sudo."
+    # Una copia truncada es peor que ninguna: es lo mismo que no tener backup y
+    # además lo esconde. Se comprueba el tamaño contra el origen. Y una copia
+    # vacía se descarta sin comparar nada.
+    dst_size="$(stat -c '%s' -- "$dst" 2>/dev/null || echo 0)"
+    if [ "$dst_size" -le 0 ]; then
+      warn "La copia local del UKI sale vacía: borro $dst, no sirve para un rollback."
+      rm -f -- "$dst" 2>/dev/null || true
+      continue
+    fi
+    if [ "$src_size" -gt 0 ] && [ "$dst_size" != "$src_size" ]; then
+      warn "La copia local del UKI no cuadra con el original ($src_size → $dst_size B): borro $dst, no sirve para un rollback."
+      rm -f -- "$dst" 2>/dev/null || true
+      continue
+    fi
+    ok "UKI archivado para rollback: $dst"
+    # DELIBERADAMENTE no se juzga aquí si la copia está firmada. La firma ya la
+    # verifica el código de salida de `sbctl sign`, que no devuelve 0 si no
+    # firmó, y ese veredicto es el de arriba. La sección .sig no sirve como
+    # señal en esta máquina: /boot es 0077 y `sbctl verify` ni siquiera lista la
+    # UKI del ESP, así que un guard que la contradijera daría un "no arrancará"
+    # falso en cada build — y un aviso que miente entrena a ignorarlo. Es la
+    # misma cautela que ya documenta cizen_uki_has_sig_section.
+  done < <(find_cizen_uki_targets "$name" 2>/dev/null || true)
+
+  # Poda por mtime, no por nombre: la etiqueta lleva la versión y "7.2.10"
+  # ordenaría ANTES que "7.2.9" en una comparación de texto, así que un
+  # "sort | head -n -N" sobre el nombre podaría la copia equivocada.
+  mapfile -t _files < <(find "$dir" -maxdepth 1 -type f -name 'uki-*.efi' -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
+  for f in "${_files[@]:-}"; do
+    [ -n "$f" ] || continue
+    n=$(( n + 1 ))
+    if [ "$n" -gt "$CIZEN_UKI_KEEP_N" ]; then
+      rm -f -- "$f" 2>/dev/null || warn "No se pudo borrar la copia antigua $f."
+    fi
+  done
+  info "Copias locales del UKI en $dir (conservadas $CIZEN_UKI_KEEP_N más recientes)."
   return 0
 }
 
@@ -12265,6 +12382,18 @@ if [ "$DO_SIGN_UKI" = true ]; then
   # para revisarlo a mano, sin convertir ruido en alarma.
   info "Firmas: el veredicto lo dio 'sbctl sign' (ver arriba). Revisión manual: sudo sbctl verify"
 fi
+
+# Archivo local del UKI nuevo para rollback (v27.33.9). Solo si la
+# sincronización fue bien: si falló, el ESP conserva el UKI ANTERIOR y archivarlo
+# como si fuera el de este build sería mentira. No se ejecuta antes de
+# FULL_PIPELINE_OK para que un fallo de archivado no ensucie el veredicto, y la
+# función no propaga error nunca.
+if [ "$UKI_SYNC_FAILED" = false ] && [ "$CIZEN_UKI_SYNC_FAILED" = false ]; then
+  uki_archive_current
+else
+  warn "No archivo copia local del UKI: la sincronización falló y el ESP conserva el UKI anterior."
+fi
+
 FULL_PIPELINE_OK=true
 
 if [ "$CIZEN_PKG_BACKEND" = "arch" ]; then

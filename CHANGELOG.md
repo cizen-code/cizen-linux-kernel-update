@@ -1,3 +1,61 @@
+## [27.33.9] - 2026-10-03
+
+**El UKI del ESP es `-rwx------ root`: una copia hecha con `sudo cp` al home del
+usuario sale root 700, ilegible sin sudo e inútil justo para lo que se copia,
+que es un rollback.**
+
+Al preparar el build del kernel 7.2.9 se pidió respaldar la UKI antes de
+reiniciar, porque con `CleanMethod=KeepCurrent` el paquete anterior no queda en la
+pacman y no hay UKI de rollback en `/var/lib/kernel-update/uki-backups`. La copia
+manual quedó `root root` y modo 700: el usuario no podía leerla. Y el backup que
+la suite dice hacer desde v27.30.0 **no estaba haciendo nada**, por dos motivos
+independientes.
+
+- **`uki_backup_prev` nunca ha respaldado nada.** Se llamaba a
+  `find_cizen_uki_targets` **sin argumento**, y `find -iname ""` no encuentra
+  ningún fichero, así que el bucle no iteraba nunca. Los otros tres call sites sí
+  pasan `$(cizen_uki_efi_name)`. Por eso `/var/lib/kernel-update/uki-backups`
+  estaba creado y vacío: no es que el backup estuviera desactivado, es que la
+  búsqueda no encontraba el UKI. Arreglado pasando el nombre. Y la copia cambia de
+  `cp` a `install -m644`, pero **no por el allowlist**: `cp` sí está en él
+  (`sudo -n -l` lo confirma, y §49 ya lo decía bien). Es por el modo — `cp` sin
+  `-p` hereda el del origen, y el del UKI del ESP es 700.
+
+Lo nuevo es `uki_archive_current`: archiva el UKI **nuevo**, ya firmado, en
+`~/kernel-pgo/ukis/auto/`, legible y sin sudo, conservando los 2 más recientes
+— la anterior y la actual, que es justo el par que hace falta para volver
+atrás. Cada build deja una y podar a 2 mantiene siempre el par.
+
+Tres decisiones que no son negociables:
+
+- **Se copia con `install -m644` y se devuelve el dueño con `chown`.** Los dos
+  están en el allowlist de §3. El modo importa tanto como el dueño: `cp` sin
+  `-p` hereda el del origen, y el del UKI del ESP es 700 — que es exactamente el
+  defecto que hizo inútil la copia manual. `install` lleva **sin** `-f`: el de
+  GNU no acepta esa opción (es de BSD) y aborta con `opción inválida -- 'f'`. Un
+  test cazó eso; en producción habría caído como un simple `warn` de "no se pudo
+  archivar" que no dice nada del motivo.
+- **La poda no sale del subdirectorio propio ni toca ficheros que no empiecen por
+  `uki-`.** Un `rm *.efi` en `~/kernel-pgo/ukis/` se llevaría por delante la
+  copia manual del usuario, que es justo lo que se quiere conservar.
+- **La poda ordena por mtime, no por nombre.** La etiqueta lleva la versión y
+  `7.2.10` ordenaría antes que `7.2.9` en texto, así que un `sort | head -n -N`
+  podaría la copia equivocada.
+
+La etiqueta incluye **pkgrel** (`uki-7.2.9-cizen-v3-1-…`), no solo `uname -r`:
+dos builds distintos pueden llamarse igual (v27.33.7) y un rollback necesita
+saber cuál es cuál. Y una copia cuyo tamaño no cuadre con el original se **borra**
+en vez de archivarse: un backup truncado es peor que ninguno, porque además
+esconde que no lo hay.
+
+Se invoca solo si la sincronización fue bien —si falló, el ESP conserva el UKI
+anterior y archivarlo como si fuera el de este build sería mentira—, antes de
+`FULL_PIPELINE_OK` para que un fallo de archivado no ensucie el veredicto, y la
+función nunca propaga error.
+
+12 tests nuevos → **639 ok / 0 fail**. Verificado **por mutación**: cambiar el
+`N` de reserva a 3 hace fallar el test del valor no numérico.
+
 ## [27.33.8] - 2026-10-03
 
 **El motor se lanzaba con `sudo` y perdía el build entero —y la caché caliente—
