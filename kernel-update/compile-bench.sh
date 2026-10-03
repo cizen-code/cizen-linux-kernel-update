@@ -109,7 +109,14 @@ export CCACHE_DISABLE=1
 # mientras corre (ver "--detached" al final). Para probarlo sin más, COMPILE_BENCH_FORCE=1
 # salta la puerta y las cifras que dé van marcadas como no fiables.
 
-PSI_MAX="${COMPILE_BENCH_PSI_MAX:-15}"
+# 2 %, no 15 %. El 15 era una suposición; los datos la refutaron. Dos bloques del
+# MISMO kernel, los mismos flags y el mismo banco: PSI 0,08 % dio 25,19 / 89,42
+# TU/s y PSI 6,67 % dio 23,70 / 72,64. Un 6 % de PSI ya sesgaba el brazo de 4
+# trabajos un 23 %, muy por encima del efecto que se quería medir (un -O3 vale
+# unos pocos puntos). Con el tope en 15 %, la puerta dejaba pasar justo lo que
+# no debe dejar pasar. A 2 % solo entra una máquina de verdad quieta, que es lo
+# que se necesita para que la cifra signifique algo.
+PSI_MAX="${COMPILE_BENCH_PSI_MAX:-2}"
 FORCE="${COMPILE_BENCH_FORCE:-0}"
 PSI=""; LOAD1=""
 
@@ -163,20 +170,36 @@ resumen_datos() {
       for (i = 2; i <= n; i++) { v = a[i]; j = i - 1; while (j > 0 && a[j] > v) { a[j+1] = a[j]; j-- }; a[j+1] = v }
       return (n % 2) ? a[(n+1)/2] : int((a[n/2] + a[n/2 + 1]) / 2)
     }
-    function flush() {
-      if (un >= 0 && par >= 0) { n++; U[n] = un; P[n] = par }
-      else if (un >= 0 || par >= 0) d++
-      un = -1; par = -1
+    # El PSI de cada bloque. Se guarda para no promediar bloques medidos con
+    # distinto ruido: la mediana de 25,19 y 23,70 da 24,45, que no es ninguna de
+    # las dos, y la de 89,42 y 72,64 da 81,03, que es peor que la buena. El
+    # promedio de una medición buena y una contaminada es peor que no medir.
+    function flush(   lo, hi, i) {
+      if (un >= 0 && par >= 0) {
+        if (fiable) { n++; U[n] = un; P[n] = par; PSI[n] = psi }
+        else d++
+      } else if (un >= 0 || par >= 0) d++
+      un = -1; par = -1; psi = -1; fiable = 1
     }
     /^fecha/ { flush(); next }
+    # El PSI de salida va DESPUÉS del "->". "% -> 0.08" son 9 caracteres y el
+    # número empieza en el 6º (índice 5), no en el 4º: con +3 salía "> 0.0", que
+    # awkava a 0, y la columna de PSIneath todos los bloques a cero sin quejarse.
+    /^psi cpu/ { if (match($0, /% -> [0-9.]+/)) { s = substr($0, RSTART + 5, RLENGTH - 5); psi = s + 0 } ; next }
+    /^fiabilidad/ { if ($0 !~ /^fiabilidad   : limpio/) fiable = 0; next }
     /^1 trabajo/ { un = tus(); next }
     /^[0-9]+ trabajos/ { par = tus(); next }
-    END { flush(); printf "%d %d %s %s\n", n + 0, d + 0, (n ? med(U, n) : "?"), (n ? med(P, n) : "?") }
+    END {
+      flush()
+      lo = -1; hi = -1
+      for (i = 1; i <= n; i++) { if (lo < 0 || PSI[i] < lo) lo = PSI[i]; if (hi < 0 || PSI[i] > hi) hi = PSI[i] }
+      printf "%d %d %s %s %s %s\n", n + 0, d + 0, (n ? med(U, n) : "?"), (n ? med(P, n) : "?"), (lo >= 0 ? lo : "?"), (hi >= 0 ? hi : "?")
+    }
   ' "$1"
 }
 
 resumen() {
-  local f base var kver fecha n desc un par
+  local f base var kver fecha n desc un par psilo psihi
   printf '%-24s %-26s %-20s %3s %5s %10s %10s\n' \
     kernel variante "primera medición" n desc "1 trabajo" "N trabajos"
   shopt -s nullglob
@@ -184,10 +207,17 @@ resumen() {
     base="$(basename "$f" .txt)"; base="${base#compile-bench-}"
     # <kernel>__<variante>: el kernel puede llevar guiones, la variante no.
     var="${base##*__}"; kver="${base%__$var}"
-    read -r n desc un par <<<"$(resumen_datos "$f")"
+    read -r n desc un par psilo psihi <<<"$(resumen_datos "$f")"
     fecha="$(grep -m1 '^fecha' "$f" | sed -E 's/^fecha *: *//; s/T[0-9:.-]+//')"
-    printf '%-24s %-26s %-20s %3s %5s %8s TU/s %8s TU/s\n' \
-      "$kver" "$var" "$fecha" "$n" "$desc" "$un" "$par"
+    printf '%-24s %-26s %-20s %3s %5s %8s TU/s %8s TU/s  %5s-%s%%\n' \
+      "$kver" "$var" "$fecha" "$n" "$desc" "$un" "$par" "$psilo" "$psihi"
+    # Si los bloques de una misma variante se midieron con ruidos muy distintos,
+    # su mediana mezcla dos condiciones y no es comparable con nada. Se avisa en
+    # vez de dejar el número ahí, que es justo el fallo que motivó esto.
+    if [ "$n" -ge 2 ] 2>/dev/null; then
+      awk -v lo="$psilo" -v hi="$psihi" 'BEGIN{exit !(lo+0>0 && hi+0 > lo+0*5 + 0.5)}' && \
+        echo "    ⚠ los bloques van de ${psilo}% a ${psihi}% de PSI: la mediana mezcla ruido. No la compares con nada."
+    fi
   done
   shopt -u nullglob
   echo
