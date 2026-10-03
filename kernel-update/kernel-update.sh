@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.33.3 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.33.8 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / XFS / systemd / KVM-libvirt / QEMU-OVMF
 #
@@ -170,7 +170,7 @@ export LC_ALL=C
 #     deje de describir un estado que el power-profiles-daemon sobrescribe y el
 #     fallback sin PPD no degrade a EPP 255.
 # No se toca el motor: la cmdline se hereda, no se genera.
-SCRIPT_VERSION="27.33.7"
+SCRIPT_VERSION="27.33.8"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -10400,6 +10400,41 @@ fi
 if [ "$DO_CHANGELOG" = true ]; then
   changelog_bump || exit 1
   exit 0
+fi
+
+# ============================================================
+# v27.33.8: el motor se ejecuta como USUARIO, nunca con `sudo`.
+#
+# El motor necesita privilegios (montar el tmpfs, `pacman -U`, sbctl, chown) y
+# los pide él mismo con `sudo` en el punto exacto, después de su `sudo -v` del
+# preflight. Por eso `cizen-build` va sin sudo, y así se han ejecutado siempre
+# los builds que funcionaron.
+#
+# Lanzarlo con `sudo` rompía el build por dos vías independientes, y el aviso
+# que se veía era solo el final de la primera:
+#   1. `make pacman-pkg` invoca `makepkg`, que aborta si EUID==0 con
+#      "Ejecutar makepkg como superusuario no está permitido ya que puede causar
+#      daños permanentes y catastróficos a su sistema" → Error 10. Se pierde el
+#      build entero, sin aviso previo y sin poder instalar el paquete.
+#   2. Con sudo, HOME pasa a /root, así que el `ccache` y la caché de fuentes
+#      caen en /root/.cache: se ignora la caché caliente del usuario y el build
+#      deja de ser incremental, que es justo lo que lo hace rápido. Además se
+#      pierde el estado en ~/.local/state/kernel-update, y el tmpfs se monta con
+#      uid=0 dejando un árbol que el usuario no puede reutilizar ni borrar.
+#
+# La guarda va AQUÍ, después de los modos de mantenimiento sin build
+# (--selftest/--changelog/--hardened), que sí son válidos como root, y antes de
+# prepare_dirs: a partir de ese punto todo modo acaba tocando makepkg.
+# ============================================================
+if [ "$(id -u)" = "0" ]; then
+  fatal "Este motor se ejecuta como usuario, NO con sudo.
+  Con sudo fallan dos cosas a la vez:
+    1) 'makepkg' se niega a correr como root y aborta el build al empaquetar.
+    2) HOME pasa a /root, asi que el ccache y la cache de fuentes del usuario se
+       ignoran y el build deja de ser incremental.
+  Repite el comando quitando el sudo inicial. Los tres puntos que si necesitan
+  privilegios (montar el tmpfs, instalar el paquete y firmar la UKI) los pide
+  el motor solo, con su propio 'sudo -v' al inicio."
 fi
 
 prepare_dirs

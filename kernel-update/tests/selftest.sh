@@ -6518,6 +6518,89 @@ else
   rec fail "despliegue: sin bit +x en el repo: $SIN_X"
 fi
 
+# ============================================================
+# v27.33.8: guarda anti-root del motor.
+#
+# Contexto real: el build de 7.2.9 se lanzó como `sudo kernel-update.sh ...` y
+# makepkg abortó con "Ejecutar makepkg como superusuario no está permitido" al
+# empaquetar, tras haber configurado ysquiado todo. Además, y en silencio, el
+# build había corrido con HOME=/root: ccache y la caché de fuentes del usuario
+# se ignoraron. Estos tests fijan las dos propiedades que lo evitan.
+# ============================================================
+_sx_v27_33_8=0
+
+# El motor no es un fichero de funciones, así que no vale _sx_nsc (que extrae de
+# VERIFY_SRC). La guarda es un `if` de primer nivel sin `if` anidados: se extrae
+# del `if` hasta el primer `^fi$`.
+_sx_guard() {
+  awk '
+    /if \[ "\$\(id -u\)" = "0" \]; then/ { ing = 1 }
+    ing { print }
+    ing && /^fi$/ { exit }
+  ' "$MOTOR"
+}
+_SX_GUARD="$(_sx_guard)"
+if [ -n "$_SX_GUARD" ]; then
+  rec ok "el motor tiene guarda anti-root (id -u = 0) y es extraíble"
+  _sx_v27_33_8=$(( _sx_v27_33_8 + 1 ))
+else
+  rec fail "el motor NO tiene guarda anti-root: 'sudo kernel-update.sh' llega hasta makepkg y revienta el build"
+fi
+
+# Posición: DESPUÉS del dispatch de los modos de mantenimiento que no compilan
+# (--selftest/--changelog/--hardened son válidos como root) y ANTES de
+# prepare_dirs, que es el primer punto compartido por todo modo que compila.
+_sx_l_guard="$(grep -n 'if \[ "\$(id -u)" = "0" \]; then' "$MOTOR" | head -1 | cut -d: -f1)"
+_sx_l_chlog="$(grep -n 'changelog_bump || exit 1' "$MOTOR" | head -1 | cut -d: -f1)"
+_sx_l_prep="$(grep -n '^prepare_dirs$' "$MOTOR" | head -1 | cut -d: -f1)"
+if [ -n "$_sx_l_guard" ] && [ -n "$_sx_l_chlog" ] && [ -n "$_sx_l_prep" ] && \
+   [ "$_sx_l_chlog" -lt "$_sx_l_guard" ] && [ "$_sx_l_guard" -lt "$_sx_l_prep" ]; then
+  rec ok "la guarda va tras el dispatch de mantenimiento ($_sx_l_chlog < $_sx_l_guard) y antes de prepare_dirs ($_sx_l_guard < $_sx_l_prep)"
+  _sx_v27_33_8=$(( _sx_v27_33_8 + 1 ))
+else
+  rec fail "la guarda está mal colocada (changelog=$_sx_l_chlog guarda=$_sx_l_guard prepare_dirs=$_sx_l_prep): debe ir entre ambos, o --selftest/--changelog/--hardened quedan bloqueados como root"
+fi
+
+# Comportamiento real, no solo el texto: se ejecuta el bloque con `id` y `fatal`
+# simulados, que es la única forma de probar la rama EUID==0 sin ser root.
+{
+  printf 'id(){ [ "${1:-}" = "-u" ] && echo "${SX_FAKE_UID:-0}"; }\n'
+  printf 'fatal(){ printf "FATAL:%%s\\n" "$*"; exit 42; }\n'
+  printf '%s\n' "$_SX_GUARD"
+  printf 'echo LLEGO_A_PREPARE\n'
+} > "$ROOT/guard-probe.sh"
+
+_sx_out_root="$(SX_FAKE_UID=0 bash "$ROOT/guard-probe.sh" 2>&1 || true)"
+if ! printf '%s' "$_sx_out_root" | grep -q 'LLEGO_A_PREPARE'; then
+  rec ok "como root (uid 0) la guarda aborta antes de prepare_dirs"
+  _sx_v27_33_8=$(( _sx_v27_33_8 + 1 ))
+else
+  rec fail "como root la guarda NO aborta: el build llega a makepkg y muere con Error 10"
+fi
+
+_sx_out_user="$(SX_FAKE_UID=1000 bash "$ROOT/guard-probe.sh" 2>&1 || true)"
+if printf '%s' "$_sx_out_user" | grep -q 'LLEGO_A_PREPARE'; then
+  rec ok "como usuario (uid 1000) la guarda deja continuar: el build normal no se rompe"
+  _sx_v27_33_8=$(( _sx_v27_33_8 + 1 ))
+else
+  rec fail "la guarda aborta tambien como usuario (uid 1000): dejaria el build inutilizable"
+fi
+
+# El mensaje tiene que nombrar LAS DOS causas. Con solo la primera el usuario
+# quita el sudo, compila, y pierde la caché caliente sin enterarse de por qué.
+if printf '%s' "$_sx_out_root" | grep -q 'makepkg' && printf '%s' "$_sx_out_root" | grep -qi 'ccache'; then
+  rec ok "el aviso de root explica las dos causas (makepkg y ccache), no solo la primera"
+  _sx_v27_33_8=$(( _sx_v27_33_8 + 1 ))
+else
+  rec fail "el aviso no menciona a la vez makepkg y ccache: con sudo se pierde la caché caliente sin explicar por qué"
+fi
+
+if [ "$_sx_v27_33_8" -eq 5 ]; then
+  ok "v27.33.8: 5/5 pruebas de la guarda anti-root"
+else
+  err "v27.33.8: solo $_sx_v27_33_8/5 pruebas de la guarda anti-root"
+fi
+
 # --- resumen ---
 echo
 printf 'Totales: %d ok, %d fail\n' "$PASS" "$FAIL"

@@ -1,3 +1,52 @@
+## [27.33.8] - 2026-10-03
+
+**El motor se lanzaba con `sudo` y perdía el build entero —y la caché caliente—
+sin que ninguna de las dos cosas se anunciara.**
+
+El build de `7.2.9` se invocó como `sudo kernel-update.sh 7.2.9 --patch bore
+--clang --no-btf --no-pgo`. Configuró, aplicó BORE y validó el perfil a la
+perfección, y murió al empaquetar:
+
+```
+==> ERROR: Ejecutar makepkg como superusuario no está permitido ya que puede causar
+    daños permanentes y catastróficos a su sistema.
+make[2]: *** [scripts/Makefile.package:155: pacman-pkg] Error 10
+```
+
+Ese `makepkg` no es culpa del paquete que genera el motor: es el motor entero,
+que **está pensado para correr como usuario** y se ha ejecutado así siempre. Los
+tres puntos que necesitan privilegios los pide él solo, con su `sudo -v` del
+preflight: montar el tmpfs (`sudo mount`), instalar el `.pkg`
+(`sudo pacman -U`, línea 11838) y firmar la UKI con `sbctl`.
+
+- **`make pacman-pkg` llama a `makepkg` sin más, y `makepkg` aborta con EUID==0.**
+  No hay bandera para saltárselo. El aviso es además tardío: llega tras la
+  configuración completa, así que el build se pierde entero y no queda paquete
+  que instalar a mano.
+- **Con `sudo`, `HOME` pasa a `/root`.** El log lo delata:
+  `Cache/build: /root/.cache/kernel-kbuild` y
+  `ccache activo: /root/.cache/ccache`. La caché caliente del usuario —9,1 GB,
+  ~50% de aciertos— no se toca, y el build deja de ser incremental, que es
+  exactamente el mecanismo que lo hace rápido.
+- **El tmpfs queda con `uid=0`.** Montado sin `uid=`/`gid=`, el árbol fuente
+  acaba en `root:root` y el usuario ya no puede escribir en él ni borrarlo, así
+  que tampoco sirve para el siguiente intento: hay que desmontar.
+
+El defecto de fondo era que el motor **no tenía ninguna guardia** contra esto.
+Confiaba en que se invocara bien y por eso el fallo se descubre al final y en
+el sitio más caro posible. Ahora aborta antes de `prepare_dirs`, con un mensaje
+que explica las dos causas y no solo la primera.
+
+La guarda va **después** del dispatch de los modos de mantenimiento
+(`--selftest`, `--changelog`, `--hardened`), que no compilan y sí son válidos
+como root, y **antes** de `prepare_dirs`, primer punto que comparten todos los
+modos que acaban tocando `makepkg`. Además `Agente.md` §54.5 —la única sección
+de la bitácora que usaba `sudo`, y justo la que nunca se ejecutó— queda
+corregida; el alias `cizen-build` de `~/.bashrc` ya era correcto y se deja así.
+
+Cinco tests nuevos, uno de ellos **ejecutando** la guarda con `id` y `fatal`
+simulados para poder probar la rama `EUID==0` sin ser root.
+
 ## [27.33.7] - 2026-10-02
 
 **Arrancar un kernel recién compilado no se anunciaba: la identidad del kernel
