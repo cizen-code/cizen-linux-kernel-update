@@ -38,6 +38,27 @@ con `scripts/config` + `make olddefconfig`—, **solo 14 son necesarios**:
   → `n`, 0 módulos. Los MB y segundos que estima el documento **no se afirman**
   hasta que exista la build que los mida.
 
+**Y los dos bancos que son la evidencia de todo eso, versionados**:
+`kconfig-bench.sh` recorre los cuatro bloques del documento contra el Kconfig real
+y separa los cinco casos en que puede estar un símbolo —no existe, ya estaba
+apagado, se apaga en cascada, Kconfig lo rechaza, lo apagó el propio bloque—; y
+`kconfig-validate.sh` replica `validate_config()` del motor, de modo que lo que
+él cantaría en pleno build se ve en un minuto. Los 14 sale de ejecutarlos, no de
+contarlos.
+
+Dos cosas que solo aparecieron al publicar el banco y que cambian el relato:
+
+- **El bloque C del documento está roto tal como está escrito.** `QUOTA` y
+  `QUOTACTL` salen `Kconfig RECHAZA apagarla`, porque el documento lista los
+  síntomas y no las raíces: no menciona `TMPFS_QUOTA`, que es lo que
+  `select`ea `QUOTA` (`fs/Kconfig:238`). Por eso la receta final añade las dos
+  raíces además de los dos síntomas.
+- **La cascada no es «11 símbolos»**: los tres bloques apagan **57** símbolos que
+  no estaban en sus listas, y eso lo cuenta el diff de los dos `.config`. La
+  primera versión del banco Etiquetaba de «cascada» a los símbolos que el propio
+  documento pedía apagar —`AUTOFS_FS` entre ellos—, que es justo lo contrario de
+  una cascada.
+
 Del §7 se aplican **3 claves de memoria y 2 de red**. Los tres sysctl que el
 usuario tiene medidos (`vm.swappiness=10`, `vm.vfs_cache_pressure=100`,
 `vm.watermark_boost_factor=0`) se respetan y se quedan en

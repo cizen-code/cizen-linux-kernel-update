@@ -7016,6 +7016,105 @@ else
   err "v5.19.0: solo $_sx_rt/14 pruebas del ajuste de runtime"
 fi
 
+# ═══ v5.19.0: los dos bancos de Kconfig, que son la evidencia de los 14 símbolos ═══
+# El perfil v5.19.0 se justificaba con 14 símbolos de 65. Ese "de 65" sale de
+# ejecutar un banco contra el Kconfig REAL, así que los bancos se versionan y se
+# comprueban. Aquí NO se ejecutan de verdad ( que no necesitan 1,8 GiB de fuentes), pero sí
+# se comprueba lo que un banco mal escrito haría: tragarse un error en silencio.
+_sx_kc=0
+for _b in kconfig-validate.sh kconfig-bench.sh; do
+  _KB="$(dirname "$MOTOR")/$_b"
+  if [ ! -r "$_KB" ]; then
+    rec fail "bancos: falta $_b junto al motor"
+    continue
+  fi
+  # if/then en vez de "&& rec ok || rec fail": si el brazo bueno llegara a fallar,
+  # el || ejecutaría el fallo y se contaría dos veces. Es el mismo aviso que ya
+  # tienen otras 157 líneas del arnés, pero aquí no hace falta añadir uno más.
+  if bash -n "$_KB" 2>/dev/null; then
+    rec ok "bancos: $_b pasa bash -n"; _sx_kc=$((_sx_kc+1))
+  else
+    rec fail "bancos: $_b no pasa bash -n"
+  fi
+  # Sin el árbol de fuentes tiene que salir con rc=2 y DECIR por qué. Un banco que
+  # se limita a un error de "no such file" deja al usuario creyendo que su perfil
+  # pasa, cuando lo único que ha comprobado es que no encuentra un directorio.
+  # La salida va a $ROOT y NO a "$_KB.salida": al correr desde /usr/local el
+  # directorio del motor es de root, el redirect falla antes de lanzar el banco,
+  # y el test concluye que el banco no explica nada cuando lo que no pudo escribir
+  # fue su propio fichero de salida.
+  _rc=0
+  _salida="$ROOT/$(basename -- "$_KB").salida"
+  KCONFIG_SRC_DIR="$ROOT/no-existe" CIZEN_VERIFY_STATE_DIR="$ROOT/no-estado" \
+    bash "$_KB" >"$_salida" 2>&1 || _rc=$?
+  if [ "$_rc" -eq 2 ] && grep -q 'árbol de fuentes' "$_salida"; then
+    rec ok "bancos: $_b sin fuentes sale con rc=2 explicando que hace falta el Kconfig real"
+    _sx_kc=$((_sx_kc+1))
+  else
+    rec fail "bancos: $_b sin fuentes no explica la falta (rc=$_rc)"
+  fi
+done
+
+# El fallo que estos bancos existen para evitar: `load_config_state()` del motor
+# devuelve el VALOR CRUDO de un int, no un estado y/m/n. Un banco que solo mire
+# y/m/n declara "missing" a HZ=1000 y da por roto un SETVAL correcto.
+if grep -q 'CONFIG_\$1=' "$(dirname "$MOTOR")/kconfig-validate.sh" \
+   && grep -q 'is not set' "$(dirname "$MOTOR")/kconfig-validate.sh"; then
+  rec ok "bancos: kconfig-validate.sh distingue el valor crudo de un int y el 'not set' de un bool"
+  _sx_kc=$((_sx_kc+1))
+else
+  rec fail "bancos: kconfig-validate.sh no tiene las dos reglas de estado del motor"
+fi
+
+# El banco explorador tiene que distinguir "no existe" de "Kconfig lo poda", y para
+# eso necesita el conjunto de símbolos DECLARADOS, generado y cacheado (350 KB que
+# no se versionan). Sin ese paso, los dos casos salen idénticos.
+if grep -q 'menu)?config' "$(dirname "$MOTOR")/kconfig-bench.sh" \
+   && grep -q 'NO EXISTE' "$(dirname "$MOTOR")/kconfig-bench.sh"; then
+  rec ok "bancos: kconfig-bench.sh genera los símbolos declarados y separa 'no existe' de 'podado'"
+  _sx_kc=$((_sx_kc+1))
+else
+  rec fail "bancos: kconfig-bench.sh no genera el conjunto de símbolos declarados"
+fi
+
+# La cascada de verdad es un DIFF de los dos .config, no una etiqueta sobre los
+# símbolos de las listas: el banco solo toca los que están listados, así que un
+# símbolo listado que se apaga lo apagó él, no su raíz. La primera versión del
+# banco llamaba "cascada" justo a eso y era mentira.
+if grep -q 'Efecto cascada real' "$(dirname "$MOTOR")/kconfig-bench.sh" \
+   && grep -q 'EN_LISTA' "$(dirname "$MOTOR")/kconfig-bench.sh"; then
+  rec ok "bancos: la cascada se mide por diff del .config, no por los símbolos listados"
+  _sx_kc=$((_sx_kc+1))
+else
+  rec fail "bancos: la cascada sigue siendo una etiqueta y no un diff"
+fi
+
+# Las cuatro listas del documento maestro, tal cual, para que el banco siga siendo
+# el banco DEL DOCUMENTO y no una lista reescrita que siempre da lo que quiere.
+if grep -q 'QUOTA QFMT_V1 QFMT_V2 QUOTACTL AUTOFS_FS' "$(dirname "$MOTOR")/kconfig-bench.sh" \
+   && grep -q 'SUSPEND HIBERNATION PM_SLEEP' "$(dirname "$MOTOR")/kconfig-bench.sh"; then
+  rec ok "bancos: las listas del documento están transcritas, no reescritas a conveniencia"
+  _sx_kc=$((_sx_kc+1))
+else
+  rec fail "bancos: las listas de símbolos del documento no están en el banco"
+fi
+
+# El banco NO puede descargar 1,8 GiB por su cuenta: la cabecera dice cómo traerlo
+# con su sha256. Un banco que se auto-servía la red sorprendería al usuario.
+if grep -q 'sha256sums.asc' "$(dirname "$MOTOR")/kconfig-validate.sh" \
+   && ! grep -qE '^\s*(curl|wget)\b' "$(dirname "$MOTOR")/kconfig-bench.sh"; then
+  rec ok "bancos: la cabecera explica cómo traer el árbol con su sha256, y no lo baja solo"
+  _sx_kc=$((_sx_kc+1))
+else
+  rec fail "bancos: falta el sha256 en la cabecera o el banco se descarga las fuentes"
+fi
+
+if [ "$_sx_kc" -eq 11 ]; then
+  ok "v5.19.0: 11/11 pruebas de los bancos de Kconfig"
+else
+  err "v5.19.0: solo $_sx_kc/11 pruebas de los bancos de Kconfig"
+fi
+
 # --- resumen ---
 echo
 printf 'Totales: %d ok, %d fail\n' "$PASS" "$FAIL"
