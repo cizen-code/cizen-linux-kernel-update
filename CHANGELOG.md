@@ -1,3 +1,83 @@
+## [27.35.4] - 2026-10-03
+
+**Perfil `cizen-optiplex7050` v5.20.0: XFS pasa de la poda a OBLIGATORIO. El
+kernel no podía montar `/home`, que es XFS, y el motivo llevaba dos builds
+escrito en el sitio equivocado.**
+
+`/home` es XFS de verdad (`/dev/sda3`, `crc=1`, `realtime=none`) y este host
+arranca por UKI verificado, **sin initramfs** que cargue `xfs.ko` a tiempo. Con
+`XFS_FS` apagado el kernel no monta `/home`. Y estaba apagado porque v5.19.0
+metió `XFS_FS` en el `OPTS_DISABLE` del Bloque C, como parte de la receta
+"apago cuotas y XFS". O sea que **no era un fallo de Kconfig: era el perfil
+apagándolo en cada build**, y por eso recompilar no lo arreglaba.
+
+Dos intentos anteriores de arreglarlo no podían funcionar, y conviene dejarlos
+escritos porque los dos son la misma clase de error:
+
+1. `~/perfil-kernel-instalado.txt` **no es el perfil**: es una copia byte a byte
+   de `profiles/linux-7.2.9-cizen-v3.config`, que es la **semilla de la
+   siguiente build** (`choose_base_config` → `promote_base_config`), o sea un
+   *resultado*. Editarla no cambia el kernel; el motor la regenera al final de
+   cada build.
+2. `~/kernel-update-fixed.sh` **no es el motor**: el motor es
+   `/usr/local/bin/kernel-update/kernel-update.sh` (lo fija `KU=` en `.bashrc`).
+   Los tres bloques "Fix XFS" que se le habían añadido además estaban en la
+   rama `else` de `if [ "$CHECK_ONLY" = true ]`, o sea que solo se ejecutaban
+   cuando se **declinaba** compilar.
+
+Cambios: `XFS_FS` y `XFS_POSIX_ACL` a `OPTS_ENABLE`, `XFS_FS` a
+`CRITICAL_OPTS`, y `XFS_FS` fuera de `OPTS_DISABLE`.
+
+**`=y` y no `=m`**, y no por gusto: `XFS_POSIX_ACL` es `bool depends on XFS_FS`,
+así que con XFS en módulo Kconfig lo degrada a `n`. `XFS_POSIX_ACL=y` y
+`XFS_POSIX_ACL=m` son incompatibles.
+
+### Lo que la medición contradijo: el resultado dependía de la BASE
+
+Con el perfil puesto, el banco daba `CONFIG_QUOTACTL=y` como desactivación no
+resuelta. La causa no era la que decía v5.19.0 (`XFS_FS` como raíz de
+`QUOTACTL`): `fs/xfs/Kconfig:80` es el `select` de **`XFS_QUOTA`**, no de
+`XFS_FS`. Y con la base de 7.2.9 promovida se apagaba, pero con
+**`/proc/config.gz`** —el fallback de una build de versión nueva— no, porque ahí
+`GFS2_FS=m` (`fs/gfs2/Kconfig:7`) y `OCFS2_FS` (`fs/ocfs2/Kconfig:8`) también
+devuelven `QUOTA`/`QUOTACTL` a `=y`.
+
+O sea que la receta de v5.19.0 ("los tres juntos o nada") era una lista de
+**síntomas**, no de raíces, y solo cerraba con algunas bases. Como relajar una
+optimización es más barato que ampliar una poda a dos filesystems que nadie
+pidió podar, `QUOTA` y `QUOTACTL` **salen** de `OPTS_DISABLE` (y con ellos
+`XFS_QUOTA`): `/home` va con `noquota` y no hay `quota` instalado, así que no hay
+ningún efecto observable. Lo que sí se apaga es `TMPFS_QUOTA`, que es la raíz de
+verdad y se apaga bien.
+
+Lo mismo, un nivel más abajo: los sub-símbolos de XFS **dependían de la base**,
+porque `olddefconfig` conserva el valor explícito que venga. Con `/proc/config.gz`
+`XFS_SUPPORT_V4`, `XFS_SUPPORT_ASCII_CI`, `XFS_QUOTA` y `XFS_RT` salían `=y`, y
+con las bases promovidas de Cizen salían `=n`: el mismo perfil daba dos kernels
+distintos. Se fijan a `n`, cada uno por su motivo medido:
+
+| Símbolo | Por qué `n` |
+|---|---|
+| `XFS_SUPPORT_V4` | `/home` es `crc=1` (V5). El formato V4 (`crc=0`) está deprecado desde 2025 y es superficie de ataque. |
+| `XFS_SUPPORT_ASCII_CI` | Su propio `help` dice que activarlo hace a XFS vulnerable a ataques de sensibilidad a mayúsculas; `/home` va `ascii-ci=0`. |
+| `XFS_RT` | `/home` va `realtime=none`. |
+| `XFS_QUOTA` | Cuota que no se usa, y raíz que devuelve `QUOTACTL` a `=y`. |
+
+No se tocan `XFS_ONLINE_SCRUB`, `XFS_ONLINE_REPAIR`, `XFS_DRAIN_INTENTS` ni
+`XFS_LIVE_HOOKS`: salen `=y` por default y son los que hacen útiles `xfs_scrub` y
+`xfs_repair` en caliente.
+
+**Verificado contra las TRES bases** que puede usar una build —la promovida de
+7.2.8, la promovida de 7.2.9 y `/proc/config.gz`— y con las tres sale lo mismo:
+**37/37 ENABLE, 14/14 CRITICAL, 320/320 DISABLE, 0 sin resolver, 0 FATAL**, y un
+bloque XFS idéntico. Medir contra una sola base es lo que dejó pasar el
+`QUOTACTL`; §57.7 ya había reprobado eso mismo en los bancos.
+
+Arnés: **684 ok / 5 fail**, y los 5 `fail` son del grupo `rollback` y son
+**preexistentes**: se comprobó con una baseline con el perfil de `HEAD`
+desplegado en las tres rutas, y sale exactamente lo mismo. Este cambio no añade
+ninguna regresión. Los `rollback` quedan pendientes de mirar aparte.
+
 ## [27.35.3] - 2026-10-03
 
 **El aviso de AppArmor de v27.35.1 solo salía el primer build. Estaba en el sitio
