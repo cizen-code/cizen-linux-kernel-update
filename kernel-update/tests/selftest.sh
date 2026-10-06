@@ -7321,6 +7321,91 @@ if [ -s "$ROOT/prune.sh" ]; then
 fi
 rec ok "uki: $_pr/8 pruebas de la poda de backups del UKI"
 
+# ═══ v27.35.6: findmnt -o SOURCE en btrfs devuelve "dev[/@]" y mount no lo entiende ═══
+# El build del 6-oct anunció "No se pudo montar el btrfs top-level; snapshot
+# omitido". Parecía transitorio (¿montaje ocupado?) y no lo era: `findmnt -n -o
+# SOURCE /` devuelve `/dev/sda2[/@]` — el subvolumen entre corchetes — y mount
+# buscaba un bloque llamado literalmente así ("el dispositivo especial
+# /dev/sda2[/@] no existe", rc 32). O sea: el snapshot previo a CADA BUILD se
+# perdía siempre en esta máquina, con un warn que disimulaba que era de sistema.
+_sn=0
+extract_fn create_btrfs_snapshot > "$ROOT/snap-fn.sh"
+cat > "$ROOT/snap-t.sh" <<'SNAPT'
+set -uo pipefail
+FN="$1"
+SANDBOX="$1.d"; rm -rf "$SANDBOX"; mkdir -p "$SANDBOX"
+SNAPSHOT_SUBVOL=".snapshots"; VERSION="7.2.9-cizen-v3"; CIZEN_SNAPSHOT=1
+WARNLOG="$SANDBOX/warn.log"; CALLLOG="$SANDBOX/calls.log"; : > "$WARNLOG"; : > "$CALLLOG"
+# shellcheck disable=SC1090
+. "$FN"
+info() { printf 'INFO %s\n' "$*" >> "$CALLLOG"; }
+ok()   { printf 'OK %s\n' "$*" >> "$CALLLOG"; }
+err()  { printf 'ERR %s\n' "$*" >> "$CALLLOG"; }
+warn() { printf 'WARN %s\n' "$*" >> "$WARNLOG"; }
+findmnt() { case "$*" in *FSTYPE*) echo btrfs ;; *) echo "/dev/sda2[/@]" ;; esac; }
+mktemp() { mkdir -p "$SANDBOX/snap"; printf '%s\n' "$SANDBOX/snap"; }  # el template real es /tmp/cizen-snap.XXXXXX
+sudo() { "$@"; }   # sin privilegios: todo cae en los stubs de abajo
+mount() {          # reproduce el fallo real: el trozo entre corchetes no existe
+  local a dev=""
+  for a in "$@"; do case "$a" in /dev/*) dev="$a" ;; esac; done
+  printf 'MOUNT %s\n' "$dev" >> "$CALLLOG"
+  if [ -n "$dev" ] && [[ "$dev" == *"["* ]]; then
+    printf 'mount: el dispositivo especial %s no existe.\n' "$dev" >&2
+    return 32
+  fi
+  return 0
+}
+btrfs()   { printf 'BTRFS %s\n' "$*" >> "$CALLLOG"; }
+umount()  { return 0; }
+create_btrfs_snapshot
+printf 'mountdev=%s warns=%s snapshots=%s\n' \
+  "$(awk '/^MOUNT /{print $2}' "$CALLLOG" | tail -1)" \
+  "$(grep -c '^WARN' "$WARNLOG" || true)" \
+  "$(grep -c '^BTRFS.*subvolume snapshot' "$CALLLOG" || true)"
+rm -rf "$SANDBOX"
+SNAPT
+if [ -s "$ROOT/snap-fn.sh" ]; then
+  # 1) La función tal como está ahora: monta sobre el dev limpio y hace el snapshot.
+  _r=$(bash "$ROOT/snap-t.sh" "$ROOT/snap-fn.sh" 2>/dev/null)
+  case "$_r" in
+    'mountdev=/dev/sda2 warns=0 snapshots=1')
+      rec ok "snap: monta sobre /dev/sda2 y crea el snapshot readonly"; _sn=$((_sn+1)) ;;
+    *) rec fail "snap: con el motor actual salió '$_r' (esperado mountdev=/dev/sda2 warns=0 snapshots=1)" ;;
+  esac
+  # 2) La misma función SIN la línea que trima el corchete: tiene que volver a
+  #    fallar el montaje y avisar. Si este caso deja de fallar, el test dejó de
+  #    cubrir nada.
+  grep -vF 'topdev="${topdev%%\[*}"' "$ROOT/snap-fn.sh" > "$ROOT/snap-fn-old.sh"
+  if [ -s "$ROOT/snap-fn-old.sh" ]; then
+    _r=$(bash "$ROOT/snap-t.sh" "$ROOT/snap-fn-old.sh" 2>/dev/null)
+    case "$_r" in
+      'mountdev=/dev/sda2[/@] warns=1 snapshots=0')
+        rec ok "snap: sin el recorte vuelve el fallo original (rc 32, warn y sin snapshot)"; _sn=$((_sn+1)) ;;
+      *) rec fail "snap: la versión vieja salió '$_r' (esperado mountdev=/dev/sda2[/@] warns=1 snapshots=0)" ;;
+    esac
+  else
+    rec fail "snap: no pude construir la copia vieja de la función"
+  fi
+  # 3) Y que el recorte siga en el motor, filtrando los comentarios: el propio
+  #    comentario de arriba escribe la línea a propósito.
+  if grep -vE '^[[:space:]]*#' "$MOTOR" | grep -qF 'topdev="${topdev%%\[*}"'; then
+    rec ok "snap: el motor sigue tirando el corchete del SOURCE"; _sn=$((_sn+1))
+  else
+    rec fail "snap: desapareció la línea que limpia el DEVICE de btrfs"
+  fi
+  # 4) Que el aviso no pueda disimular el error de mount: ahora que el montaje
+  #    funciona, el warn solo queda para el caso de verdad (SOURCE vacío).
+  if grep -vE '^[[:space:]]*#' "$MOTOR" | grep -q 'sudo mount -o subvol=/ "\$topdev" "\$tmp" >/dev/null 2>&1'; then
+    rec ok "snap: el montaje sigue tirando de \$topdev ya limpio"; _sn=$((_sn+1))
+  else
+    rec fail "snap: el montaje ya no usa \$topdev (¿volvió a leer SOURCE sin limpiar?)"
+  fi
+else
+  rec fail "snap: no se extrajo create_btrfs_snapshot del motor"
+fi
+rm -f "$ROOT/snap-fn.sh" "$ROOT/snap-fn-old.sh" "$ROOT/snap-t.sh"
+rec ok "snap: $_sn/4 pruebas del snapshot btrfs previo"
+
 # --- resumen ---
 echo
 printf 'Totales: %d ok, %d fail\n' "$PASS" "$FAIL"

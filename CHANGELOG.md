@@ -1,3 +1,45 @@
+## [27.35.6] - 2026-10-06
+
+**El snapshot btrfs previo a cada build se ha perdido SIEMPRE en esta máquina:
+`mount` recibía `/dev/sda2[/@]`. Detectado en el build de 7.2.9 (6-oct).**
+
+El build imprimió `⚠ No se pudo montar el btrfs top-level; snapshot omitido.` y
+tenía toda la pinta de un tropiezo transitorio (ese mismo día el tmpfs del build
+se me quedaba ocupado y tuve que desmontarlo a mano). No lo era: `findmnt -n -o
+SOURCE /` en btrfs devuelve el dispositivo **con el subvolumen entre corchetes** —
+`/dev/sda2[/@]` — y `create_btrfs_snapshot` se lo pasaba a `mount` tal cual, que
+buscaba un bloque llamado literalmente así:
+
+```
+mount: el dispositivo especial /dev/sda2[/@] no existe.   (rc 32)
+```
+
+Con el trozo limpio (`/dev/sda2`) el mismo montaje devuelve 0, así que la función
+entera estaba bien: solo faltaba trinar la llave.
+
+La consecuencia lleva desde **v27.23.0**, cuando entró la función: `/.snapshots`
+existe desde el 20 de septiembre y está **vacío** — ni un `@kernel-*` en toda la
+vida de la suite. Una red de seguridad que no cubría nada, con un `warn` que
+parecía del montaje y era del parsing. (Y por eso este mismo build se anunciara
+con «3 fichero(s) escrito(s), 1 nuevo(s)» pero sin snapshot: el rollback real
+—el `tar.xz` de `rollback/`— funcionaba, el de `.snapshots` nunca llegó a
+existir.)
+
+Arreglo: `topdev="${topdev%%\[*}"` justo después de leer SOURCE (si SOURCE no
+lleva corchete, no se toca nada). El resto de la función ya estaba: los avisos de
+`mkdir` y de `btrfs subvolume snapshot` siguen ahí para el fallo de verdad.
+
+4 tests nuevos (bloque `snap`) que ejecutan `create_btrfs_snapshot` con
+`findmnt`, `mount`, `btrfs`, `mktemp` y `sudo` stubbeados: el montaje tiene que
+llegar con `/dev/sda2` limpio y el snapshot tiene que crearse; además se prueba la
+misma función **sin** el recorte, que tiene que volver a fallar con rc 32, para
+que el test no deje de cubrir nada si alguien lo quita. **694 ok / 0 fail**
+(el selftest por defecto corre contra el motor instalado, así que primero se
+despliega y luego se cuentan).
+
+`SCRIPT_VERSION` 27.35.3 → **27.35.6** (las dos entradas anteriores, [27.35.4] y
+[27.35.5], no tocaban código del motor) y cabecera, que seguía en v27.34.0.
+
 ## [27.35.5] - 2026-10-06
 
 **Perfil `cizen-optiplex7050` v5.21.0 → v5.22.0: las optimizaciones RT-Lite

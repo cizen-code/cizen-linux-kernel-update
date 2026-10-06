@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# kernel-update.sh — Cizen v27.34.0 (PRODUCCIÓN)
+# kernel-update.sh — Cizen v27.35.6 (PRODUCCIÓN)
 # Dell OptiPlex 7050 / Intel Core i5-7500 / HD 630 / Q270
 # 12 GiB DDR4 / Btrfs / XFS / systemd / KVM-libvirt / QEMU-OVMF
 #
@@ -170,7 +170,7 @@ export LC_ALL=C
 #     deje de describir un estado que el power-profiles-daemon sobrescribe y el
 #     fallback sin PPD no degrade a EPP 255.
 # No se toca el motor: la cmdline se hereda, no se genera.
-SCRIPT_VERSION="27.35.3"
+SCRIPT_VERSION="27.35.6"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -8351,6 +8351,13 @@ create_btrfs_snapshot() {
 
   local topdev tmp snapname dst
   topdev="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
+  # v27.35.6: en btrfs `findmnt -o SOURCE` devuelve "dev[/@]" (el subvolumen
+  # entre corchetes), y pasar eso a mount hacía que mount buscara un bloque
+  # llamado literalmente "/dev/sda2[/@]": "el dispositivo especial
+  # /dev/sda2[/@] no existe" (rc 32) y el snapshot se perdía EN CADA BUILD,
+  # con un warn que parecía transitorio y no lo era. Se trima el corchete;
+  # sin subvolumen en SOURCE no hay corchete y no se toca nada.
+  topdev="${topdev%%\[*}"
   [ -n "$topdev" ] || { warn "No se pudo resolver el dispositivo btrfs de /; snapshot omitido."; return 0; }
   tmp="$(mktemp -d /tmp/cizen-snap.XXXXXX 2>/dev/null)" || { warn "No se pudo crear temporal; snapshot omitido."; return 0; }
 
