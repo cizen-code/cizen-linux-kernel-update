@@ -17,13 +17,17 @@ mount: el dispositivo especial /dev/sda2[/@] no existe.   (rc 32)
 Con el trozo limpio (`/dev/sda2`) el mismo montaje devuelve 0, así que la función
 entera estaba bien: solo faltaba trinar la llave.
 
-La consecuencia lleva desde **v27.23.0**, cuando entró la función: `/.snapshots`
-existe desde el 20 de septiembre y está **vacío** — ni un `@kernel-*` en toda la
-vida de la suite. Una red de seguridad que no cubría nada, con un `warn` que
-parecía del montaje y era del parsing. (Y por eso este mismo build se anunciara
-con «3 fichero(s) escrito(s), 1 nuevo(s)» pero sin snapshot: el rollback real
-—el `tar.xz` de `rollback/`— funcionaba, el de `.snapshots` nunca llegó a
-existir.)
+La consecuencia lleva desde **v27.23.0**, cuando entró la función. Montando el
+top-level a mano, **`<top>/.snapshots` —el directorio que la función crea— ni
+siquiera existe**, y no hay ni un `@kernel-*` en todo el top-level: el `mkdir -p`
+de cada build corrió siempre contra un montaje que nunca estuvo ahí. (Cuidado con
+la evidencia fácil: `/.snapshots`, vacío desde el 20 de septiembre, es
+`<top>/@/.snapshots`, y en el top-level hay además un `@snapshots` de snapper del
+mismo día; ninguno de los dos es el suyo, y los tres se parecen.) Una red de
+seguridad que no cubrió nada jamás, con un `warn` que parecía del montaje y era
+del parsing. El rollback que sí funcionaba era el otro (el `tar.xz` de
+`rollback/`), y por eso el aviso costó: anunciaba algo cuya ausencia no molestaba
+a nadie.
 
 Arreglo: `topdev="${topdev%%\[*}"` justo después de leer SOURCE (si SOURCE no
 lleva corchete, no se toca nada). El resto de la función ya estaba: los avisos de
