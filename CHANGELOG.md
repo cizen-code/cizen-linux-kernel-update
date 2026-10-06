@@ -1,3 +1,126 @@
+## [27.35.5] - 2026-10-06
+
+**Perfil `cizen-optiplex7050` v5.21.0 → v5.22.0: las optimizaciones RT-Lite
+(P0 + P1 + P2 + runtime) preparadas de punta a punta, con los tres rebeldes
+medidos contra el Kconfig de 7.2.9 y la cmdline al Nivel 2.**
+
+Sin cambios de código en el motor: todo lo que sigue es perfil, runtime y
+`/etc/kernel/cmdline`.
+
+### El gate se corrió antes de tocar nada
+
+`config` del kernel en marcha (`/proc/config.gz`): **P0, P1 y P2 todos
+APLICAN** — `MAXSMP=y` con `NR_CPUS=8192` y los 6 símbolos debug `=y`; en P1
+los 16 símbolos `=y` y el estado runtime limpio (sin `kexec_load`, sin
+`crashkernel`, `auditd` inactivo, sin `CONFIG_BSD_PROCESS_ACCT`, arranque sin
+`security=`, `/etc/udev/rules.d` vacío); `RT_GROUP_SCHED` ni siquiera existe en
+este Kconfig.
+
+### Cambios en el perfil
+
+| Array | v5.21.0 | v5.22.0 |
+|---|---|---|
+| `OPTS_DISABLE` | 340 | **368** (+28) |
+| `OPTS_ENABLE` | 38 | **45** (+7 anclas) |
+| `OPTS_SETVAL` | 29 | **30** (`NR_CPUS=8`) |
+| `CRITICAL_OPTS` | 14 | **13** (`SCHED_AUTOGROUP` fuera) |
+
+`SCHED_AUTOGROUP` sale de `CRITICAL_OPTS` y pasa a `OPTS_DISABLE`: dejarlo como
+crítico haría que `validate_config` lo reportara insatisfecho en cada build, ya
+que la Fase 4 lo poda.
+
+`NR_CPUS=8` sobrevive porque `apply_config_requests` (`kernel-update.sh:2116`)
+manda **todos los `--disable` antes que los `--set-val`**: al revés,
+`olddefconfig` repondría 8192.
+
+### Los tres rebeldes se midieron, no se supusieron
+
+El primer `--check` devolvió **374/377 desactivaciones resueltas** y exactamente
+tres sin resolver, los tres candidatos que el procedimiento anticipaba:
+
+| Símbolo | Por qué Kconfig lo devuelve a `=y` |
+|---|---|
+| `MODULE_DEBUGFS` | `bool` sin prompt (`kernel/module/Kconfig:26`); lo levanta `select MODULE_DEBUGFS` de `MODULE_UNLOAD_TAINT_TRACKING` (`Kconfig:153`, `=y` aquí) |
+| `STACKDEPOT` | `bool` sin prompt (`lib/Kconfig:560`, y encima hace `select STACKTRACE`); lo levanta `SLUB_DEBUG` (`=y`) en `mm/Kconfig.debug:52` |
+| `SCHED_SMT` | `select SCHED_SMT if SMP` en `arch/x86/Kconfig:335` con `SMP=y`; el caso «infraestructura x86 SMP» que el procedimiento preveía |
+
+Siguen en `OPTS_DISABLE` (se pidió podarlos) y se añaden a `EXPECTED_REBELS` con
+la razón escrita: la validación pasa de «3 sin resolver» a **«3 rebeldes
+esperados»**. No se fuerzan con `--force`. Recordatorio de v5.21.0: un símbolo
+solo en `EXPECTED_REBELS` y **fuera de `OPTS_DISABLE`** no lo mira nadie.
+
+### Runtime
+
+- **Nuevo `runtime/sysctl.d/99-cizen-rt-lite.conf`**: `dirty_background_bytes`
+  16 MiB, `dirty_bytes` 64 MiB, `dirty_writeback/expire` 500/1500,
+  `compaction_proactiveness=0`, `min_free_kbytes=131072`,
+  `sched_rt_runtime_us=-1`, `perf_cpu_time_max_percent=1`, `netdev_budget`
+  128/4000, `tcp_congestion_control=bbr`, `default_qdisc=fq` (`/etc` manda sobre
+  el `fq_codel` de `/usr/lib/sysctl.d/50-default.conf`).
+  `kernel.sched_migration_cost_ns` **no existe aquí**: el scheduler es BORE, así
+  que se omite en vez de dejar un sysctl muerto.
+- `99-cizen-memory.conf`: fuera `dirty_ratio` y `dirty_background_ratio`
+  (los sustituyen los bytes); los valores medidos (`swappiness=10`,
+  `watermark_boost_factor=0`, `vfs_cache_pressure=100`) se quedan intactos.
+- `99-cizen-sata-ssd.rules` reescrito: `mq-deadline` anclado, `nr_requests=32`,
+  `read_ahead_kb=128`, `add_random=0` y **sin `rotational=0`** — esa línea
+  habría hecho que el sistema mintiera sobre el USB rotacional (§57).
+
+El motor sobrescribe `/etc/sysctl.d/99-cizen-*` y `/etc/udev/rules.d/*` en cada
+build: **la fuente es el repo**, y `runtime_tuning_pairs()` globula estos
+directorios así que los ficheros nuevos se despliegan solos.
+
+### Cmdline Nivel 2
+
+`/etc/kernel/cmdline` → `preempt=full threadirqs
+transparent_hugepage=madvise nmi_watchdog=0`, conservando raíces, subvol,
+`intel_idle.max_cstate=4` y las mitigaciones apagadas. Respaldo
+`cmdline.bak-20261006-150336`. **Conflicto abierto**: v27.32.0 migró
+`preempt=full` → `lazy` porque `full` es el modo más caro y cede spinlocks
+contended (peor para KVM), y la §53.5 pasó de lazy a `none` para medir. El
+cambio se eligió conscientemente y es reversible editando un campo.
+
+### Verificación
+
+Tres `--check`, todos limpios:
+
+| Corrida | Flags | Resultado |
+|---|---|---|
+| ruta repo | `--no-btf` | 46/46 · 13/13 · **374/377 (3 rebeldes)** · 30/30 · 2/2 |
+| ruta repo, tras `EXPECTED_REBELS` | `--no-btf` | 374/377 **(3 rebeldes esperados)** |
+| **ruta instalada, flags reales del build** | `--no-btf --clang --patch bore --pgo …` | **48/48 · 13/13 · 368/371 · 30/30 · 2/2** |
+
+Config promovida verificada antes de compilar: `NR_CPUS=8`, `MAXSMP` apagado,
+`KEXEC/AUDIT/CRASH_DUMP/SCHED_AUTOGROUP/RT_GROUP_SCHED/REMOTEPROC/
+PCSPKR_PLATFORM/X86_USER_SHADOW_STACK` apagados, `PREEMPT=y` +
+`PREEMPT_DYNAMIC=y` + `IRQ_FORCED_THREADING=y` (sin esto, `preempt=full` y
+`threadirqs` no sirven de nada), las 7 anclas `=y`, `SCHED_BORE=y`,
+`AUTOFDO_CLANG=y` + `LTO_CLANG_THIN=y`, `KVM=m`, `XFS_FS=y`, sin BTF.
+
+`kconfig-validate.sh` contra el Kconfig real: **sin FATALES** (45/45, 13/13,
+365/368 con 3 rebeldes esperados, 30, 2). Dato nuevo: **75 de los `OPTS_DISABLE`
+ya no existen** en el Kconfig de 7.2.9 — ruido heredado, no fallo, y candidato a
+limpieza.
+
+Arnés: **689 ok / 0 fail** (el motor no se toca).
+
+### Despliegue
+
+Perfil y runtime con **paridad sha256** en las tres rutas (repo,
+`/usr/local/bin/kernel-update/`, `~/.config/kernel-update/profiles/`), motor
+intacto (`e41afd1c…`), respaldos `.bak-20261006-*`. Se **borra**
+`kernel-update/profiles/linux-7.2.9-cizen-v3.config` del repo: era un artefacto
+sin seguimiento generado desde el repo, **sin `AUTOFDO_CLANG` ni `SCHED_BORE`**,
+y esa misma semilla es lo que lee la siguiente build — una copia stale en el
+sitio exacto de §62.
+
+Pendiente de lanzar (sin TTY no compila: `confirm_build_after_check` devuelve 1
+y sale con `CHECK EXITOSO` sin compilar):
+
+```bash
+cizen-build 7.2.9 --no-btf --clang --patch bore --pgo ~/kernel-pgo/7.2.8-cizen-v3.afdo
+```
+
 ## [27.35.4] - 2026-10-03
 
 **Perfil `cizen-optiplex7050` v5.20.0: XFS pasa de la poda a OBLIGATORIO. El

@@ -1,23 +1,40 @@
-# Gestionado por kernel-update (v5.19.0) — fuente en runtime/udev/ del repo.
+# Gestionado por kernel-update (v5.22.0) — fuente en runtime/udev/ del repo.
 # NO editar a mano: el motor compara el contenido y lo sobrescribe en cada build.
 #
-# Corrección sobre el documento maestro: sus cuatro reglas eran
+# v5.22.0 (2026-10-06) — Fase 3 del procedimiento RT-Lite
+# (`/home/cizen/nuevas-optimizaciones-kernel.txt`, §4.3), decisión del usuario:
+# "32/128 + mq-deadline, sin rotational". Cambios sobre v5.19.0:
+#   · nr_requests  64 -> 32   La NCQ de SATA es 32 comandos: una cola mayor que
+#     la ventana de comandos del propio dispositivo solo añade bufferbloat de
+#     disco (más cola = más espera cuando el bus satura).
+#   · read_ahead_kb 256 -> 128 128 KiB favorece LATENCIA (menos lecturas
+#     predictivas que dejen la cola llena); 256 favorece THROUGHPUT. El plan
+#     RT-Lite prioriza apertura de apps. Si se mide una copia secuencial
+#     grande más lenta, volver a 256: es una línea.
+#   · ancla explícita de mq-deadline (nueva). El kernel ya lo elige por
+#     defecto para SATA (BFQ/KYBER están apagados en Kconfig), pero así un
+#     cambio de default o un udev de terceros no lo cambia en caliente.
+#
+# Política heredada de v5.19.0, INTACTA: el documento maestro original quería
 #   ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/rotational}="0"
-# es decir, declaraban NO rotacional cualquier disco sd*. Aquí hay un Kingston
+# es decir, declarar NO rotacional cualquier disco sd*. Aquí hay un Kingston
 # DataTraveler en sdb con rotational=1, así que esa regla le habría mentido al
-# kernel sobre un disco que sí gira, y el planificador habría dejado de usar
-# ascensores para el USB. Aquí no se escribe rotational en ningún sitio: se
-# exige que el disco YA se declare no rotacional y se ajustan solo atributos de
-# cola. Con ACTION=="add" en vez de "add|change" no hace falta re-disparar la
-# regla en cada cambio de atributo: los ajustes de cola viven toda la vida del
-# dispositivo y add se dispara una vez, al enchufarlo.
+# kernel sobre un disco que sí gira y el planificador habría dejado de usar
+# ascensores para el USB. Por eso aquí NO se escribe rotational en ningún
+# sitio: se exige que el disco YA se declare no rotacional y se ajustan solo
+# atributos de cola. Con ACTION=="add" en vez de "add|change" no hace falta
+# re-disparar la regla en cada cambio de atributo: los ajustes de cola viven
+# toda la vida del dispositivo y add se dispara una vez, al enchufarlo.
 #
 # Aplican a: el SSD SATA interno (sda, ADATA SU650, rotational=0).
 # No aplican a: el USB rotacional (sdb), ni a nvme0 (no es sd*).
-ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="0", ATTR{queue/nr_requests}="64"
-ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="0", ATTR{bdi/read_ahead_kb}="256"
+ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="mq-deadline"
+ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="0", ATTR{queue/nr_requests}="32"
+ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="0", ATTR{bdi/read_ahead_kb}="128"
 ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="0", ATTR{queue/add_random}="0"
 
-# nr_requests ya está en 64 y add_random ya está en 0 en el kernel actual: se
-# dejan escritos para que un cambio de valor por defecto no los revierta.
-# read_ahead_kb sí cambia: 128 -> 256.
+# En el kernel anterior corrían con 64/256: nr_requests y read_ahead_kb son
+# los dos que cambian de verdad (32/128). mq-deadline ya estaba seleccionado y
+# add_random ya era 0; se escriben igual para que un default futuro no los
+# revierta. La variante agresiva del documento (mq_deadline/writes_starved=1,
+# front_merges=0) queda FUERA: es para medir, no para fijar sin benchmark.
