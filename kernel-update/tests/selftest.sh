@@ -5437,10 +5437,14 @@ if [ -f "$PROFV_" ]; then
   # Duplicados DENTRO de la misma array. add_unique() los absorbe sin avisar, así
   # que un "PM_DEBUG" repetido no rompe la build: solo indica que la lista se
   # está editando a ciegas. Salió uno de verdad al añadir el bloque v5.16.1.
+  # Ojo con el comentario final de línea: bash lo trata como comentario dentro
+  # del literal de array, y sin recortarlo este parser contaba dos veces el
+  # símbolo que el comentario volvía a nombrar (falso FAIL con SCHED_SMT).
   for _arr in ENABLE DISABLE; do
     _dups="$(awk -v blk="declare -a OPTS_$_arr=(" '/^[[:space:]]*#/ {next}
                    index($0,blk)==1 {b=1;next} /^\)/ {b=0}
-                   b {for(i=1;i<=NF;i++){gsub(/"/,"",$i); if($i!="") print $i}}' "$PROFV_" \
+                   b {sub(/[[:space:]]+#.*$/,"",$0)
+                      for(i=1;i<=NF;i++){gsub(/"/,"",$i); if($i!="") print $i}}' "$PROFV_" \
                  | sort | uniq -d | tr '\n' ' ')"
     if [ -z "${_dups// /}" ]; then
       rec ok "perfil v5.16.1: sin símbolos repetidos dentro de OPTS_$_arr"
@@ -5452,7 +5456,10 @@ if [ -f "$PROFV_" ]; then
 
   # Invariante general: ningún símbolo puede estar a la vez en ENABLE y DISABLE.
   # El motor aplicaría los dos scripts/config y ganaría el último, así que la
-  # validación nunca lo detectaría: solo se ve leyendo el perfil.
+  # validación nunca lo detectaría: solo se ve leyendo el perfil. Los awk de
+  # ambos bloques recortan también el comentario final de línea, igual que hace
+  # bash al repartir el literal: sin eso, "#" y "en" de un comentario compartido
+  # contaban como dos símbolos presentes en los dos bloques (falso FAIL).
   _enset=""
   _nen=0
   while read -r _s; do
@@ -5461,7 +5468,8 @@ if [ -f "$PROFV_" ]; then
   done < <(awk '/^[[:space:]]*#/ {next}
                  /^declare -a OPTS_ENABLE=\(/ {b=1;next}
                  /^\)/ {b=0}
-                 b {for(i=1;i<=NF;i++){gsub(/"/,"",$i); if($i!="") print $i}}' "$PROFV_")
+                 b {sub(/[[:space:]]+#.*$/,"",$0)
+                    for(i=1;i<=NF;i++){gsub(/"/,"",$i); if($i!="") print $i}}' "$PROFV_")
   _dups=""
   while read -r _s; do
     [ -z "$_s" ] && continue
@@ -5469,7 +5477,8 @@ if [ -f "$PROFV_" ]; then
   done < <(awk '/^[[:space:]]*#/ {next}
                  /^declare -a OPTS_DISABLE=\(/ {b=1;next}
                  /^\)/ {b=0}
-                 b {for(i=1;i<=NF;i++){gsub(/"/,"",$i); if($i!="") print $i}}' "$PROFV_")
+                 b {sub(/[[:space:]]+#.*$/,"",$0)
+                    for(i=1;i<=NF;i++){gsub(/"/,"",$i); if($i!="") print $i}}' "$PROFV_")
   if [ -z "${_dups// /}" ]; then
     rec ok "perfil v5.16.1: ningún símbolo en OPTS_ENABLE y OPTS_DISABLE a la vez ($_nen en ENABLE)"
   else

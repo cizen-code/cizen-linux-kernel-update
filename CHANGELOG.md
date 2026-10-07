@@ -1,3 +1,45 @@
+## [27.35.7] - 2026-10-07
+
+**Dos FAIL falsos en el selftest: el parser de arrays no recortaba el comentario
+final de línea; y en `/usr/local` el selftest y el CHANGELOG seguían en la
+versión del 3-oct.**
+
+Los dos FAIL venían del mismo sitio y **ninguno era un problema del perfil**. La
+suite lee `OPTS_ENABLE`/`OPTS_DISABLE` con `awk` para comprobar dos invariantes
+(duplicados dentro de un bloque, y que ningún símbolo esté en los dos), y ese
+`awk` saltaba solo las líneas que **empiezan** por `#`: un comentario al final de
+una línea de array se tragaba entero y sus palabras contaban como símbolos.
+Resultado:
+
+- `"SCHED_SMT"  # … select SCHED_SMT if SMP (arch/x86/Kconfig:335).` → la
+  palabra `SCHED_SMT` se contaba **dos veces** → «símbolos repetidos en
+  OPTS_DISABLE: SCHED_SMT».
+- `"DEFAULT_FQ"  # … lo ancla en runtime también.` (ENABLE) y ese mismo
+  comentario de SCHED_SMT (DISABLE) aportaban `#` y `en` a los dos bloques →
+  «a la vez en ENABLE y DISABLE: # en».
+
+El perfil está limpio: hay **una sola** entrada de `SCHED_SMT` en DISABLE y
+ningún símbolo real en los dos bloques. bash, que es quien reparte el literal de
+array de verdad, trata ese `#` como comentario, así que el parser del test era
+el único que lo veía. Arreglo: `sub(/[[:space:]]+#.*$/,"",$0)` dentro de los
+tres `awk`, antes de partir por campos.
+
+**Y el despliegue estaba desfasado**: `kernel-update/tests/selftest.sh` y
+`CHANGELOG.md` en `/usr/local/bin/kernel-update/` eran los del **3-oct**
+(mtime 2026-10-03, CHANGELOG parado en 27.35.3), pese a que 27.35.6 anotó
+paridad: lo que se sincronizó entonces fue el motor, no `tests/`. Por eso la
+suite instalada corría sin el bloque `snap` de 27.35.6 (4 tests) y ejecutaba el
+parser viejo. Ahora los tres ficheros tocados tienen paridad sha256 repo ==
+`/usr/local`.
+
+Estado: **694 ok / 0 fail** contra el repo y **693 ok / 0 fail** contra el
+instalado (la diferencia es el test de coherencia repo↔instalado, que solo
+existe al correr desde el repo, igual que en [27.31.52]), `bash -n` limpio y
+**0 hallazgos de nivel error en ShellCheck**.
+
+`SCRIPT_VERSION` 27.35.6 → **27.35.7** (cambios en `tests/`; el motor no cambia
+de comportamiento) y cabecera.
+
 ## [27.35.6] - 2026-10-06
 
 **El snapshot btrfs previo a cada build se ha perdido SIEMPRE en esta máquina:
