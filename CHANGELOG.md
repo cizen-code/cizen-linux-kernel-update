@@ -1,3 +1,47 @@
+## [27.35.8] - 2026-10-08
+
+**Retirado `vm.watermark_scale_factor=500` y `vm.min_free_kbytes=131072`: inflaban
+la columna «usado» de `free` en ~2,3 GiB nada más arrancar. Y paridad
+repo==instalado arreglada de verdad (el verificador se validaba a sí mismo).**
+
+El «usado» de `free` (procps 4.0.7) es `total − MemAvailable`, así que el salto
+de 2613 MiB (30-sep) a 4680 MiB (8-oct) en el mismo punto de arranque **tenía
+que estar en `MemAvailable`**, y estaba: el uso real no-caché no se movió
+(2028 → **1982 MiB**). `si_mem_available()` (`mm/show_mem.c`) descuenta
+`totalreserve = Σ(high_wmark + lowmem_reserve)` y con `scale=500` el `zoneinfo`
+daba **Σhigh=1743 MiB** y **Σlow=915 MiB** (antes: 48732 y 32620 kB). La cuenta
+cerró con 5 MB de error: **11333524 kB** predichos contra **11328500** medidos.
+
+Los dos sysctls siguen comentados en su fuente con las cifras, la fórmula y el
+rollback, y ahora hay paridad de tres vías (`repo == /usr/local/bin/kernel-update
+== /etc/sysctl.d`). El kernel arranca en defaults: `scale=10` y `min_free=16384`
+(recalculado por `calculate_min_free_kbytes()` en cada boot). O-5 de §67.5 queda
+cerrada sin medir.
+
+**El hallazgo gordo era otro**: `deploy_runtime_tuning` copia
+`$SCRIPT_DIR/runtime/sysctl.d/*.conf` → `/etc/sysctl.d` en cada run, y la suite
+instalada seguía teniendo `vm.watermark_scale_factor = 500` **activo** (solo
+había sincronizado `/etc`), así que el siguiente build habría deshecho la
+retirada en silencio.
+
+`scripts/verify-installed.sh` tampoco verificaba nada: comparaba el repo contra
+su propio manifest (autocomprobación) y el generador salía **corrompido** —
+`awk "{…substr("$f")…}"` expandía `$f` como campo de awk, no como shell, así que
+salían paths vacíos y colas de `.git/objects` (993 líneas, 949 de ellas objetos
+git). Ahora: paths relativos reales, excluidos `.git` y `*.bak*` (el motor los
+regenera al editar un perfil), regeneración automática del manifest si está
+desfasado, y **comparación contra la suite instalada** entrada por entrada
+(`kernel-update/*` + `cizen-uki-sync`), con `FALTA`/`DIFIERE` y rc=2. Mismas
+exclusiones en `install.sh`. Además faltaba `/usr/local/bin/cizen-uki-sync`
+(el verificador abortaba antes de llegar a la paridad).
+
+Estado: `make verify` → **Paridad OK (23 ficheros + cizen-uki-sync)**, `make
+test` → **694 ok / 0 fail**, `bash -n` y ShellCheck limpios. Commits `457e89d`
+(runtime) y `9598cc7` (scripts).
+
+`SCRIPT_VERSION` 27.35.7 → **27.35.8** (cambios en `scripts/` e `install.sh`; el
+motor no cambia de comportamiento) y cabecera.
+
 ## [27.35.7] - 2026-10-07
 
 **Dos FAIL falsos en el selftest: el parser de arrays no recortaba el comentario
