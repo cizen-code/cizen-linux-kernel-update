@@ -45,9 +45,15 @@ run_priv() {
 generate_manifest() {
   local out="$1"
   : > "$out"
-  local f m d
+  local f m d rel
   while IFS= read -r -d '' f; do
-    [[ "${f#${REPO_DIR}/}" == MANIFEST.sha256 ]] && continue
+    rel="${f#${REPO_DIR}/}"
+    # .git y los .bak locales no se despliegan ni se comparan: incluirlos
+    # rompía la paridad (949 objetos git en el manifest y .bak que el motor
+    # regenera al editar un perfil).
+    case "$rel" in
+      MANIFEST.sha256|.git|.git/*|*.bak|*.bak-*) continue ;;
+    esac
     if [[ -x "$f" ]]; then
       m=755
     else
