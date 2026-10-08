@@ -47,3 +47,4 @@ linux-*.config
 *.key
 *id_ed25519*
 *token*
+MANIFEST.sha256
