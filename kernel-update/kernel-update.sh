@@ -11450,8 +11450,11 @@ if command -v ccache >/dev/null 2>&1; then
   #  - base_dir=$HOME: los hits no dependen del cwd donde se compila
   #  - max_size: límite opcional vía CCACHE_MAX_SIZE (cosa por defecto)
   #  - compiler_check=content: hash del binario del compilador, no del path
+  # v27.35.8+: optimizaciones para kernel (hash_dir=false, sloppiness=file_stat_matches)
   ccache -o base_dir="$HOME" >/dev/null 2>&1 || true
   ccache -o compiler_check=content >/dev/null 2>&1 || true
+  ccache -o hash_dir=false >/dev/null 2>&1 || true
+  ccache -o sloppiness=file_stat_matches >/dev/null 2>&1 || true
   if [ -n "${CCACHE_MAX_SIZE:-}" ]; then
     ccache -o max_size="$CCACHE_MAX_SIZE" >/dev/null 2>&1 || true
   fi

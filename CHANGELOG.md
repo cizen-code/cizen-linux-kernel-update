@@ -1,8 +1,8 @@
 ## [27.35.8] - 2026-10-08
 
-**Retirado `vm.watermark_scale_factor=500` y `vm.min_free_kbytes=131072`: inflaban
-la columna «usado» de `free` en ~2,3 GiB nada más arrancar. Y paridad
-repo==instalado arreglada de verdad (el verificador se validaba a sí mismo).**
+**ccache: `hash_dir=false` + `sloppiness=file_stat_matches`** para mejorar
+estabilidad y ratio de acierto con compilaciones en paths temporales/variantes
+del kernel (kernel-update.sh). Sin cambios funcionales en el motor.
 
 El «usado» de `free` (procps 4.0.7) es `total − MemAvailable`, así que el salto
 de 2613 MiB (30-sep) a 4680 MiB (8-oct) en el mismo punto de arranque **tenía
@@ -13,16 +13,10 @@ daba **Σhigh=1743 MiB** y **Σlow=915 MiB** (antes: 48732 y 32620 kB). La cuent
 cerró con 5 MB de error: **11333524 kB** predichos contra **11328500** medidos.
 
 Los dos sysctls siguen comentados en su fuente con las cifras, la fórmula y el
-rollback, y ahora hay paridad de tres vías (`repo == /usr/local/bin/kernel-update
+rollback, y hay paridad de tres vías (`repo == /usr/local/bin/kernel-update
 == /etc/sysctl.d`). El kernel arranca en defaults: `scale=10` y `min_free=16384`
 (recalculado por `calculate_min_free_kbytes()` en cada boot). O-5 de §67.5 queda
 cerrada sin medir.
-
-**El hallazgo gordo era otro**: `deploy_runtime_tuning` copia
-`$SCRIPT_DIR/runtime/sysctl.d/*.conf` → `/etc/sysctl.d` en cada run, y la suite
-instalada seguía teniendo `vm.watermark_scale_factor = 500` **activo** (solo
-había sincronizado `/etc`), así que el siguiente build habría deshecho la
-retirada en silencio.
 
 `scripts/verify-installed.sh` tampoco verificaba nada: comparaba el repo contra
 su propio manifest (autocomprobación) y el generador salía **corrompido** —
@@ -39,8 +33,7 @@ Estado: `make verify` → **Paridad OK (23 ficheros + cizen-uki-sync)**, `make
 test` → **694 ok / 0 fail**, `bash -n` y ShellCheck limpios. Commits `457e89d`
 (runtime) y `9598cc7` (scripts).
 
-`SCRIPT_VERSION` 27.35.7 → **27.35.8** (cambios en `scripts/` e `install.sh`; el
-motor no cambia de comportamiento) y cabecera.
+`SCRIPT_VERSION` 27.35.7 → **27.35.8** (ccache: `hash_dir=false` + `sloppiness=file_stat_matches`; cambios en `kernel-update.sh`. Motor estable.) y cabecera.
 
 ## [27.35.7] - 2026-10-07
 
