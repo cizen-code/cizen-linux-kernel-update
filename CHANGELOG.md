@@ -1,3 +1,46 @@
+## [27.35.9] - 2026-10-08
+
+**Perfil `cizen-optiplex7050` v5.26.1 → v5.27.0: optimizaciones #3, #5, #6 y #7
+de la lista priorizada (RCU offload, micro-podas, zram LZ4, imagen LZ4). Sin
+cambios de código en el motor; el único cambio de suite es el selftest.**
+
+Validado antes de tocar nada con `kconfig-validate.sh`/`validar.sh` sobre el
+árbol Kconfig real **linux-7.2.9**: base `linux-7.2.8-cizen-v3.config`. Resultado
+del perfil v5.27.0: **ENABLE 53/53, CRITICAL 13/13, DISABLE 599/601 (2 rebeldes
+esperados: `MODULE_DEBUGFS`, `SCHED_SMT`), SETVAL 29, 0 FATALES**. Valores
+comprobados en el `.config` generado: `RCU_NOCB_CPU=y`,
+`RCU_NOCB_CPU_DEFAULT_ALL=y`, `NR_CPUS=4`, `SLUB_DEBUG=n`, `PSI=n`,
+`X86_KERNEL_IBT=n`, `KERNEL_LZ4=y`/`KERNEL_ZSTD=n`,
+`ZRAM_BACKEND_LZ4=y`/`ZRAM_BACKEND_ZSTD=n`.
+
+- **#3 RCU offload (Fase 3 §69.4).** `RCU_NOCB_CPU` sale de `OPTS_DISABLE` y pasa
+  a `OPTS_ENABLE`; se activa `RCU_NOCB_CPU_DEFAULT_ALL` para offloadear los 4
+  CPUs **sin tocar `/etc/kernel/cmdline`** (el motor no genera cmdline). `RCU_LAZY`
+  se mantiene en `OPTS_DISABLE`: con NOCB ya es un símbolo vivo y se quiere fuera
+  por latencia. Efecto: `call_rcu()`/`kfree_rcu()` dejan de correr en softirq de
+  los 4 cores y pasan a kthreads `rcuo/N`. **Pendiente de validar en arranque**
+  (hilos `rcuo/*`, `/proc/softirqs`) tras el primer reboot del build.
+- **#5 micro-podas.** `NR_CPUS` 8 → **4** (el i5-7500 es 4C/4T; el margen de 8 no
+  lo usaba nada). `SLUB_DEBUG` a `OPTS_DISABLE` (queda `/sys/kernel/slab` pero sin
+  validación); al caer, `STACKDEPOT` pierde su selector y sale de
+  `EXPECTED_REBELS`. `PSI` a `OPTS_DISABLE` (systemd-oomd inactive; sin `psi=`),
+  retirando `PSI`/`PSI_DEFAULT_DISABLED` de `OPTS_SETVAL`. `X86_KERNEL_IBT` a
+  `OPTS_DISABLE` (inerte en Kaby Lake sin CET; cae `X86_CET`, `OBJTOOL` sigue por
+  `STACK_VALIDATION`).
+- **#6 zram zstd → lz4.** `ZRAM_BACKEND_LZ4` vuelve a `OPTS_ENABLE` y
+  `ZRAM_BACKEND_ZSTD` pasa a `OPTS_DISABLE`. Runtime aparte (fuera del repo):
+  `/etc/systemd/zram-generator.conf` pasa a `compression-algorithm = lz4`;
+  **efectivo solo en el primer arranque con el kernel nuevo** (el kernel en
+  marcha aún no lleva el backend LZ4).
+- **#7 arranque.** `KERNEL_LZ4` a `OPTS_ENABLE` y `KERNEL_ZSTD` a `OPTS_DISABLE`
+  (choice de `init/Kconfig`, `HAVE_KERNEL_LZ4=y` en x86_64). Imagen algo mayor,
+  descompresión más rápida; **A/B de boot-time pendiente (§47)**.
+
+Override consciente de §0.4 ("intocables ZRAM/ZSTD, …") y del comentario v5 del
+perfil ("NO se fuerzan fuera RCU, PSI, …"): decisión explícita del usuario en la
+lista priorizada de 2026-10-08. `SCRIPT_VERSION` 27.35.8 → **27.35.9** y cabecera.
+Selftest: bloque nuevo con los invariantes de v5.27.0.
+
 ## [27.35.8] - 2026-10-08
 
 **ccache: `hash_dir=false` + `sloppiness=file_stat_matches`** para mejorar

@@ -5488,6 +5488,78 @@ if [ -f "$PROFV_" ]; then
 fi
 unset PROFV_
 
+# --- v27.31.52 / perfil v5.27.0: optimizaciones #3 (RCU offload), #5 (micro-podas),
+# #6 (zram lz4) y #7 (imagen LZ4). Red de seguridad de la validación con
+# kconfig-validate.sh sobre el árbol 7.2.9 (ENABLE 53/53, DISABLE 599/601,
+# SETVAL 29, 0 FATALES).
+PROFV_="$(dirname "$MOTOR")/profiles/cizen-optiplex7050.conf"
+if [ -f "$PROFV_" ]; then
+  if grep -q '^# PERFIL CIZEN v5.27.0 ' "$PROFV_"; then
+    rec ok "perfil v5.27.0: cabecera en v5.27.0"
+  else
+    rec fail "perfil v5.27.0: la cabecera no dice v5.27.0"
+  fi
+
+  # #3: RCU_NOCB_CPU pasa a ENABLE con DEFAULT_ALL; RCU_LAZY se queda apagado.
+  if [ "$(_prof_sym "$PROFV_" ENABLE  RCU_NOCB_CPU)" -eq 1 ] \
+     && [ "$(_prof_sym "$PROFV_" ENABLE  RCU_NOCB_CPU_DEFAULT_ALL)" -eq 1 ] \
+     && [ "$(_prof_sym "$PROFV_" DISABLE RCU_NOCB_CPU)" -eq 0 ] \
+     && [ "$(_prof_sym "$PROFV_" DISABLE RCU_LAZY)" -eq 1 ]; then
+    rec ok "perfil v5.27.0 (#3): RCU_NOCB_CPU+DEFAULT_ALL en ENABLE, RCU_LAZY en DISABLE"
+  else
+    rec fail "perfil v5.27.0 (#3): offload RCU mal colocado (EN_nocb=$(_prof_sym "$PROFV_" ENABLE RCU_NOCB_CPU) DIS_nocb=$(_prof_sym "$PROFV_" DISABLE RCU_NOCB_CPU))"
+  fi
+
+  # #5: NR_CPUS exacto a 4 (4C/4T).
+  if grep -qE '^\["NR_CPUS"\]="4"$' "$PROFV_"; then
+    rec ok "perfil v5.27.0 (#5): NR_CPUS=4"
+  else
+    rec fail "perfil v5.27.0 (#5): NR_CPUS no está fijado a 4"
+  fi
+
+  # #5: micro-podas en DISABLE.
+  _miss=""
+  for _s in SLUB_DEBUG PSI X86_KERNEL_IBT; do
+    [ "$(_prof_sym "$PROFV_" DISABLE "$_s")" -eq 1 ] || _miss="$_miss $_s"
+  done
+  if [ -z "${_miss// /}" ]; then
+    rec ok "perfil v5.27.0 (#5): SLUB_DEBUG/PSI/X86_KERNEL_IBT en DISABLE"
+  else
+    rec fail "perfil v5.27.0 (#5): faltan en DISABLE:$_miss"
+  fi
+
+  # #5: PSI/PSI_DEFAULT_DISABLED salen de OPTS_SETVAL (si no, SETVAL fallaría).
+  if ! grep -qE '^\["PSI"\]=' "$PROFV_" && ! grep -qE '^\["PSI_DEFAULT_DISABLED"\]=' "$PROFV_"; then
+    rec ok "perfil v5.27.0 (#5): PSI y PSI_DEFAULT_DISABLED fuera de OPTS_SETVAL"
+  else
+    rec fail "perfil v5.27.0 (#5): PSI sigue en OPTS_SETVAL con PSI en DISABLE"
+  fi
+
+  # #6/#7: backends de compresión intercambiados (zram lz4, imagen LZ4).
+  _miss=""
+  for _s in ZRAM_BACKEND_LZ4 KERNEL_LZ4; do
+    [ "$(_prof_sym "$PROFV_" ENABLE "$_s")" -eq 1 ] || _miss="$_miss $_s"
+  done
+  for _s in ZRAM_BACKEND_ZSTD KERNEL_ZSTD; do
+    [ "$(_prof_sym "$PROFV_" DISABLE "$_s")" -eq 1 ] || _miss="$_miss $_s"
+  done
+  if [ -z "${_miss// /}" ]; then
+    rec ok "perfil v5.27.0 (#6/#7): LZ4 en ENABLE, ZSTD en DISABLE (zram + imagen)"
+  else
+    rec fail "perfil v5.27.0 (#6/#7): backends LZ4/ZSTD mal colocados:$_miss"
+  fi
+
+  # #5: al apagar SLUB_DEBUG, STACKDEPOT deja de ser rebelde y sale de la lista.
+  if awk '/^[[:space:]]*#/ {next} /^declare -a EXPECTED_REBELS=\(/ {b=1;next} /^\)/ {b=0}
+         b && index($0,"\"STACKDEPOT\"") {n++} END{print n+0}' "$PROFV_" | grep -qx 0; then
+    rec ok "perfil v5.27.0 (#5): STACKDEPOT retirado de EXPECTED_REBELS (SLUB_DEBUG apagado)"
+  else
+    rec fail "perfil v5.27.0 (#5): STACKDEPOT sigue en EXPECTED_REBELS"
+  fi
+  unset _miss _s
+fi
+unset PROFV_
+
 # Los frag se|sourcean con el .config: un CONFIG_ que no exista en Kconfig lo
 # descarta olddefconfig y genera un aviso de "símbolo no solicitado".
 FRAGD_="$(dirname "$MOTOR")/profiles/frags"
