@@ -7,6 +7,7 @@ After=graphical-session.target
 Type=oneshot
 ExecStart=/usr/local/bin/kernel-update/kernel-update-notify.sh
 TimeoutStartSec=90
+KillMode=process
 
 [Install]
 WantedBy=default.target
