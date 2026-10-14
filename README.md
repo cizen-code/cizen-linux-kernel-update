@@ -29,7 +29,8 @@ el borrador del siguiente release y bumpea banner + `SCRIPT_VERSION`.
 │   ├── arch-update-notify-agent.sh# Notificador de escritorio con acciones
 │   ├── arch-update-notify-user.sh # Wrapper del agente para la unit de usuario
 │   ├── arch-show-pending.sh       # Muestra actualizaciones pendientes
-│   └── arch-open-terminal.sh      # Abre terminal con la ruta indicada (compartido)
+│   ├── arch-open-terminal.sh      # Abre terminal con la ruta indicada (compartido)
+│   └── 99-cizen-build.sudoers     # Plantilla del allowlist NOPASSWD (Flatpak sin contraseña)
 └── systemd/
     ├── user/                      # Units de usuario
     │   ├── kernel-update-notify.service
@@ -755,6 +756,20 @@ pero **nunca** los críticos/no reiniciables en caliente (dbus, gestores de
 display y sesión gráfica, `getty@*`, red y subsistemas del núcleo de systemd);
 esos quedan para un reinicio del sistema. El conjunto actualizado se obtiene del
 `pacman.log` real (no de `pacman -Quq` previo).
+
+#### Flatpak sin contraseña (2026-10-14)
+
+La actualización de Flatpak de **sistema** (`/var/lib/flatpak`) exige root. El
+asistente usa `sudo -n flatpak update` para no quedarse pidiendo contraseña: si
+`/usr/bin/flatpak` está en el allowlist NOPASSWD actualiza en silencio; si no,
+cae a polkit avisando. La plantilla del allowlist vive en
+`arch-update-checker/99-cizen-build.sudoers`:
+
+```sh
+sudo install -m 0440 -o root -g root arch-update-checker/99-cizen-build.sudoers \
+  /etc/sudoers.d/99-cizen-build
+sudo visudo -c
+```
 
 ## Licencia
 

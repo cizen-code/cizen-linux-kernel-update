@@ -83,7 +83,18 @@ fi
 if command -v flatpak >/dev/null 2>&1 && { [[ -z "$n_fp" ]] || (( n_fp > 0 )); }; then
   read -r -p "¿Actualizar paquetes Flatpak? [S/n] " f
   if [[ ! "$f" =~ ^[Nn] ]]; then
-    if sudo flatpak update; then actualizado=1; fi
+    # La instalación de sistema (/var/lib/flatpak) exige root. Con `sudo -n`
+    # NUNCA se queda pidiendo contraseña: si el allowlist NOPASSWD
+    # (/etc/sudoers.d/99-cizen-build) cubre flatpak, actualiza en silencio; si
+    # no, cae a polkit (flatpak como usuario) avisando de cómo evitarlo.
+    if sudo -n flatpak --version >/dev/null 2>&1; then
+      if sudo -n flatpak update; then actualizado=1; fi
+    else
+      echo "⚠ flatpak no está en el allowlist NOPASSWD; se usará autenticación polkit."
+      echo "  Añade /usr/bin/flatpak a /etc/sudoers.d/99-cizen-build para no preguntar"
+      echo "  (plantilla: arch-update-checker/99-cizen-build.sudoers del repo)."
+      if flatpak update; then actualizado=1; fi
+    fi
     if [[ -d "$HOME/.local/share/flatpak" ]]; then
       flatpak update --user >/dev/null 2>&1 || true
     fi

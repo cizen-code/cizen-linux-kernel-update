@@ -1,0 +1,13 @@
+# /etc/sudoers.d/99-cizen-build — allowlist NOPASSWD del host para las suites
+# de cizen-linux-kernel-update (kernel-update + arch-update-checker).
+#
+# Instalación (sustituye «cizen» por tu usuario si no coincide):
+#   sudo install -m 0440 -o root -g root 99-cizen-build.sudoers /etc/sudoers.d/99-cizen-build
+#   sudo visudo -c        # debe responder «parsed OK»
+#
+# Sin la entrada /usr/bin/flatpak, arch-apply-updates.sh pediría la contraseña
+# al actualizar Flatpak de sistema (los repos oficiales ya van con pacman y el
+# AUR con yay/paru, ambos cubiertos aquí).
+cizen ALL=(root) NOPASSWD: /usr/bin/mount, /usr/bin/umount, /usr/bin/install, /usr/bin/pacman, /usr/bin/flatpak, /usr/bin/swapon, /usr/bin/swapoff, /usr/bin/systemctl daemon-reload
+
+cizen ALL=(root) NOPASSWD: /usr/bin/chown, /usr/bin/mkdir, /usr/bin/rm
