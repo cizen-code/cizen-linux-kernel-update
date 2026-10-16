@@ -771,6 +771,32 @@ sudo install -m 0440 -o root -g root arch-update-checker/99-cizen-build.sudoers 
 sudo visudo -c
 ```
 
+#### Resolución de conflictos de archivos de pacman (2026-10-16)
+
+Cuando `pacman -Syu` aborta con `archivos en conflicto` / `conflicting files`
+(un paquete a actualizar instala un fichero que ya posee otro paquete),
+`arch-apply-updates.sh` captura el log y lo diagnostica. La causa típica es un
+upgrade parcial entre repos: el paquete propietario va retrasado en un repo
+(p. ej. ALHP `x86-64-v3` tarda en recompilar) mientras el paquete nuevo ya llegó
+a otro repo, como ocurrió con `clang` (de `extra`) y `/usr/bin/clang-offload-packager`
+(propiedad de `llvm` en `extra-x86-64-v3`).
+
+El asistente entonces:
+
+1. identifica el fichero y su propietario (`pacman -Qo`);
+2. busca la versión más nueva del propietario en **cualquier** repo y ofrece
+   actualizarlo en la misma transacción (`sudo pacman -Syu extra/llvm`) y
+   reintentar;
+3. si no hay versión nueva, ofrece reintentar con `--overwrite` sobre el
+   fichero en conflicto;
+4. si se declina, imprime los comandos manuales (upgrade del propietario o
+   `--overwrite`) y el dueño del fichero.
+
+Para el AUR (`yay`/`paru`) se aplica el mismo diagnóstico, pero solo se
+sugieren los comandos (no se reintenta automáticamente). Otros fallos de
+transacción (dependencias no resolubles, firma/keyring, base de datos
+bloqueada) reciben una pista orientativa.
+
 ## Licencia
 
 MIT — ver [LICENSE](LICENSE).

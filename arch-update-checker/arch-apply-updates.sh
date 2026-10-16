@@ -11,6 +11,200 @@ pause_final() {
   fi
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Diagnóstico y arreglo de conflictos de archivos (pacman).
+#
+# pacman aborta con «archivos en conflicto» / «conflicting files» cuando un
+# paquete a actualizar instala un fichero que ya posee otro paquete instalado
+# (o que existe sin dueño). Causa habitual: el paquete propietario va retrasado
+# en un repo (p. ej. ALHP x86-64-v3 tarda en recompilar) mientras el paquete
+# nuevo ya llegó a otro repo. Aquí se detecta el conflicto, se busca una
+# versión más nueva del propietario en cualquier repo y se ofrece corregir y
+# reintentar; si no la hay, se ofrece `--overwrite`; y en último término se
+# sugieren los comandos manuales.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Extrae los conflictos del log de pacman: líneas "<fichero>|<pkg>|<dueño>".
+parse_file_conflicts() {
+  local log="$1" line pkg rest file owner
+  grep -aE '^[^:[:space:]]+: .+ (ya existe en el sistema de archivos|exists in filesystem)' "$log" 2>/dev/null |
+  while IFS= read -r line; do
+    pkg="${line%%:*}"
+    rest="${line#*: }"
+    file="$(sed -E 's/ (ya existe en el sistema de archivos|exists in filesystem)( \(.*\))?$//' <<<"$rest")"
+    owner="$(sed -nE 's/.*\((es parte de|owned by) ([^)]+)\)$/\2/p' <<<"$rest")"
+    [[ -n "$owner" ]] || owner="$(pacman -Qoq "$file" 2>/dev/null | head -n1 || true)"
+    [[ -n "$file" ]] || continue
+    printf '%s|%s|%s\n' "$file" "$pkg" "$owner"
+  done
+}
+
+# Mejor candidato disponible de un paquete: "<repo> <versión>" (vacío si no está).
+pkg_best_repo() {
+  local pkg="$1" repo v best_repo="" best_ver=""
+  while read -r repo; do
+    [[ -n "$repo" ]] || continue
+    v="$(pacman -Sl "$repo" 2>/dev/null | awk -v p="$pkg" '$2==p {print $3; exit}')"
+    [[ -n "$v" ]] || continue
+    if [[ -z "$best_ver" ]] || (( $(vercmp "$v" "$best_ver") > 0 )); then
+      best_ver="$v"; best_repo="$repo"
+    fi
+  done < <(pacman-conf --repo-list 2>/dev/null)
+  [[ -n "$best_ver" ]] && printf '%s %s\n' "$best_repo" "$best_ver"
+}
+
+# Pistas para errores que no son conflictos de archivos.
+print_error_hints() {
+  local log="$1"
+  grep -aqE 'could not satisfy dependencies|no se pudo satisfactor|no se pudieron satisfacer' "$log" &&
+    { echo "   ↳ Dependencias no resolubles: suele indicar upgrade parcial (algún repo,";
+      echo "     p. ej. ALHP x86-64-v3, va retrasado). Prueba 'sudo pacman -Syu' de nuevo."; }
+  grep -aqiE 'invalid|corrupt|no válido|dañado|signature|firma|clave|keyring' "$log" &&
+    echo "   ↳ Posible paquete/firma inválida: 'sudo pacman -Sy archlinux-keyring' o limpia la caché."
+  grep -aqiE 'unable to lock|no se puede bloquear|db\.lck' "$log" &&
+    echo "   ↳ Base de datos bloqueada: ¿hay otra instancia de pacman en ejecución?"
+  return 0
+}
+
+# Actualiza repos oficiales con detección y arreglo automático de conflictos.
+run_official_upgrade() {
+  local log rc attempt=0 r file owner inst best_repo best_ver
+  local -a pacman_extra=()
+  local -a new_targets=()
+  local -a manual=()
+  local -a overwrite_files=()
+  local -A seen_owner=() fix_repo=() fix_ver=() fix_inst=()
+  local max_attempts=3
+
+  while (( attempt < max_attempts )); do
+    attempt=$(( attempt + 1 ))
+    log="$(mktemp /tmp/arch-update-pacman.XXXXXX)"
+    if (( ${#pacman_extra[@]} )); then
+      sudo pacman -Syu "${pacman_extra[@]}" 2>&1 | tee "$log"
+    else
+      sudo pacman -Syu 2>&1 | tee "$log"
+    fi
+    rc=${PIPESTATUS[0]}
+    if (( rc == 0 )); then
+      rm -f "$log"
+      return 0
+    fi
+
+    local conflicts
+    conflicts="$(parse_file_conflicts "$log")"
+    if [[ -z "$conflicts" ]]; then
+      echo
+      echo "⚠ pacman terminó con errores (código $rc)."
+      grep -aE '^(error|warning|aviso)' "$log" | tail -n 5 | sed 's/^/   /'
+      print_error_hints "$log"
+      echo "   Log completo: $log"
+      return 1
+    fi
+
+    echo
+    echo "⚙ Conflictos de archivos detectados:"
+    overwrite_files=(); seen_owner=(); fix_repo=(); fix_ver=(); fix_inst=()
+    while IFS='|' read -r file pkg owner; do
+      [[ -n "$file" ]] || continue
+      inst=""
+      [[ -n "$owner" ]] && inst="$(pacman -Q "$owner" 2>/dev/null | awk '{print $2}' | head -n1)"
+      printf '   • %s\n' "$file"
+      if [[ -n "$owner" ]]; then
+        printf '       lo instala también: %s | propietario actual: %s %s\n' "$pkg" "$owner" "${inst:+($inst)}"
+      else
+        printf '       lo instala también: %s | propietario actual: (ninguno, fichero sin dueño)\n' "$pkg"
+      fi
+      overwrite_files+=("$file")
+      if [[ -n "$owner" && -n "$inst" && -z "${seen_owner[$owner]:-}" ]]; then
+        seen_owner["$owner"]=1
+        read -r best_repo best_ver < <(pkg_best_repo "$owner")
+        if [[ -n "${best_ver:-}" ]] && (( $(vercmp "$best_ver" "$inst") > 0 )); then
+          fix_repo["$owner"]="$best_repo"; fix_ver["$owner"]="$best_ver"; fix_inst["$owner"]="$inst"
+        fi
+      fi
+    done <<<"$conflicts"
+
+    r=""
+    if (( ${#fix_repo[@]} )); then
+      echo
+      new_targets=()
+      for owner in "${!fix_repo[@]}"; do
+        echo "   Diagnóstico: '$owner' va retrasado (${fix_inst[$owner]}); '${fix_repo[$owner]}' ya ofrece"
+        echo "   ${fix_ver[$owner]}, cuya versión no incluye el fichero en conflicto."
+        new_targets+=("${fix_repo[$owner]}/$owner")
+      done
+      echo "   Corrección propuesta:  sudo pacman -Syu ${new_targets[*]}"
+      read -r -p "¿Aplicarla y reintentar? [S/n] " r
+      if [[ ! "$r" =~ ^[Nn] ]]; then
+        local t
+        for t in "${new_targets[@]}"; do
+          [[ " ${pacman_extra[*]:-} " == *" $t "* ]] || pacman_extra+=("$t")
+        done
+        rm -f "$log"
+        continue
+      fi
+    else
+      echo
+      echo "   No hay versiones más nuevas del propietario en ningún repo. El patrón habitual"
+      echo "   para desbloquear es sobreescribir el fichero (equivalente al aviso de pacman)."
+      echo "   ⚠ --overwrite sustituirá el fichero en conflicto por el que trae el paquete nuevo."
+      read -r -p "¿Reintentar con --overwrite para esos ficheros? [S/n] " r
+      if [[ ! "$r" =~ ^[Nn] ]]; then
+        for file in "${overwrite_files[@]}"; do
+          pacman_extra+=(--overwrite "$file")
+        done
+        rm -f "$log"
+        continue
+      fi
+    fi
+
+    echo
+    echo "Sugerencias manuales:"
+    if (( ${#fix_repo[@]} )); then
+      manual=()
+      for owner in "${!fix_repo[@]}"; do manual+=("${fix_repo[$owner]}/$owner"); done
+      echo "   sudo pacman -Syu ${manual[*]}"
+    fi
+    for file in "${overwrite_files[@]}"; do
+      echo "   sudo pacman -Syu --overwrite '$file'"
+      echo "   pacman -Qo '$file'      # propietario del fichero"
+    done
+    echo "   Log completo: $log"
+    return 1
+  done
+
+  echo "⚠ Se agotaron los reintentos automáticos; revisa el log: ${log:-?}"
+  return 1
+}
+
+# Actualiza AUR con el helper disponible; en caso de conflicto, solo sugiere.
+run_aur_upgrade() {
+  local helper="$1" log rc conflicts file pkg owner
+  log="$(mktemp /tmp/arch-update-aur.XXXXXX)"
+  "$helper" -Syu 2>&1 | tee "$log"
+  rc=${PIPESTATUS[0]}
+  if (( rc == 0 )); then
+    rm -f "$log"
+    return 0
+  fi
+  echo
+  echo "⚠ $helper terminó con errores (código $rc)."
+  conflicts="$(parse_file_conflicts "$log")"
+  if [[ -n "$conflicts" ]]; then
+    echo "   Conflictos de archivos detectados:"
+    while IFS='|' read -r file pkg owner; do
+      [[ -n "$file" ]] || continue
+      printf '   • %s (lo instala también: %s%s)\n' "$file" "$pkg" "${owner:+ | propietario: $owner}"
+    done <<<"$conflicts"
+    echo "   Sugerencia: actualiza primero el propietario con 'sudo pacman -Syu <propietario>'"
+    echo "   o reintenta con '$helper -Syu --overwrite <fichero>'."
+  fi
+  grep -aE '^(error|warning|aviso)' "$log" | tail -n 5 | sed 's/^/   /'
+  print_error_hints "$log"
+  echo "   Log completo: $log"
+  return 1
+}
+
 echo "──────────────────────────────────────────"
 echo " Arch Update Checker · Asistente de actualización"
 echo "──────────────────────────────────────────"
@@ -52,7 +246,7 @@ if [[ -z "$n_off" ]] || (( n_off > 0 )); then
         fi
       fi
     fi
-    if sudo pacman -Syu; then actualizado=1; fi
+    if run_official_upgrade; then actualizado=1; fi
   else
     echo "Omitido."
   fi
@@ -68,7 +262,7 @@ if [[ -z "$n_aur" ]] || (( n_aur > 0 )); then
   if [[ -n "$helper" ]]; then
     read -r -p "¿Actualizar AUR con $helper? [S/n] " a
     if [[ ! "$a" =~ ^[Nn] ]]; then
-      if "$helper" -Syu; then actualizado=1; fi
+      if run_aur_upgrade "$helper"; then actualizado=1; fi
     else
       echo "Omitido."
     fi
