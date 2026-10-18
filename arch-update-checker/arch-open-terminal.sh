@@ -12,21 +12,20 @@ tlog() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$logf" 2>/dev
 
 wrap="AUC_AUTO_WINDOW=1 $cmd"
 
-launch=()
 if have foot; then
   launch=(foot -e bash -c "$wrap")
 elif [[ "$desk" == *KDE* ]] && have konsole; then
   launch=(konsole -e bash -c "$wrap")
-elif [[ "$desk" == *GNOME* ]] && have gnome-terminal; then
-  launch=(gnome-terminal -- bash -c "$wrap")
-elif [[ "$desk" == *XFCE* ]] && have xfce4-terminal; then
-  launch=(xfce4-terminal -e "env $wrap")
 elif have kitty; then
   launch=(kitty bash -c "$wrap")
 elif have alacritty; then
   launch=(alacritty -e bash -c "$wrap")
 elif have ghostty; then
   launch=(ghostty bash -c "$wrap")
+elif [[ "$desk" == *GNOME* ]] && have gnome-terminal; then
+  launch=(gnome-terminal -- bash -c "$wrap")
+elif [[ "$desk" == *XFCE* ]] && have xfce4-terminal; then
+  launch=(xfce4-terminal -e "env $wrap")
 elif have konsole; then
   launch=(konsole -e bash -c "$wrap")
 elif have gnome-terminal; then
@@ -34,7 +33,7 @@ elif have gnome-terminal; then
 elif have xfce4-terminal; then
   launch=(xfce4-terminal -e "env $wrap")
 elif have xterm; then
-  launch=(xterm -e env $wrap)
+  launch=(xterm -e env "$wrap")
 fi
 
 if (( ${#launch[@]} > 0 )); then

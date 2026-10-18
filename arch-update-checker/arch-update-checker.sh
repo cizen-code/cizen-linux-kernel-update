@@ -8,20 +8,38 @@ NEWS_CACHE="${STATE_DIR}/news-cache"
 AUR_RPC="https://aur.archlinux.org/rpc/v5/info"
 NEWS_URL="https://archlinux.org/feeds/news/"
 NEWS_SEEN="${STATE_DIR}/news-seen"
-REPOS_REGEX='^(core|extra|multilib|core[-_]x86[-_]64[-_]v3|extra[-_]x86[-_]64[-_]v3|multilib[-_]x86[-_]64[-_]v3)$'
+AUR_RPC="https://aur.archlinux.org/rpc/v5/info"
+NEWS_URL="https://archlinux.org/feeds/news/"
 AUR_CHUNK_SIZE=130
+
+log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
+
+# Repos habilitados en el sistema. Antes había un REPOS_REGEX fijo (core, extra,
+# multilib + sus gemelos x86_64-v3) que descartaba en silencio cualquier otro
+# repo: repos locales, chaotic-aur, ALHP… Ahora se lee de pacman-conf y se
+# compara por nombre exacto, sin regex (los nombres de repo pueden llevar
+# caracteres que significan otra cosa en una expresión regular).
+ENABLED_REPOS="$(pacman-conf --repo-list 2>/dev/null | sed '/^[[:space:]]*$/d')"
+if [[ -z "$ENABLED_REPOS" ]]; then
+  log "No se pudo obtener la lista de repos activos (pacman-conf --repo-list)."
+  exit 1
+fi
+
+# Filtra líneas «repo pkg ver» y las formatea como «repo/pkg -> ver».
+filter_enabled_repos() {
+  awk -v repos="$ENABLED_REPOS" '
+    BEGIN { n = split(repos, r, "\n"); for (i = 1; i <= n; i++) if (r[i] != "") on[r[i]] = 1 }
+    ($1 in on) { print $1 "/" $2 " -> " $3 }
+  ' | sort -u
+}
 
 # Parseo de argumentos
 SKIP_NEWS=0
-QUICK_REFRESH=0
 for arg in "$@"; do
   case "$arg" in
-    --skip-news)   SKIP_NEWS=1 ;;
-    --quick-refresh) QUICK_REFRESH=1; SKIP_NEWS=1 ;;
+    --skip-news) SKIP_NEWS=1 ;;
   esac
 done
-
-log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
 
 if [[ ${EUID:-0} -ne 0 ]]; then
   log "Este script debe ejecutarse como root."
@@ -31,12 +49,22 @@ fi
 mkdir -p "$STATE_DIR"
 chmod 755 "$STATE_DIR"
 
+# Serializa las comprobaciones: el timer de 6 h, un `systemctl start` lanzado
+# por arch-apply-updates.sh y una ejecución manual no deben pisarse escribiendo
+# el mismo fichero de estado. Si otra instancia está en marcha, esta sale sin
+# hacer nada (el estado ya lo escribirá la que manda).
+STATE_LOCK="${STATE_DIR}/checker.lock"
+exec 9>"$STATE_LOCK"
+if ! flock -n 9; then
+  log "Otra comprobación está en curso; se omite esta."
+  exit 0
+fi
+
 PACMAN_DB="$(pacman-conf DBPath 2>/dev/null || echo /var/lib/pacman)"
 PACMAN_DB="${PACMAN_DB%/}"
 LOCK_FILE="${PACMAN_DB}/db.lck"
 
 notify_users() {
-  local hash="$1"
   command -v runuser >/dev/null 2>&1 || return 0
   [[ -x /usr/local/bin/arch-update/arch-update-notify-agent.sh ]] || return 0
   local uid user bus home sid leader line dpy wdisp desk
@@ -105,7 +133,7 @@ is_pacman_busy() {
   return 1
 }
 
-if (( QUICK_REFRESH == 0 )) && is_pacman_busy; then
+if is_pacman_busy; then
   log "Pacman está ocupado; se omite esta comprobación."
   exit 0
 fi
@@ -117,56 +145,49 @@ trap cleanup EXIT INT TERM
 ### REPOS OFICIALES ###
 official_updates=""; official_count=0; official_checked=0
 
-if (( QUICK_REFRESH == 1 )); then
-  # Modo rápido: la BD local ya está sincronizada tras el pacman -Syu previo
-  official_updates=$(pacman -Qu --print-format '%r %n %v' 2>/dev/null |
-    awk -v re="$REPOS_REGEX" '$1 ~ re {print $1"/"$2" -> "$3}' | sort -u)
-  [[ -n "$official_updates" ]] && official_count=$(printf '%s\n' "$official_updates" | wc -l)
+# Modo completo: sincronizar en BD temporal para evitar partial upgrades
+TMP_DB="$(mktemp -d /tmp/arch-update-checker.XXXXXX)" || {
+  log "No se pudo crear el directorio temporal."
+  exit 1
+}
+chmod 755 "$TMP_DB"
+mkdir -p "$TMP_DB/sync"
+chmod 755 "$TMP_DB/sync"
+# /local se ENLAZA, no se copia (mismo criterio que checkupdates de
+# pacman-contrib): pacman solo lee el db local para comparar versiones en
+# `-Sy`/`-Sup`, y copiarlo suponía miles de entradas de I/O en cada
+# comprobación. Si el enlace fallara, se cae a la copia de siempre.
+if [[ -d "$PACMAN_DB/local" ]] && ! ln -s "$PACMAN_DB/local" "$TMP_DB/local" 2>/dev/null; then
+  mkdir -p "$TMP_DB/local"
+  chmod 755 "$TMP_DB/local"
+  cp -a "$PACMAN_DB/local/." "$TMP_DB/local/" >/dev/null 2>&1 || true
+fi
+
+sync_ok=0
+for attempt in 1 2 3; do
+  if pacman --dbpath "$TMP_DB" -Sy --logfile /dev/null >/dev/null 2>&1; then
+    sync_ok=1; break
+  fi
+  log "No se pudo sincronizar la BD temporal de pacman (intento ${attempt}/3); esperando 15 s."
+  sleep 15
+done
+if [[ $sync_ok -eq 1 ]]; then
   official_checked=1
+  official_updates=$(pacman --dbpath "$TMP_DB" -Sup --print-format '%r %n %v' 2>/dev/null |
+    filter_enabled_repos)
+  [[ -n "$official_updates" ]] && official_count=$(printf '%s\n' "$official_updates" | wc -l)
 else
-  # Modo completo: sincronizar en BD temporal para evitar partial upgrades
-  TMP_DB="$(mktemp -d /tmp/arch-update-checker.XXXXXX)" || {
-    log "No se pudo crear el directorio temporal."
-    exit 1
-  }
-  chmod 755 "$TMP_DB"
-  mkdir -p "$TMP_DB/local" "$TMP_DB/sync"
-  chmod 755 "$TMP_DB/local" "$TMP_DB/sync"
-  if [[ -d "$PACMAN_DB/local" ]]; then
-    cp -a "$PACMAN_DB/local/." "$TMP_DB/local/" >/dev/null 2>&1 || true
-  fi
-  
-  sync_ok=0
-  for attempt in 1 2 3; do
-    if pacman --dbpath "$TMP_DB" -Sy --logfile /dev/null >/dev/null 2>&1; then
-      sync_ok=1; break
-    fi
-    log "No se pudo sincronizar la BD temporal de pacman (intento ${attempt}/3); esperando 15 s."
-    sleep 15
-  done
-  if [[ $sync_ok -eq 1 ]]; then
-    official_checked=1
-    official_updates=$(pacman --dbpath "$TMP_DB" -Sup --print-format '%r %n %v' 2>/dev/null |
-      awk -v re="$REPOS_REGEX" '$1 ~ re {print $1"/"$2" -> "$3}' | sort -u)
-    [[ -n "$official_updates" ]] && official_count=$(printf '%s\n' "$official_updates" | wc -l)
-  else
-    log "No se pudo comprobar repos oficiales."
-  fi
+  log "No se pudo comprobar repos oficiales."
 fi
 
 ### AUR ###
 aur_updates=""; aur_count=0; aur_checked=0
 
-if (( QUICK_REFRESH == 1 )); then
-  # Modo rápido: asumir 0 (el AUR helper ya actualizó exitosamente)
-  aur_checked=1
-  aur_count=0
-else
-  # Modo completo: consultar AUR RPC
-  declare -A inst_ver=()
-  while read -r pkg ver; do
-    [[ -n "$pkg" ]] && inst_ver["$pkg"]="$ver"
-  done < <(pacman -Qm 2>/dev/null)
+# Modo completo: consultar AUR RPC
+declare -A inst_ver=()
+while read -r pkg ver; do
+  [[ -n "$pkg" ]] && inst_ver["$pkg"]="$ver"
+done < <(pacman -Qm 2>/dev/null)
   if (( ${#inst_ver[@]} == 0 )); then
     aur_checked=1
   elif command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 && command -v vercmp >/dev/null 2>&1; then
@@ -191,53 +212,47 @@ else
         log "Fallo consultando AUR RPC para un lote de paquetes."
       fi
     done
-    (( aur_failed == 0 )) && aur_checked=1
-  else
-    log "Faltan curl/jq/vercmp; AUR no comprobado."
-  fi
-  aur_updates="${aur_updates%$'\n'}"
-  if [[ -n "$aur_updates" ]]; then
-    aur_updates="$(printf '%s\n' "$aur_updates" | sort -u)"
-    aur_count=$(printf '%s\n' "$aur_updates" | wc -l)
-  fi
+(( aur_failed == 0 )) && aur_checked=1
+else
+  log "Faltan curl/jq/vercmp; AUR no comprobado."
+fi
+aur_updates="${aur_updates%$'\n'}"
+if [[ -n "$aur_updates" ]]; then
+  aur_updates="$(printf '%s\n' "$aur_updates" | sort -u)"
+  aur_count=$(printf '%s\n' "$aur_updates" | wc -l)
 fi
 
 ### FLATPAK ###
 flatpak_updates=""; flatpak_count=0; flatpak_checked=1
 
-if (( QUICK_REFRESH == 1 )); then
-  # Modo rápido: asumir 0 (flatpak update ya actualizó exitosamente)
-  flatpak_count=0
-else
-  # Modo completo: consultar remotos
-  flatpak_list_updates() {
-    local out=""
-    if out=$("$@" --updates --columns=application 2>/dev/null); then :; else out=""; fi
-    if [[ -z "$out" ]]; then out=$("$@" --updates 2>/dev/null | awk '{print $1}'); fi
-    printf '%s\n' "$out" | sed '/^[[:space:]]*$/d'
-  }
-  if command -v flatpak >/dev/null 2>&1; then
-    if [[ -d /var/lib/flatpak ]]; then
-      while read -r app; do
-        [[ -n "$app" ]] && flatpak_updates+="flatpak/system: ${app}"$'\n'
-      done < <(flatpak_list_updates flatpak remote-ls --system)
-    fi
-    while IFS=: read -r user _ uid _ _ home _; do
-      [[ "$uid" =~ ^[0-9]+$ ]] || continue
-      (( uid >= 1000 && uid < 65000 )) || continue
-      [[ -n "$home" && -d "$home" && -d "$home/.local/share/flatpak" ]] || continue
-      while read -r app; do
-        [[ -n "$app" ]] && flatpak_updates+="flatpak/user(${user}): ${app}"$'\n'
-      done < <(flatpak_list_updates runuser -u "$user" -- env HOME="$home" XDG_RUNTIME_DIR="/run/user/${uid}" flatpak remote-ls --user)
-    done < <(getent passwd)
-    flatpak_updates="${flatpak_updates%$'\n'}"
-    if [[ -n "$flatpak_updates" ]]; then
-      flatpak_updates="$(printf '%s\n' "$flatpak_updates" | sort -u)"
-      flatpak_count=$(printf '%s\n' "$flatpak_updates" | wc -l)
-    fi
-  else
-    log "flatpak no está instalado; se omite Flatpak."
+# Modo completo: consultar remotos
+flatpak_list_updates() {
+  local out=""
+  if out=$("$@" --updates --columns=application 2>/dev/null); then :; else out=""; fi
+  if [[ -z "$out" ]]; then out=$("$@" --updates 2>/dev/null | awk '{print $1}'); fi
+  printf '%s\n' "$out" | sed '/^[[:space:]]*$/d'
+}
+if command -v flatpak >/dev/null 2>&1; then
+  if [[ -d /var/lib/flatpak ]]; then
+    while read -r app; do
+      [[ -n "$app" ]] && flatpak_updates+="flatpak/system: ${app}"$'\n'
+    done < <(flatpak_list_updates flatpak remote-ls --system)
   fi
+  while IFS=: read -r user _ uid _ _ home _; do
+    [[ "$uid" =~ ^[0-9]+$ ]] || continue
+    (( uid >= 1000 && uid < 65000 )) || continue
+    [[ -n "$home" && -d "$home" && -d "$home/.local/share/flatpak" ]] || continue
+    while read -r app; do
+      [[ -n "$app" ]] && flatpak_updates+="flatpak/user(${user}): ${app}"$'\n'
+    done < <(flatpak_list_updates runuser -u "$user" -- env HOME="$home" XDG_RUNTIME_DIR="/run/user/${uid}" flatpak remote-ls --user)
+  done < <(getent passwd)
+  flatpak_updates="${flatpak_updates%$'\n'}"
+  if [[ -n "$flatpak_updates" ]]; then
+    flatpak_updates="$(printf '%s\n' "$flatpak_updates" | sort -u)"
+    flatpak_count=$(printf '%s\n' "$flatpak_updates" | wc -l)
+  fi
+else
+  log "flatpak no está instalado; se omite Flatpak."
 fi
 
 ### NOTICIAS DE ARCH LINUX ###

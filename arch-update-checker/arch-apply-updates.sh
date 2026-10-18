@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -u
+
 PENDING="/var/cache/arch-update-checker/pending"
+# Unidades y binarios de la suite; se comprueba su existencia antes de usarlos.
+CHECKER_SERVICE="arch-update-checker.service"
+UKI_SYNC_BIN="/usr/local/bin/cizen-uki-sync"
+KERNEL_NOTIFY_BIN="/usr/local/bin/kernel-update/kernel-update-notify.sh"
 
 pause_final() {
   if [[ -n "${AUC_AUTO_WINDOW:-}" ]]; then
@@ -44,13 +49,32 @@ pkg_best_repo() {
   local pkg="$1" repo v best_repo="" best_ver=""
   while read -r repo; do
     [[ -n "$repo" ]] || continue
-    v="$(pacman -Sl "$repo" 2>/dev/null | awk -v p="$pkg" '$2==p {print $3; exit}')"
+    # `-Si repo/pkg` interroga SOLO ese paquete en ese repo. `pacman -Sl repo`
+    # vuelca el índice completo (decenas de miles de líneas) por cada conflicto.
+    v="$(LC_ALL=C pacman -Si "$repo/$pkg" 2>/dev/null |
+      awk -F' *: *' '/^Version/ {print $2; exit}')"
     [[ -n "$v" ]] || continue
     if [[ -z "$best_ver" ]] || (( $(vercmp "$v" "$best_ver") > 0 )); then
       best_ver="$v"; best_repo="$repo"
     fi
   done < <(pacman-conf --repo-list 2>/dev/null)
   [[ -n "$best_ver" ]] && printf '%s %s\n' "$best_repo" "$best_ver"
+}
+
+# Snapshot Btrfs previo. Se pide y se crea ANTES de cualquier operación de red
+# de pacman. Un snapshot tomado tras `pacman -Sy` fija las bases de datos nuevas
+# con los binarios viejos: restaurarlo devuelve el sistema a un estado de
+# upgrade parcial (partial upgrade), que es exactamente lo que pacman impide.
+maybe_create_snapshot() {
+  command -v snapper >/dev/null 2>&1 || return 0
+  read -r -p "¿Crear snapshot Btrfs previo con snapper? [S/n] " s
+  [[ "$s" =~ ^[Nn] ]] && return 0
+  if sudo snapper create --description "Pre-actualización $(date '+%F %T')" \
+       --cleanup-algorithm timeline; then
+    echo "✔ Snapshot Btrfs creado."
+  else
+    echo "⚠ No se pudo crear el snapshot (revisa snapper); continuando…"
+  fi
 }
 
 # Pistas para errores que no son conflictos de archivos.
@@ -235,17 +259,11 @@ PACMAN_LOG_OFF=0
 if [[ -z "$n_off" ]] || (( n_off > 0 )); then
   read -r -p "¿Actualizar repositorios oficiales con pacman? [S/n] " r
   if [[ ! "$r" =~ ^[Nn] ]]; then
-    sudo pacman -Sy
-    if command -v snapper >/dev/null 2>&1; then
-      read -r -p "¿Crear snapshot Btrfs previo con snapper? [S/n] " s
-      if [[ ! "$s" =~ ^[Nn] ]]; then
-        if sudo snapper create --description "Pre-actualización $(date '+%F %T')" --cleanup-algorithm timeline >/dev/null 2>&1; then
-          echo "✔ Snapshot Btrfs creado."
-        else
-          echo "⚠ No se pudo crear el snapshot (revisa snapper); continuando…"
-        fi
-      fi
-    fi
+    # El snapshot va ANTES de tocar la red: `run_official_upgrade` ejecuta
+    # `pacman -Syu`, que sincroniza y actualiza en una sola transacción. Un
+    # `pacman -Sy` suelto antes del snapshot dejaría el restaurado en partial
+    # upgrade, y era redundante con el -Syu.
+    maybe_create_snapshot
     if run_official_upgrade; then actualizado=1; fi
   else
     echo "Omitido."
@@ -289,8 +307,19 @@ if command -v flatpak >/dev/null 2>&1 && { [[ -z "$n_fp" ]] || (( n_fp > 0 )); }
       echo "  (plantilla: arch-update-checker/99-cizen-build.sudoers del repo)."
       if flatpak update; then actualizado=1; fi
     fi
+    # Flatpak de usuario (~/.local/share/flatpak): corre como usuario, sin
+    # sudo. `-y` es obligatorio porque la salida va a un tubo no interactivo:
+    # sin él, si hay que resolver dependencias o confirmar, se quedaría
+    # esperando entrada en un canal cerrado (o abortaría en silencio).
     if [[ -d "$HOME/.local/share/flatpak" ]]; then
-      flatpak update --user >/dev/null 2>&1 || true
+      fp_user_out=""
+      if fp_user_out="$(flatpak update -y --user 2>&1)"; then
+        printf '%s\n' "$fp_user_out"
+        grep -qiE 'nothing to do|no hay nada que hacer' <<<"$fp_user_out" || actualizado=1
+      else
+        printf '%s\n' "$fp_user_out"
+        echo "⚠ 'flatpak update --user' terminó con errores (revisa la salida)."
+      fi
     fi
   else
     echo "Omitido."
@@ -311,7 +340,9 @@ if [[ -n "$pacnew_list" ]]; then
   printf '%s\n' "$pacnew_list" | sed 's/^/   • /'
   if command -v pacdiff >/dev/null 2>&1; then
     read -r -p "¿Revisarlos ahora con pacdiff? [S/n] " p
-    [[ "$p" =~ ^[Nn] ]] || sudo pacdiff
+    # `sudo -E` preserva DIFFPROG/DIFFARCH y demás variables del usuario;
+    # `sudo pacdiff` perdía el difuminador configurado.
+    [[ "$p" =~ ^[Nn] ]] || sudo -E pacdiff
   else
     echo "  (instala pacman-contrib para usar pacdiff)"
   fi
@@ -326,7 +357,9 @@ if [[ -n "$orphans" ]]; then
   printf '%s\n' "$orphans" | sed 's/^/   • /'
   read -r -p "¿Eliminarlos con 'pacman -Rns'? [S/n] " o
   if [[ ! "$o" =~ ^[Nn] ]]; then
-    orphan_list=( $orphans )
+    # readarray en vez de `orphan_list=( $orphans )`: el splitting sin comillas
+    # (SC2206) rompería con nombres con caracteres especiales y metía globs.
+    readarray -t orphan_list <<<"$orphans"
     sudo pacman -Rns "${orphan_list[@]}" && echo "✔ Huérfanos eliminados."
   fi
 else
@@ -381,16 +414,29 @@ if [[ -n "$updated_pkgs" ]]; then
     echo "· Ningún servicio activo seguro requiere reinicio ahora."
   else
     echo "⚙ Servicios activos cuyos paquetes se actualizaron (seguros de reiniciar en caliente):"
-    [[ -n "$sys_active" ]] && printf '   • [sistema] %s\n' $sys_active
+    [[ -n "$sys_active" ]] && printf '   • [sistema] %s\n' "$sys_active"
     [[ -n "$usr_active" ]] && printf '   • [usuario] %s\n' $usr_active
     read -r -p "¿Reiniciarlos ahora? [S/n] " rs
     if [[ ! "$rs" =~ ^[Nn] ]]; then
+      # if/else explícito (no `A && B || C`, SC2015): con el encadenamiento, un
+      # fallo de `echo` por pipe roto hacía entrar en la rama de error aunque
+      # `systemctl restart` hubiera tenido éxito.
       err=0
       for u in $sys_active; do
-        sudo systemctl restart "$u" && echo "   ✔ $u reiniciado" || { err=1; echo "   ✗ fallo al reiniciar $u (systemctl status $u)"; }
+        if sudo systemctl restart "$u"; then
+          echo "   ✔ $u reiniciado"
+        else
+          err=1
+          echo "   ✗ fallo al reiniciar $u (systemctl status $u)"
+        fi
       done
       for u in $usr_active; do
-        systemctl --user restart "$u" && echo "   ✔ $u reiniciado (usuario)" || { err=1; echo "   ✗ fallo al reiniciar $u (usuario)"; }
+        if systemctl --user restart "$u"; then
+          echo "   ✔ $u reiniciado (usuario)"
+        else
+          err=1
+          echo "   ✗ fallo al reiniciar $u (usuario)"
+        fi
       done
       [[ "$err" -eq 0 ]] && echo "✔ Servicios reiniciados."
     fi
@@ -404,27 +450,97 @@ if [[ -n "$updated_pkgs" ]]; then
     sudo systemctl daemon-reexec
   fi
   ### 4) Reinicio recomendado (paquetes críticos) ###
+  # Coincidencia por PATRÓN, no por lista fija de nombres: la lista anterior
+  # (linux, linux-lts, …) ignoraba el kernel personalizado linux-cizen-v3 y
+  # cualquier módulo DKMS (nvidia-open-dkms y cía.), que pasaban sin avisar.
+  # Cubre kernels estándar y propios, microcódigo, DKMS y los componentes que
+  # solo se aplican en el arranque.
   reboot_hits=""
-  for p in linux linux-lts linux-zen linux-hardened linux-rt linux-firmware intel-ucode amd-ucode systemd glibc mesa mesa-utils nvidia nvidia-utils; do
-    grep -qx "$p" <<<"$updated_pkgs" && reboot_hits+="$p "
+  cizen_kernel_updated=""
+  for p in $updated_pkgs; do
+    case "$p" in
+      linux*|*-ucode|systemd|systemd-boot|glibc|mesa*|nvidia*|*-dkms)
+        reboot_hits+="$p "
+        case "$p" in linux*cizen*) cizen_kernel_updated="$p" ;; esac
+        ;;
+    esac
   done
   if [[ -n "$reboot_hits" ]]; then
     echo
     echo "⚠ Se actualizaron paquetes críticos: $reboot_hits"
+    [[ -n "$cizen_kernel_updated" ]] &&
+      echo "  (incluye tu kernel Cizen $cizen_kernel_updated: el UKI del arranque debe reflejarlo)"
     echo "  Se RECOMIENDA REINICIAR el sistema para aplicar los cambios."
     read -r -p "¿Reiniciar ahora? [s/N] " rb
     [[ "$rb" =~ ^[Ss] ]] && sudo systemctl reboot
+  fi
+
+  ### 5) UKI del arranque (suite Cizen) ###
+  # La UKI que arranca el equipo embebe el microcódigo, la cmdline y el initrd.
+  # Si cambian systemd, systemd-boot, linux-firmware, el microcódigo, el paquete
+  # base o el propio kernel Cizen, hay que regenerarla (y firmarla) para que el
+  # arranque no siga usando la imagen anterior.
+  uki_hits=""
+  for p in $updated_pkgs; do
+    case "$p" in
+      systemd|systemd-boot|linux-firmware|*-ucode|base|linux*cizen*) uki_hits+="$p " ;;
+    esac
+  done
+  if [[ -n "$uki_hits" ]]; then
+    echo
+    echo "⚙ Paquetes que afectan al arranque/UKI: $uki_hits"
+    if [[ -x "$UKI_SYNC_BIN" ]]; then
+      read -r -p "¿Regenerar la UKI con cizen-uki-sync? [S/n] " uk
+      if [[ ! "$uk" =~ ^[Nn] ]]; then
+        if "$UKI_SYNC_BIN"; then
+          echo "✔ UKI sincronizada."
+        else
+          echo "⚠ cizen-uki-sync terminó con errores (revisa la salida)."
+        fi
+      fi
+    else
+      echo "  (no se encuentra $UKI_SYNC_BIN; regenera la UKI a mano con el menú de kernel-update)"
+    fi
   fi
 else
   echo "· No se registraron paquetes actualizados en esta sesión."
 fi
 
+### 6) Kernel Cizen: ¿hay release de kernel.org pendiente de compilar? ###
+# Consolida ambas suites: tras el mantenimiento se comprueba si el notificador
+# de kernel.org ve una release más nueva que la instalada. `--check` imprime una
+# línea y devuelve 10 si hay release pendiente; el timeout evita que el
+# asistente se quede colgado si kernel.org no responde.
+if [[ -x "$KERNEL_NOTIFY_BIN" ]]; then
+  krc=0
+  kout="$(timeout 25 "$KERNEL_NOTIFY_BIN" --check 2>/dev/null)" || krc=$?
+  if (( krc == 10 )); then
+    echo
+    echo "⚙ Kernel: hay una release de kernel.org pendiente de compilar ($kout)."
+    echo "  Menú de compilación: /usr/local/bin/kernel-update/kernel-update-menu.sh"
+  fi
+fi
+
 ### REFRESCO (background, no bloqueante) ###
 echo
 if (( actualizado == 1 )); then
-  setsid nohup sudo /usr/local/bin/arch-update/arch-update-checker.sh --quick-refresh >/dev/null 2>&1 &
-  disown
-  echo "✔ Refresco lanzado en segundo plano (se completará en unos segundos)."
+  # El refresco se lanza vía systemd, no con `setsid nohup sudo …`:
+  #  - ese proceso moría sin TTY si las credenciales de sudo habían caducado
+  #    (>15 min, habitual con builds del AUR), y
+  #  - la redirección a /dev/null ocultaba el fallo, dejando el fichero
+  #    `pending` (y la notificación de escritorio) con datos obsoletos.
+  # `--no-block` devuelve el control al instante; el chequeo completo que hace
+  # el servicio además vuelve a mirar AUR y Flatpak, que este asistente pudo
+  # omitir. Si el arranque falla, se avisa (nada silencioso) y el timer de 6 h
+  # sigue siendo la red de seguridad.
+  if command -v systemctl >/dev/null 2>&1 &&
+     sudo -n systemctl start --no-block "$CHECKER_SERVICE" 2>/dev/null; then
+    echo "✔ Refresco lanzado en segundo plano (systemd $CHECKER_SERVICE)."
+  else
+    echo "⚠ No pude lanzar el refresco en segundo plano sin contraseña."
+    echo "  El timer de 6 h lo hará igualmente; para refrescar ahora:"
+    echo "      sudo systemctl start $CHECKER_SERVICE"
+  fi
 else
   echo "No se aplicaron cambios; el estado se refrescará solo cada 6 h."
 fi

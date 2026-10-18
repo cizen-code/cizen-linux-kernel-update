@@ -105,6 +105,15 @@ if notify-send --help 2>&1 | grep -q -- '--action'; then
   fi
 fi
 
+# El marcador debe escribirse ANTES de invocar notify-send que pueda bloquear.
+# Un timeout largo (-t 0 combinado con acción), o que el agente se reinicie,
+# podía crear una nueva notificación idéntica sobre la anterior si el marcador
+# aún no existía cuando llegaba una nueva instancia (timer de 6 h).
+if [[ -n "$current_hash" ]]; then
+  mkdir -p "$CACHE_DIR"
+  printf '%s\n' "$current_hash" >"$MARKER" 2>/dev/null || true
+fi
+
 resp=""
 if (( ${#actions[@]} > 0 )); then
   resp="$(notify-send -a 'Arch Update Checker' -u critical -t 0 -i system-software-update \
@@ -114,10 +123,6 @@ else
     "$TITLE" "$BODY" >/dev/null 2>&1 || true
 fi
 alog "Respuesta de la notificación: '${resp:-（ninguna）}'"
-
-if [[ -n "$current_hash" ]]; then
-  printf '%s\n' "$current_hash" >"$MARKER" 2>/dev/null || true
-fi
 
 case "$resp" in
   update)
