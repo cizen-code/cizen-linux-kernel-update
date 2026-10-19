@@ -170,7 +170,7 @@ export LC_ALL=C
 #     deje de describir un estado que el power-profiles-daemon sobrescribe y el
 #     fallback sin PPD no degrade a EPP 255.
 # No se toca el motor: la cmdline se hereda, no se genera.
-SCRIPT_VERSION="27.35.10"
+SCRIPT_VERSION="27.35.11"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -3529,6 +3529,30 @@ download_file() {
   fi
 }
 
+# Descarga silenciosa para ficheros que pueden NO existir en el origen (los
+# intentos de parche que sondean variantes: mirror del forward-port, upstream
+# del autor, etc.). Con download_file, aria2c imprime en crudo su bloque
+# "Download Results" + "Exception ... Resource not found" cada vez que un
+# candidato da 404, que en el caso de BORE/7.3 (mirror sin publicar) llenaba la
+# pantalla con un error que NO es tal: el motor degrada al siguiente intento por
+# diseño. Aquí no se emite nada: el motor ya anuncia cada intento con su warn.
+# Mismo contrato que download_file (rc 0 = descargado; != 0 = no disponible).
+# override CIZEN_DOWNLOAD_QUIET_VERBOSE=1 para depuración (deja pasar el ruido).
+download_file_quiet() {
+  if [ "${CIZEN_DOWNLOAD_QUIET_VERBOSE:-0}" = 1 ]; then
+    download_file "$@"
+    return
+  fi
+  local url="$1" out="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 30 --retry 3 --retry-delay 2 --max-time 600 -o "$out" "$url"
+  elif command -v wget >/dev/null 2>&1; then
+    wget --tries=3 --timeout=30 -q -O "$out" "$url"
+  else
+    download_small_file "$url" "$out"
+  fi
+}
+
 get_tarball() {
   local tarball="$1" url="$2" tmp_download tmp_sign sig bad_name sign_url
   if [ "$KERNEL_TREE" = "cachyos" ]; then
@@ -6705,7 +6729,7 @@ apply_patch_plugin() {
   main_url="${PATCH_URL_PREFIX}/${PATCH_BRANCH}/${PATCH_CDN_SUBDIR}/${PATCH_MAIN_FILE}"
   main_tmp="${patch_file}.intento1"
   rm -f -- "$patch_file" "$main_tmp"
-  if download_file "$main_url" "$main_tmp"; then
+  if download_file_quiet "$main_url" "$main_tmp"; then
     if [ ! -s "$main_tmp" ]; then
       _mreason="descarga vacía"
     elif ! grep -Fq "$PATCH_MAGIC" "$main_tmp"; then
@@ -6751,7 +6775,7 @@ apply_patch_plugin() {
     if [ -n "$_mreason" ]; then
       warn "${PATCH_DISP_NAME:-$name}: ${PATCH_MAIN_FILE} $_mreason; probando upstream (${PATCH_FALLBACK_FILE}) ..."
       fallback_url="${PATCH_URL_PREFIX}/${PATCH_BRANCH}/${PATCH_CDN_SUBDIR}/${PATCH_FALLBACK_FILE}"
-      if ! download_file "$fallback_url" "$patch_file" \
+      if ! download_file_quiet "$fallback_url" "$patch_file" \
          || [ ! -s "$patch_file" ] \
          || ! grep -Fq "$PATCH_MAGIC" "$patch_file" \
          || ! patch -p1 --dry-run -d "$SRC" < "$patch_file" >/dev/null 2>&1; then
@@ -6766,7 +6790,7 @@ apply_patch_plugin() {
           if _upfile="$(patch_pick_upstream_file "${patch_file}.lista")"; then
             _up_url="${PATCH_UPSTREAM_RAW}/${_upfile}"
             warn "${PATCH_DISP_NAME:-$name}: ${PATCH_FALLBACK_FILE} no disponible/no aplica en ${PATCH_BRANCH:-?}; probando el oficial del mantenedor (${_upfile}) ..."
-            if download_file "$_up_url" "$patch_file" \
+            if download_file_quiet "$_up_url" "$patch_file" \
                && [ -s "$patch_file" ] \
                && grep -Fq "$PATCH_MAGIC" "$patch_file" \
                && patch -p1 --dry-run -d "$SRC" < "$patch_file" >/dev/null 2>&1; then
@@ -6913,7 +6937,7 @@ apply_cachy_misc_single() {
     tmp="$(mktemp "$KERNEL_BUILD_ROOT/cachy-${item}-${br}.XXXXXX.patch" 2>/dev/null || mktemp)"
     rm -f -- "$tmp"
     url="https://raw.githubusercontent.com/CachyOS/kernel-patches/master/${br}/misc/${cand}"
-    if download_file "$url" "$tmp"; then
+    if download_file_quiet "$url" "$tmp"; then
       if [ -s "$tmp" ] && grep -Fqi "diff --git" "$tmp" && patch -p1 --dry-run -d "$SRC" < "$tmp" >/dev/null 2>&1; then
         if patch -p1 -d "$SRC" < "$tmp" >/dev/null 2>&1; then
           ok "CachyOS misc: $item aplicado (rama $br, $cand)."

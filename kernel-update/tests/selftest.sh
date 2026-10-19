@@ -78,6 +78,10 @@ download_file() { download_file_good "$@"; }
 # El probe de releases usa download_small_file (un hilo); en el harness se
 # sirve con el mismo stub de download_file para no tocar la red.
 download_small_file() { download_file "$@"; }
+# Los intentos de parche usan download_file_quiet (descarga sin el ruido de
+# aria2 en los candidatos que dan 404); en el harness delega en el mismo stub
+# para que la lógica de intentos se siga ejercitando.
+download_file_quiet() { download_file "$@"; }
 
 # parches de prueba (contienen el PATCH_MAGIC que exige el motor)
 printf 'config SCHED_BORE\n--- a/init/Kconfig\n+++ b/init/Kconfig\n' > "$ROOT/patch-cachy.patch"
@@ -6051,6 +6055,35 @@ case "$_apf_unset" in
   *) rec fail "apply_patch_plugin no resetea CHOICE_DISABLE/RETIRED/EMBED_B64 juntos" ;;
 esac
 unset _bmq_leak _bmq_retired _bmq_choice _bore_retired _bore_choice _apf_unset _v
+
+printf '%s\n' "== descargas de parche silenciosas (no ensucian la terminal con 404) =="
+# El mirror/upstream de un parche puede dar 404 por diseño (CachyOS sin
+# 0001-bore.patch en 7.3) y aria2c imprime en crudo su bloque de error, que
+# parece un fallo del build. Los intentos de parche deben usar
+# download_file_quiet; el motor conserva download_file para el tarball.
+grep -q '^download_file_quiet() {' "$MOTOR" \
+  && rec ok "el motor define download_file_quiet" \
+  || rec fail "no existe download_file_quiet en el motor"
+_dq_body="$(sed -n '/^download_file_quiet() {/,/^}/p' "$MOTOR")"
+case "$_dq_body" in
+  *CIZEN_DOWNLOAD_QUIET_VERBOSE*) rec ok "download_file_quiet respeta el override de depuración" ;;
+  *) rec fail "download_file_quiet no lee CIZEN_DOWNLOAD_QUIET_VERBOSE" ;;
+esac
+# download_file (tarball) sigue siendo la ruidosa: no debe llamar a la quiet.
+case "$_dq_body" in
+  *download_file\ \"\$\@\"*) rec ok "el override delega en download_file (con su progreso)" ;;
+  *) rec fail "el override de download_file_quiet no delega en download_file" ;;
+esac
+_apf_body="$(sed -n '/^apply_patch_plugin() {/,/^}/p' "$MOTOR")"
+_apf_plain="$(printf '%s\n' "$_apf_body" | grep -c '[^_]download_file "')"
+_apf_quiet="$(printf '%s\n' "$_apf_body" | grep -c 'download_file_quiet "')"
+[ "$_apf_quiet" -ge 3 ] \
+  && rec ok "los 3 intentos de parche usan la descarga silenciosa ($_apf_quiet)" \
+  || rec fail "apply_patch_plugin solo usa download_file_quiet $_apf_quiet veces (esperado 3)"
+[ "$_apf_plain" = 0 ] \
+  && rec ok "no queda ninguna descarga ruidosa de parche en apply_patch_plugin" \
+  || rec fail "apply_patch_plugin aún llama a download_file en $_apf_plain sitios"
+unset _dq_body _apf_body _apf_plain _apf_quiet
 
 printf '%s\n' "== módulo firmado: SECURE_BOOT no se leía sin existir (module-sign) =="
 # `if [ "$SECURE_BOOT" = true ]` dentro de module_sign_installed. La variable no

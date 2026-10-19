@@ -1,3 +1,26 @@
+## [27.35.11] - 2026-10-19
+
+**Descargas de parche silenciosas: un 404 esperado (mirror CachyOS sin publicar
+el parche de una rama) ya no imprime en crudo el bloque de error de aria2c.**
+
+Al buildear 7.3 con BORE (v27.35.10) el intento contra el mirror falla a
+propósito (404 en `sched/0001-bore.patch`) para degradar al intento 3, pero
+`aria2c` volcaba al terminal su `Download Results` + `Exception … Resource not
+found` + `aria2 will resume download…`: parecía un fallo del build cuando el
+motor ya había degradado correctamente.
+
+- **`download_file_quiet()`** (nueva): misma semántica que `download_file`
+  (rc 0 = descargado, ≠0 = no disponible) pero sin ruido — `curl -fsSL`/`wget -q`
+  en vez de aria2c. Override `CIZEN_DOWNLOAD_QUIET_VERBOSE=1` para depurar
+  (delega en `download_file` con su progreso).
+- **`apply_patch_plugin`** (3 intentos), **intento 1b embebido** y
+  **`apply_cachy_misc_single`** usan ya `download_file_quiet`. El tarball
+  (`get_tarball`) sigue con `download_file` (aria2c/progreso): ahí una descarga
+  sí es un evento que interesa ver.
+- **Selftest** (738 ok): guardas de que los intentos usan la descarga silenciosa,
+  que `download_file_quiet` existe y respeta el override, y que no queda ninguna
+  llamada ruidosa de parche en `apply_patch_plugin`.
+
 ## [27.35.10] - 2026-10-19
 
 **BORE: tercer intento de parche desde el repo del mantenedor
