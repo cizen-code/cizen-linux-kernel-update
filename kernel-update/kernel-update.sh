@@ -170,7 +170,7 @@ export LC_ALL=C
 #     deje de describir un estado que el power-profiles-daemon sobrescribe y el
 #     fallback sin PPD no degrade a EPP 255.
 # No se toca el motor: la cmdline se hereda, no se genera.
-SCRIPT_VERSION="27.35.9"
+SCRIPT_VERSION="27.35.10"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
@@ -3965,6 +3965,11 @@ extract_tarball() {
 #   PATCH_FALLBACK_FILE  respaldo del autor upstream (se sincroniza por release)
 #   PATCH_SHA256_MAIN    hash SHA256 de confianza del fichero principal (pin)
 #   PATCH_SHA256_FALLBACK  hash SHA256 de confianza del respaldo upstream (pin)
+#   PATCH_UPSTREAM_API   (opcional) API que lista el dir oficial del mantenedor:
+#                        de ahí se descubre el nombre real del fichero, que
+#                        cambia con cada release (0001-linux7.3-rc2-bore-7.0.0)
+#   PATCH_UPSTREAM_RAW   (opcional) base raw para descargar ese fichero
+#   PATCH_SHA256_UPSTREAM (opcional) pin SHA256 del fichero del mantenedor
 #   PATCH_CACHE_NAME     prefijo del fichero en KERNEL_BUILD_ROOT (-> name-$br.patch)
 #   PATCH_SYMBOLS        símbolos Kconfig que el parche introduce (=y + rebelde)
 #   PATCH_MAGIC          cadena que debe aparecer en un parche válido
@@ -3977,11 +3982,18 @@ extract_tarball() {
 #     definitivo si valida (aplica limpio): un intento fallido no pisa el
 #     destino, no deja .1 huérfanos y no muestra dos descargas idénticas.
 #   - Degrade automático principal -> upstream si no aplica limpio sobre X.Y.Z.
+#   - Tercer intento (v27.35.10): si el respaldo del descriptor no está
+#     publicado para la rama (p. ej. CachyOS sin 0001-bore.patch en 7.3 → 404)
+#     o no aplica limpio, se prueba el fichero que el mantenedor publica en su
+#     propio repo (PATCH_UPSTREAM_API → PATCH_UPSTREAM_RAW), descubriendo el
+#     nombre por la API y validándolo con los mismos criterios (marcador +
+#     dry-run + pin). Descriptor sin PATCH_UPSTREAM_API = sin intento 3.
 #   - ANCLAJE SHA256 (pin): el fichero que se va a aplicar debe coincidir con el
 #     hash de confianza del descriptor; si no, se descarta y se degrada a vanilla
 #     (nunca se aplica un parche cuya procedencia no casa con el pin). Overrides:
-#     CIZEN_PATCH_SHA256_MAIN / CIZEN_PATCH_SHA256_FALLBACK para otro hash bueno
-#     conocido, y CIZEN_PATCH_SHA256_VERIFY=0 para desactivar (último recurso).
+#     CIZEN_PATCH_SHA256_MAIN / CIZEN_PATCH_SHA256_FALLBACK /
+#     CIZEN_PATCH_SHA256_UPSTREAM para otro hash bueno conocido, y
+#     CIZEN_PATCH_SHA256_VERIFY=0 para desactivar (último recurso).
 #   - Cualquier fallo es fatal suave: warning y build vanilla (nunca rompe).
 #   - Al aplicar, los símbolos se registran (apply_patch_register) para que
 #     build_effective_arrays los fuerce a =y y los marque como esperados.
@@ -3992,6 +4004,33 @@ bore_branch_from_version() {
   else
     printf '%s\n' "${1%%.*}"
   fi
+}
+
+# Intento 3: lista el dir `stable` del repo del mantenedor vía su API y elige el
+# parche de esta release. El nombre rota con cada release/bore
+# (0001-linux7.3-rc2-bore-7.0.0.patch para 7.3), así que no se fija en el
+# descriptor: se busca por prefijo, primero `linux<X.Y.Z>` exacto y después
+# `linux<X.Y>` (rama), por si solo está publicado el forward-port de la rama.
+# $1 = ruta del temporal para el JSON. Imprime el nombre; rc=1 si no hay match.
+patch_pick_upstream_file() {
+  local listing="$1" pref name vshort
+  [ -n "${PATCH_UPSTREAM_API:-}" ] || return 1
+  vshort="${VERSION%%[!0-9.]*}" # 7.3.0-cizen-v3 -> 7.3.0
+  rm -f -- "$listing"
+  download_small_file "${PATCH_UPSTREAM_API}" "$listing" || { rm -f -- "$listing"; return 1; }
+  [ -s "$listing" ] || { rm -f -- "$listing"; return 1; }
+  for pref in "linux${vshort}" "linux${PATCH_BRANCH}"; do
+    while IFS= read -r name; do
+      case "$name" in
+        0001-"$pref"*.patch)
+          rm -f -- "$listing"
+          printf '%s\n' "$name"
+          return 0 ;;
+      esac
+    done < <(grep -o '"name": *"[^"]*"' "$listing" | sed 's/.*"\([^"]*\)"[[:space:]]*$/\1/')
+  done
+  rm -f -- "$listing"
+  return 1
 }
 
 # Descriptor del plugin BORE (firelzrd, reenviado por CachyOS).
@@ -4005,6 +4044,16 @@ patch_desc_bore() {
   PATCH_FALLBACK_FILE="0001-bore.patch"
   PATCH_SHA256_MAIN="1809a4d4d6508a2a3f92cd8b3b385640583f90bd6cee46584f4bf105affd24a0"
   PATCH_SHA256_FALLBACK="61b9543e400d6fb38a68ee2276538ae14834bec75d7b06d3e1ac9977174ff619"
+  # Intento 3: repo propio del mantenedor (firelzrd/bore-scheduler), sin pasar
+  # por CachyOS. Cubre el caso real de 7.3 (2026-10-19): CachyOS aún no publica
+  # 0001-bore.patch para la rama (404) y su 0001-bore-cachy.patch solo aplica
+  # sobre el árbol CachyOS, mientras que el upstream ya tenía su parche de 7.3 y
+  # aplica limpio sobre vanilla. El nombre se descubre por la API; el pin es del
+  # fichero 0001-linux7.3-rc2-bore-7.0.0.patch y hay que renovarlo cuando el
+  # mantenedor publica otra release (mismo protocolo que MAIN/FALLBACK).
+  PATCH_UPSTREAM_API="https://api.github.com/repos/firelzrd/bore-scheduler/contents/patches/stable"
+  PATCH_UPSTREAM_RAW="https://raw.githubusercontent.com/firelzrd/bore-scheduler/main/patches/stable"
+  PATCH_SHA256_UPSTREAM="0de0f56c2e3db14b4bb2797aa0362a623d4b7e39643add1da65f91a1cedcdcfd"
   PATCH_CACHE_NAME="bore"
   PATCH_SYMBOLS=(SCHED_BORE MIN_BASE_SLICE_NS)
   PATCH_MAGIC="config SCHED_BORE"
@@ -6557,6 +6606,7 @@ apply_patch_plugin() {
   local name="$1"
   local patch_file main_url fallback_url
   local main_tmp _mreason=
+  local _upfile="" _up_url=""
 
   # Carga el descriptor del parche (función patch_desc_<nombre> global).
   if ! declare -F "patch_desc_$name" >/dev/null 2>&1; then
@@ -6578,8 +6628,12 @@ apply_patch_plugin() {
   #   - PATCH_CHOICE_DISABLE=(SCHED_BMQ), que se marcaba como rebelde esperado;
   #   - PATCH_EMBED_B64 con el blob base64 del parche PRJC, que se intentaba
   #     decodificar como si fuera el parche de BORE.
+  # v27.35.10: igual motivo para las tres variables del intento 3: solo
+  # patch_desc_bore las declara, así que con varios schedulers en el mismo run
+  # el descriptor siguiente heredaría la API/raw/pin del upstream de BORE.
   unset PATCH_TREE_REQUIRED PATCH_SKIP_REASON PATCH_CHOICE_DISABLE \
-        PATCH_RETIRED_SYMBOLS PATCH_EMBED_B64
+        PATCH_RETIRED_SYMBOLS PATCH_EMBED_B64 \
+        PATCH_UPSTREAM_API PATCH_UPSTREAM_RAW PATCH_SHA256_UPSTREAM
 "patch_desc_$name"
 
   # Un descriptor puede decidir que el parche NO aplica a esta versión (p. ej.
@@ -6627,6 +6681,7 @@ apply_patch_plugin() {
 
   PATCH_SHA256_MAIN="${CIZEN_PATCH_SHA256_MAIN:-${PATCH_SHA256_MAIN:-}}"
   PATCH_SHA256_FALLBACK="${CIZEN_PATCH_SHA256_FALLBACK:-${PATCH_SHA256_FALLBACK:-}}"
+  PATCH_SHA256_UPSTREAM="${CIZEN_PATCH_SHA256_UPSTREAM:-${PATCH_SHA256_UPSTREAM:-}}"
   PATCH_SHA256_VERIFY="${CIZEN_PATCH_SHA256_VERIFY:-1}"
   # Imprime el motivo si $1 difiere del pin $2 (vacío si pin válido/desactivado).
   verify_patch_sha() {
@@ -6701,19 +6756,49 @@ apply_patch_plugin() {
          || ! grep -Fq "$PATCH_MAGIC" "$patch_file" \
          || ! patch -p1 --dry-run -d "$SRC" < "$patch_file" >/dev/null 2>&1; then
         rm -f -- "$patch_file"
-        warn "Ningún parche ${PATCH_DISP_NAME:-$name} disponible que aplique para la rama ${PATCH_BRANCH:-?} / $VERSION; se continúa vanilla."
-        return 1
-      fi
-      ok "${PATCH_DISP_NAME:-$name}: usando upstream ${PATCH_FALLBACK_FILE} (válido para $VERSION)."
-      _pin_reason="$(verify_patch_sha "$patch_file" "$PATCH_SHA256_FALLBACK")"
-      if [ -n "$_pin_reason" ]; then
-        rm -f -- "$patch_file"
-        warn "Parche ${PATCH_DISP_NAME:-$name}: $_pin_reason; se continúa vanilla. Si el hash es legítimo, actualiza el pin (CIZEN_PATCH_SHA256_MAIN / _FALLBACK) o usa CIZEN_PATCH_SHA256_VERIFY=0."
-        return 1
+        # Intento 3 (v27.35.10): fichero publicado por el mantenedor en su
+        # propio repo. Solo si el descriptor declara PATCH_UPSTREAM_API (ahora
+        # BORE: CachyOS dejó de publicar 0001-bore.patch para 7.3 y su
+        # forward-port no aplica sobre vanilla). El nombre lo da la API, se
+        # valida igual que los otros dos (marcador + dry-run + pin) y, si
+        # tampoco cuadra, se acaba igual que antes: warning y build vanilla.
+        if [ -n "${PATCH_UPSTREAM_API:-}" ] && [ "${CIZEN_PATCH_UPSTREAM:-1}" = 1 ]; then
+          if _upfile="$(patch_pick_upstream_file "${patch_file}.lista")"; then
+            _up_url="${PATCH_UPSTREAM_RAW}/${_upfile}"
+            warn "${PATCH_DISP_NAME:-$name}: ${PATCH_FALLBACK_FILE} no disponible/no aplica en ${PATCH_BRANCH:-?}; probando el oficial del mantenedor (${_upfile}) ..."
+            if download_file "$_up_url" "$patch_file" \
+               && [ -s "$patch_file" ] \
+               && grep -Fq "$PATCH_MAGIC" "$patch_file" \
+               && patch -p1 --dry-run -d "$SRC" < "$patch_file" >/dev/null 2>&1; then
+              ok "${PATCH_DISP_NAME:-$name}: usando upstream del mantenedor ${_upfile} (válido para $VERSION)."
+              _pin_reason="$(verify_patch_sha "$patch_file" "$PATCH_SHA256_UPSTREAM")"
+              if [ -n "$_pin_reason" ]; then
+                rm -f -- "$patch_file"
+                warn "Parche ${PATCH_DISP_NAME:-$name}: $_pin_reason; se continúa vanilla. Si el hash es legítimo, actualiza el pin (CIZEN_PATCH_SHA256_UPSTREAM) o usa CIZEN_PATCH_SHA256_VERIFY=0."
+                return 1
+              fi
+            else
+              rm -f -- "$patch_file"
+              warn "${PATCH_DISP_NAME:-$name}: el oficial del mantenedor ${_upfile} tampoco valida para $VERSION."
+            fi
+          fi
+        fi
+        if [ ! -f "$patch_file" ]; then
+          warn "Ningún parche ${PATCH_DISP_NAME:-$name} disponible que aplique para la rama ${PATCH_BRANCH:-?} / $VERSION; se continúa vanilla."
+          return 1
+        fi
+      else
+        ok "${PATCH_DISP_NAME:-$name}: usando upstream ${PATCH_FALLBACK_FILE} (válido para $VERSION)."
+        _pin_reason="$(verify_patch_sha "$patch_file" "$PATCH_SHA256_FALLBACK")"
+        if [ -n "$_pin_reason" ]; then
+          rm -f -- "$patch_file"
+          warn "Parche ${PATCH_DISP_NAME:-$name}: $_pin_reason; se continúa vanilla. Si el hash es legítimo, actualiza el pin (CIZEN_PATCH_SHA256_MAIN / _FALLBACK) o usa CIZEN_PATCH_SHA256_VERIFY=0."
+          return 1
+        fi
       fi
     fi
   fi
-  unset _mreason main_tmp _pin_reason _embed_tmp
+  unset _mreason main_tmp _pin_reason _embed_tmp _upfile _up_url
 
   if ! patch -p1 -d "$SRC" < "$patch_file" >/dev/null 2>&1; then
     warn "Aplicación real del parche ${PATCH_DISP_NAME:-$name} falló inesperadamente; se continúa vanilla."

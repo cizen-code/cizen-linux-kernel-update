@@ -116,6 +116,7 @@ extract_from() { # $1 = fichero, $2 = nombre de función
 }
 {
   extract bore_branch_from_version
+  extract patch_pick_upstream_file
   extract patch_desc_bore
   extract _patch_desc_scheduler_base
   # descriptores compactos de una línea (pds/bmq/lfbmq/muqss)
@@ -248,6 +249,22 @@ printf '%s\n' "== bore_branch_from_version =="
 [ "$(bore_branch_from_version 7.2)" = "7.2" ] && rec ok "7.2 -> 7.2" || rec fail "7.2 -> 7.2"
 [ "$(bore_branch_from_version 6.1.77)" = "6.1" ] && rec ok "6.1.77 -> 6.1" || rec fail "6.1.77 -> 6.1"
 
+printf '%s\n' "== patch_desc_bore: intento 3, repo del mantenedor (v27.35.10) =="
+patch_desc_bore
+case "${PATCH_UPSTREAM_API:-}" in
+  "https://api.github.com/repos/"*"/contents/patches/stable") rec ok "descriptor declara la API del mantenedor" ;;
+  *) rec fail "PATCH_UPSTREAM_API: [${PATCH_UPSTREAM_API:-<vacío>}]" ;;
+esac
+case "${PATCH_UPSTREAM_RAW:-}" in
+  "https://raw.githubusercontent.com/"*"/patches/stable") rec ok "descriptor declara la base raw del mantenedor" ;;
+  *) rec fail "PATCH_UPSTREAM_RAW: [${PATCH_UPSTREAM_RAW:-<vacío>}]" ;;
+esac
+if [[ "${PATCH_SHA256_UPSTREAM:-}" =~ ^[0-9a-f]{64}$ ]]; then
+  rec ok "pin upstream con hash de 64 hex (${PATCH_SHA256_UPSTREAM:0:12}…)"
+else
+  rec fail "PATCH_SHA256_UPSTREAM: [${PATCH_SHA256_UPSTREAM:-<vacío>}]"
+fi
+
 printf '%s\n' "== patch_markers_hit (árbol ya parcheado) =="
 mkdir -p "$SRC/kernel/sched"
 : > "$SRC/kernel/sched/bore.c"
@@ -353,6 +370,108 @@ else
 fi
 [ "${PATCHES_APPLIED[*]:-}" = "" ] && rec ok "pin rechazado: bore no se registró" || rec fail "bore se registró pese al pin no válido"
 unset CIZEN_PATCH_SHA256_FALLBACK
+
+printf '%s\n' "== patch_pick_upstream_file: descubre el nombre por la API (v27.35.10) =="
+# El fichero upstream rota con cada release (0001-linux7.3-rc2-bore-7.0.0.patch),
+# así que el descriptor no lo fija: se lista el dir del mantenedor y se elige por
+# prefijo, primero X.Y.Z exacto y después X.Y (ramas publicadas). El JSON es el
+# formato de la API de GitHub (una entrada por fichero con su "name").
+_up_json='[ {"name": "0001-linux7.2-rc1-bore-7.0.0.patch"},
+ {"name": "0001-linux7.3-rc2-bore-7.0.0.patch"} ]'
+download_small_file() { printf '%s\n' "$_up_json" > "$2"; }
+_up_sav_ver="$VERSION"
+VERSION="7.2.6"; PATCH_BRANCH="7.2"   # no existe linux7.2.6 -> cae en la rama 7.2
+rc=0; pick="$(patch_pick_upstream_file "$ROOT/up-list.json")" || rc=$?
+[ "$rc" = 0 ] && [ "$pick" = "0001-linux7.2-rc1-bore-7.0.0.patch" ] \
+  && rec ok "7.2.6 cae en el parche de su rama (7.2)" \
+  || rec fail "pick 7.2.6 = [$pick] (rc=$rc)"
+VERSION="7.3.0"; PATCH_BRANCH="7.3"   # prefijo exacto 7.3.0 no existe -> 7.3
+rc=0; pick="$(patch_pick_upstream_file "$ROOT/up-list.json")" || rc=$?
+[ "$rc" = 0 ] && [ "$pick" = "0001-linux7.3-rc2-bore-7.0.0.patch" ] \
+  && rec ok "7.3.0 cae en el parche publicado para 7.3" \
+  || rec fail "pick 7.3.0 = [$pick] (rc=$rc)"
+VERSION="7.9"; PATCH_BRANCH="7.9"     # sin parche publicado
+rc=0; pick="$(patch_pick_upstream_file "$ROOT/up-list.json")" || rc=$?
+[ "$rc" != 0 ] \
+  && rec ok "sin parche para la rama -> rc!=0 (degrada vanilla sin crashear)" \
+  || rec fail "pick sin match debía fallar (rc=$rc pick=[$pick])"
+[ ! -f "$ROOT/up-list.json" ] && rec ok "el JSON temporal no queda huérfano" \
+  || rec fail "resto de JSON: $ROOT/up-list.json"
+VERSION="$_up_sav_ver"; PATCH_BRANCH="$(bore_branch_from_version "$VERSION")"
+download_small_file() { download_file "$@"; }
+
+# Stub del escenario real de 7.3 (2026-10-19): el forward-port cachy no aplica
+# sobre vanilla, el mirror 0001-bore.patch de CachyOS devuelve 404 y el repo del
+# mantenedor sí tiene el suyo (API + fichero con el PATCH_MAGIC de BORE).
+_bore_stub_up404() {
+  DL_CALLED=$((DL_CALLED + 1))
+  printf '%s\n' "$1" >> "$ROOT/dl.log"
+  case "$1" in
+    *"/sched/0001-bore-cachy.patch")
+      LAST_SERVED="cachy"; cp -- "$ROOT/patch-cachy.patch" "$2" 2>/dev/null; return 0 ;;
+    *"/sched/0001-bore.patch")
+      return 1 ;;
+    *api.github.com*bore-scheduler*)
+      printf '[ {"name": "0001-linux7.3-rc2-bore-7.0.0.patch"} ]\n' > "$2"; return 0 ;;
+    *bore-scheduler*"/0001-linux"*)
+      LAST_SERVED="upstream"; cp -- "$ROOT/patch-cachy.patch" "$2" 2>/dev/null; return 0 ;;
+  esac
+  return 1
+}
+
+printf '%s\n' "== apply_patch_plugin: intento 3 upstream cuando CachyOS 404 (v27.35.10) =="
+rm -rf "$SRC/kernel/sched" "$KERNEL_BUILD_ROOT"/*
+mkdir -p "$SRC"
+_up_sav_ver="$VERSION"; VERSION="7.3"
+PATCHES_APPLIED=(); PATCH_ENABLE_ALL=(); PATCH_REBEL_ALL=(); PATCH_VALUE_SYMBOLS=()
+BORE_ENABLED=false; DL_CALLED=0; : > "$ROOT/dl.log"
+kconfig_index_invalidate
+KCONFIG_SYMBOL_KNOWN=([SCHED_BORE]=1 [MIN_BASE_SLICE_NS]=1)
+KCONFIG_SYMBOL_TYPE=([SCHED_BORE]=bool [MIN_BASE_SLICE_NS]=int)
+KCONFIG_SYMBOL_INDEX_BUILT=true; KCONFIG_TYPE_INDEX_BUILT=true
+export CIZEN_PATCH_SHA256_MAIN="$(sha256sum "$ROOT/patch-cachy.patch" | cut -d' ' -f1)"
+export CIZEN_PATCH_SHA256_UPSTREAM="$(sha256sum "$ROOT/patch-cachy.patch" | cut -d' ' -f1)"
+unset CIZEN_PATCH_SHA256_FALLBACK
+download_file() { _bore_stub_up404 "$@"; }
+if apply_patch_plugin bore; then
+  rec ok "intento 3: aplica el upstream del mantenedor cuando el mirror falla"
+  [ "$BORE_ENABLED" = true ] && rec ok "intento 3: BORE_ENABLED=true" || rec fail "intento 3: BORE_ENABLED=$BORE_ENABLED"
+  case " ${PATCH_ENABLE_ALL[*]:-} " in
+  *SCHED_BORE*) rec ok "intento 3: SCHED_BORE registrado en ENABLE" ;;
+  *) rec fail "intento 3: SCHED_BORE no está en ENABLE (${PATCH_ENABLE_ALL[*]:-})" ;;
+  esac
+  grep -q "firelzrd" "$ROOT/dl.log" 2>/dev/null \
+    && rec ok "se consultó y bajó del repo del mantenedor" \
+    || rec fail "no hubo ninguna llamada a firelzrd/bore-scheduler"
+  grep -q "/sched/0001-bore.patch" "$ROOT/dl.log" 2>/dev/null \
+    && rec ok "antes se probó el mirror CachyOS (404) y solo entonces el upstream" \
+    || rec fail "no consta el intento contra el mirror CachyOS"
+else
+  rec fail "el intento 3 debía aplicar (404 en CachyOS + upstream disponible)"
+fi
+download_file() { download_file_good "$@"; }
+
+printf '%s\n' "== apply_patch_plugin: pin upstream rechaza hash no anclado (v27.35.10) =="
+rm -rf "$SRC/kernel/sched" "$KERNEL_BUILD_ROOT"/*
+mkdir -p "$SRC"
+PATCHES_APPLIED=(); PATCH_ENABLE_ALL=(); PATCH_REBEL_ALL=(); PATCH_VALUE_SYMBOLS=()
+BORE_ENABLED=false; DL_CALLED=0
+kconfig_index_invalidate
+KCONFIG_SYMBOL_KNOWN=([SCHED_BORE]=1 [MIN_BASE_SLICE_NS]=1)
+KCONFIG_SYMBOL_TYPE=([SCHED_BORE]=bool [MIN_BASE_SLICE_NS]=int)
+KCONFIG_SYMBOL_INDEX_BUILT=true; KCONFIG_TYPE_INDEX_BUILT=true
+export CIZEN_PATCH_SHA256_UPSTREAM="0000000000000000000000000000000000000000000000000000000000000000"
+download_file() { _bore_stub_up404 "$@"; }
+if apply_patch_plugin bore; then
+  rec fail "el pin upstream incorrecto debía rechazar el parche"
+else
+  rec ok "pin upstream incorrecto -> rechaza y degrada vanilla"
+fi
+[ "${PATCHES_APPLIED[*]:-}" = "" ] && rec ok "pin upstream: bore no se registró" \
+  || rec fail "bore se registró pese al pin upstream no válido"
+download_file() { download_file_good "$@"; }
+unset CIZEN_PATCH_SHA256_UPSTREAM
+VERSION="$_up_sav_ver"
 
 printf '%s\n' "== apply_patch_plugin: árbol conservado ya parcheado (v27.22.4) =="
 mkdir -p "$SRC/kernel/sched"

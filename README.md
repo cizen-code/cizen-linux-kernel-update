@@ -520,14 +520,25 @@ estándar de Arch (mkinitcpio + intel-ucode + hook microcode).
 
 ### Anclaje SHA256 de los parches
 
-Los parches BORE (principal de CachyOS y respaldo upstream) se verifican por
-**SHA256 antes de aplicarse**: si el contenido descargado no coincide con el
-hash anclado en el descriptor del motor, el parche se descarta y el build se
-degrada a vanilla (nunca se aplica un parche cuya procedencia no casa con el
-pin). Overrides: `CIZEN_PATCH_SHA256_MAIN` / `CIZEN_PATCH_SHA256_FALLBACK`
-(otro hash bueno conocido); `CIZEN_PATCH_SHA256_VERIFY=0` desactiva el pin
-(último recurso). Al actualizar a una rama nueva puede ser necesario renovar
+Los parches BORE (principal de CachyOS, respaldo upstream del mirror y, como
+tercer intento, el fichero oficial del mantenedor en `firelzrd/bore-scheduler`)
+se verifican por **SHA256 antes de aplicarse**: si el contenido descargado no
+coincide con el hash anclado en el descriptor del motor, el parche se descarta y
+el build se degrada a vanilla (nunca se aplica un parche cuya procedencia no casa
+con el pin). Overrides: `CIZEN_PATCH_SHA256_MAIN` / `CIZEN_PATCH_SHA256_FALLBACK`
+/ `CIZEN_PATCH_SHA256_UPSTREAM` (otro hash bueno conocido);
+`CIZEN_PATCH_SHA256_VERIFY=0` desactiva el pin (último recurso).
+`CIZEN_PATCH_UPSTREAM=0` desactiva solo el tercer intento (útil si la API de
+GitHub no responde). Al actualizar a una rama nueva puede ser necesario renovar
 los hashes.
+
+El nombre del fichero del mantenedor rota con cada release
+(`0001-linux7.3-rc2-bore-7.0.0.patch` para 7.3), así que **no** se fija en el
+descriptor: el motor lista `patches/stable` por la API y elige por prefijo
+(`linux<X.Y.Z>` exacto y, si no, `linux<X.Y>` de la rama). Es el camino que cubre
+el caso de **7.3 (2026-10-19)**: CachyOS aún no publicaba `0001-bore.patch` para
+esa rama (404) y su forward-port solo aplica sobre el árbol CachyOS, mientras que
+el upstream ya tenía parche de 7.3 válido sobre vanilla.
 
 ### Guarda OOM pre-build
 

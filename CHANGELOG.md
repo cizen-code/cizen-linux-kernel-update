@@ -1,3 +1,42 @@
+## [27.35.10] - 2026-10-19
+
+**BORE: tercer intento de parche desde el repo del mantenedor
+(`firelzrd/bore-scheduler`) cuando el mirror de CachyOS no sirve. Permite el
+build de 7.3 con BORE.**
+
+Caso real (2026-10-19): para la rama **7.3**, `CachyOS/kernel-patches` solo
+publica `0001-bore-cachy.patch` —forward-port contra su propio árbol, que **no**
+aplica sobre vanilla— y `0001-bore.patch` **devuelve 404**. El motor degradaba a
+vanilla EEVDF por diseño. El upstream de firelzrd, en cambio, ya tenía
+`0001-linux7.3-rc2-bore-7.0.0.patch` y aplica limpio sobre `linux-7.3` (dry-run
+`-p1` rc=0, solo offsets).
+
+- **`patch_desc_bore`** declara ahora `PATCH_UPSTREAM_API`
+  (`https://api.github.com/repos/firelzrd/bore-scheduler/contents/patches/stable`),
+  `PATCH_UPSTREAM_RAW` (base raw del mismo dir) y `PATCH_SHA256_UPSTREAM`
+  (pin del fichero servido; `0de0f56c…`).
+- **`patch_pick_upstream_file()`** (nueva): lista el dir `stable` por la API y
+  elige el parche por prefijo —`linux<X.Y.Z>` exacto y, si no existe,
+  `linux<X.Y>` de la rama— porque el nombre **rota con cada release**
+  (`…-rc2-bore-7.0.0.patch`). Limpia siempre el JSON temporal.
+- **`apply_patch_plugin`**: nuevo intento 3 tras el fallback del descriptor. Solo
+  actúa si el descriptor declara `PATCH_UPSTREAM_API`. Descarga a un temporal,
+  valida marcador + `patch --dry-run` + pin SHA256 con la misma semántica que los
+  otros dos intentos (mismatch → warning y build vanilla, nunca se aplica un
+  parche sin anclar). Desactivable con `CIZEN_PATCH_UPSTREAM=0` (p. ej. si la API
+  de GitHub no responde); override de hash `CIZEN_PATCH_SHA256_UPSTREAM`.
+- **`unset PATCH_UPSTREAM_API/_RAW/PATCH_SHA256_UPSTREAM`** añadido al arranque de
+  `apply_patch_plugin`: evitaba la clase de bug de fuga de descriptor (v27.33.3)
+  con varios schedulers en el mismo run.
+- **Selftest** (`733 ok, 0 fail`): descriptor (API/raw/pin), selección por
+  prefijo (rama 7.2, exacta 7.3.0, sin match → rc≠0 y sin JSON huérfano), flujo
+  completo 404 en CachyOS → aplica el upstream del mantenedor y registra BORE, y
+  pin upstream incorrecto → rechaza y degrada vanilla.
+- **README**: documentados el anclaje del tercer intento y la rotación del nombre.
+
+Nota de mantenimiento: el pin `PATCH_SHA256_UPSTREAM` hay que renovarlo cuando
+firelzrd publique otra release del parche, igual que MAIN/FALLBACK.
+
 ## [27.35.9] - 2026-10-08
 
 **Perfil `cizen-optiplex7050` v5.26.1 → v5.27.0: optimizaciones #3, #5, #6 y #7
