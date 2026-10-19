@@ -123,6 +123,11 @@ extract_from() { # $1 = fichero, $2 = nombre de función
   extract patch_desc_ntsync
   extract patch_desc_fsync
   extract kernel_version_ge
+  # Release X.Y.0: kernel.org publica 7.3 y el Makefile del árbol reporta 7.3.0
+  extract normalize_version
+  extract version_matches
+  extract kernel_version_full
+  extract kernel_release_name
   extract _resolve_cc_compiler
   extract resolve_kernel_tree
   extract cachyos_release_tagrel
@@ -397,6 +402,56 @@ kernel_version_ge 6.10 6.10 && rec ok "6.10 >= 6.10" || rec fail "6.10>=6.10"
 kernel_version_ge 7.2.6 6.8 && rec ok "7.2.6 >= 6.8" || rec fail "7.2.6>=6.8"
 ! kernel_version_ge 6.1.77 6.2 && rec ok "6.1.77 < 6.2" || rec fail "6.1.77>=6.2"
 ! kernel_version_ge 5.15 6.1 && rec ok "5.15 < 6.1" || rec fail "5.15>=6.1"
+
+printf '%s\n' "== version_matches / normalize_version (release X.Y.0) =="
+[ "$(normalize_version 7.3.0)" = "7.3" ] \
+  && rec ok "normalize_version 7.3.0 -> 7.3" || rec fail "normalize_version 7.3.0 = $(normalize_version 7.3.0)"
+[ "$(normalize_version 7.2.11)" = "7.2.11" ] \
+  && rec ok "normalize_version 7.2.11 intacta" || rec fail "normalize_version 7.2.11 = $(normalize_version 7.2.11)"
+[ "$(normalize_version 7.30)" = "7.30" ] \
+  && rec ok "normalize_version 7.30 no se confunde con 7.3" || rec fail "normalize_version 7.30 = $(normalize_version 7.30)"
+[ "$(normalize_version 7.0.0)" = "7.0" ] \
+  && rec ok "normalize_version 7.0.0 -> 7.0" || rec fail "normalize_version 7.0.0 = $(normalize_version 7.0.0)"
+version_matches 7.3.0 7.3 && rec ok "7.3.0 del Makefile coincide con la release 7.3" \
+  || rec fail "version_matches 7.3.0 7.3 devolvió 1 (el gate de extract_tarball rechazará el árbol)"
+version_matches 7.3 7.3 && rec ok "7.3 coincide con 7.3" || rec fail "version_matches 7.3 7.3"
+version_matches 7.2.11 7.2.11 && rec ok "7.2.11 coincide consigo misma" || rec fail "version_matches 7.2.11 7.2.11"
+! version_matches 7.3.1 7.3 && rec ok "7.3.1 NO es la release 7.3" || rec fail "7.3.1 se aceptó como 7.3"
+! version_matches 7.30 7.3 && rec ok "7.30 NO es la release 7.3" || rec fail "7.30 se aceptó como 7.3"
+! version_matches 7.4 7.3 && rec ok "7.4 NO es la release 7.3" || rec fail "7.4 se aceptó como 7.3"
+[ "$(kernel_version_full 7.3)" = "7.3.0" ] \
+  && rec ok "kernel_version_full 7.3 -> 7.3.0" || rec fail "kernel_version_full 7.3 = $(kernel_version_full 7.3)"
+[ "$(kernel_version_full 7.2.11)" = "7.2.11" ] \
+  && rec ok "kernel_version_full 7.2.11 intacta" || rec fail "kernel_version_full 7.2.11 = $(kernel_version_full 7.2.11)"
+_sv_ver="$VERSION"; _sv_suf="${LOCALVERSION_SUFFIX-}"
+VERSION=7.3; LOCALVERSION_SUFFIX="-cizen-v3"
+[ "$(kernel_release_name)" = "7.3.0-cizen-v3" ] \
+  && rec ok "kernel_release_name 7.3 -> 7.3.0-cizen-v3 (pkgver/uname reales)" \
+  || rec fail "kernel_release_name = $(kernel_release_name)"
+[ "$(kernel_release_name 7.2.11)" = "7.2.11-cizen-v3" ] \
+  && rec ok "kernel_release_name 7.2.11 -> 7.2.11-cizen-v3" \
+  || rec fail "kernel_release_name 7.2.11 = $(kernel_release_name 7.2.11)"
+VERSION="$_sv_ver"
+if [ -n "$_sv_suf" ]; then LOCALVERSION_SUFFIX="$_sv_suf"; else unset LOCALVERSION_SUFFIX; fi
+unset _sv_ver _sv_suf
+# El gate de extract_tarball debe ser la comparación normalizada: con una
+# igualdad estricta el árbol de 7.3 se descarta siempre (fallo real del usuario
+# de 2026-10-19: "La versión del árbol extraído no coincide con 7.3 ... 7.3.0").
+if grep -q 'if ! version_matches "\$kver" "\$VERSION"; then' "$MOTOR"; then
+  rec ok "extract_tarball valida el árbol con version_matches (acepta X.Y.0)"
+else
+  rec fail "extract_tarball ya no valida con version_matches: volverá a rechazar 7.3"
+fi
+if grep -q 'version_matches "\$ver" "\$ver_want" || return 1' "$MOTOR"; then
+  rec ok "tree_usable_for compara con version_matches"
+else
+  rec fail "tree_usable_for dejó de comparar con version_matches"
+fi
+if grep -q 'version_matches "\${__vid%%|\*}" "\$VERSION" || fatal' "$MOTOR"; then
+  rec ok "verify_build_tree valida con version_matches"
+else
+  rec fail "verify_build_tree ya no valida con version_matches"
+fi
 
 printf '%s\n' "== patch_desc: schedulers alternativos =="
 patch_desc_pds
@@ -1717,6 +1772,11 @@ PREFS
   : > "$ROOT/pgo.sh"
   extract_fn pgo_profile_dir  >> "$ROOT/pgo.sh"
   extract_fn pgo_list_profiles >> "$ROOT/pgo.sh"
+  # pgo_pick_profile compara con kernel_release_name (la forma real del
+  # release, 7.3.0-cizen-v3); sin extraerla el probe falla con "orden no
+  # encontrada" y la elección de perfil no queda probada.
+  extract_fn kernel_version_full >> "$ROOT/pgo.sh"
+  extract_fn kernel_release_name >> "$ROOT/pgo.sh"
   extract_fn pgo_pick_profile >> "$ROOT/pgo.sh"
   extract_fn pgo_disp_suffix  >> "$ROOT/pgo.sh"
   extract_fn ask_build_pgo    >> "$ROOT/pgo.sh"
@@ -2683,9 +2743,15 @@ VERSION=7.2.8; KERNEL_TREE=vanilla; TARBALL="$ROOT/linux-7.2.8.tar.xz"
 : > "$TARBALL"
 (
   cleanup_old_source_trees() { :; }
+  # STUB_V es la versión que el "Makefile" simulado reporta (kernelversion) y
+  # STUB_TOP el nombre del directorio que "entra" el tarball: el de kernel.org
+  # es linux-X.Y aunque el Makefile reporte X.Y.0. Los escenarios 1-3 usan
+  # 7.2.8 para ambos; el de una release X.Y.0 los separa.
+  STUB_V="${STUB_V:-7.2.8}"
+  STUB_TOP="${STUB_TOP:-$STUB_V}"
   make() { # el Makefile de pruebas responde la versión sin hacer nada real
     local a; for a in "$@"; do
-      [ "$a" = kernelversion ] && { printf '7.2.8\n'; return 0; }
+      [ "$a" = kernelversion ] && { printf '%s\n' "$STUB_V"; return 0; }
     done; return 0
   }
   tar() { # simula la extracción: aparece el árbol limpio donde toca
@@ -2693,8 +2759,8 @@ VERSION=7.2.8; KERNEL_TREE=vanilla; TARBALL="$ROOT/linux-7.2.8.tar.xz"
     for ((i = 0; i < ${#a[@]}; i++)); do
       [ "${a[$i]}" = "-C" ] && cdir="${a[$((i + 1))]}"
     done
-    mkdir -p "$cdir/linux-7.2.8/kernel/sched"
-    : > "$cdir/linux-7.2.8/Makefile"; : > "$cdir/linux-7.2.8/kernel/Makefile"
+    mkdir -p "$cdir/linux-$STUB_TOP/kernel/sched"
+    : > "$cdir/linux-$STUB_TOP/Makefile"; : > "$cdir/linux-$STUB_TOP/kernel/Makefile"
     return 0
   }
   WARNS="$ROOT/et.warn"
@@ -2737,6 +2803,21 @@ VERSION=7.2.8; KERNEL_TREE=vanilla; TARBALL="$ROOT/linux-7.2.8.tar.xz"
   else
     echo "desconocido fail $(tr '\n' ' ' < "$WARNS")" >> "$VEREDICTO"
   fi
+
+  # 4) Release X.Y.0: kernel.org publica "7.3" (VERSION) y el Makefile del
+  #    árbol responde "7.3.0" (SUBLEVEL=0). Con igualdad estricta el gate
+  #    rechazaba el árbol recién extraído: "La versión del árbol extraído no
+  #    coincide con 7.3 (obtenida: '7.3.0')" — el fallo real de 2026-10-19.
+  : > "$WARNS"; rm -rf "$TMPFS_ROOT"; mkdir -p "$TMPFS_ROOT"
+  STUB_V=7.3.0; STUB_TOP=7.3; VERSION=7.3; SRC="$TMPFS_ROOT/linux-7.3"
+  extract_tarball
+  if grep -q "^LOG:Extrayendo" "$WARNS" && ! grep -q "^ERR:" "$WARNS" \
+     && grep -qx "version=7.3.0" "$SRC/$TREE_META_NAME"; then
+    echo "xy0 ok" >> "$VEREDICTO"
+  else
+    echo "xy0 fail $(tr '\n' ' ' < "$WARNS")" >> "$VEREDICTO"
+  fi
+  STUB_V=7.2.8; STUB_TOP=7.2.8; VERSION=7.2.8
 ) 2>/dev/null
 # El veredicto viaja como "<caso> <ok|fail> [detalle]". El ok/fail va en su
 # propio campo a propósito: en un intento anterior el detalle iba pegado al
@@ -2749,6 +2830,7 @@ while read -r caso vered detalle; do
     sucio)       d="extract_tarball descarta el vanilla con BORE, lo dice y vuelve a extraer limpio" ;;
     limpio)      d="extract_tarball sigue reutilizando un árbol limpio" ;;
     desconocido) d="extract_tarball no hereda un árbol de estado desconocido" ;;
+    xy0)         d="extract_tarball acepta el árbol 7.3.0 de la release 7.3 (X.Y.0)" ;;
     *)           d="escenario inesperado '$caso'" ;;
   esac
   case "$vered" in
@@ -2759,7 +2841,7 @@ while read -r caso vered detalle; do
 done < "$VEREDICTO"
 # Si el subshellmurió antes de emitir veredictos, estos cuatro tests NO existen
 # y la sección entera pasa sin comprobar nada. Se cuenta lo que se esperaba.
-_esperados=3
+_esperados=4
 _emitidos="$(grep -c ' ok$' "$VEREDICTO" 2>/dev/null || echo 0)"
 _totales_v="$(grep -c '' "$VEREDICTO" 2>/dev/null || echo 0)"
 [ "$_totales_v" -eq "$_esperados" ] \
@@ -6696,6 +6778,11 @@ _sx_v27_33_9=0
 # _sx_nsc extrae de VERIFY_SRC; estas funciones están en el motor.
 _sx_fnm() { sed -n "/^$1() {/,/^}/p" "$MOTOR"; }
 _SX_ARC="$(_sx_fnm uki_archive_current)"
+# uki_archive_current compone su etiqueta con kernel_release_name (forma real
+# del release: 7.3.0-cizen-v3 en una X.Y.0); la sonda es un script aparte, así
+# que las dos funciones de las que depende van con ella.
+_SX_KVF="$(_sx_fnm kernel_version_full)"
+_SX_KRN="$(_sx_fnm kernel_release_name)"
 if [ -n "$_SX_ARC" ]; then
   rec ok "uki_archive_current existe y es extraíble"
   _sx_v27_33_9=$(( _sx_v27_33_9 + 1 ))
@@ -6727,6 +6814,8 @@ if [ "${LIESTAT:-0}" = 1 ]; then
   stat(){ local a; for a in "$@"; do if [ "$a" = "$FAKE_UKI" ]; then echo 999999; return 0; fi; done; command stat "$@"; }
 fi
 PROBE
+  printf '%s\n' "$_SX_KVF"
+  printf '%s\n' "$_SX_KRN"
   printf '%s\n' "$_SX_ARC"
   printf 'uki_archive_current\necho "RC=$?"\n'
 } > "$ROOT/arc-probe.sh"

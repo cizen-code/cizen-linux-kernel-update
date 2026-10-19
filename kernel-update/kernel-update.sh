@@ -174,7 +174,8 @@ SCRIPT_VERSION="27.35.9"
 PROFILE="cizen-optiplex7050"
 LOCALVERSION_SUFFIX="-cizen-v3"
 # Nombre del paquete Arch y pkgbase Cizen. El KERNELRELEASE seguirá siendo
-# VERSION-cizen-v3; este pkgbase es el que mkinitcpio usa para nombrar el preset.
+# <release>-cizen-v3 (7.3.0-cizen-v3 para la release 7.3); este pkgbase es el
+# que mkinitcpio usa para nombrar el preset.
 CIZEN_PKGBASE="linux-cizen-v3"
 LEGACY_PKGBASE="linux-upstream"
 
@@ -1165,6 +1166,56 @@ version_gt() {
   [ "$first" = "$b" ] && [ "$a" != "$b" ]
 }
 
+# kernel.org publica la release base como X.Y (SUBLEVEL=0), pero el propio
+# Makefile del árbol reporta X.Y.0 (`make kernelversion`, `make kernelrelease`,
+# uname -r, pkgver). La misma release existe en DOS formas y compararlas con
+# igualdad estricta rechaza árboles buenos: el primer build de una X.Y.0
+# (p. ej. 7.3) moría con "La versión del árbol extraído no coincide con 7.3
+# (obtenida: '7.3.0')". normalize_version reduce ambas a la forma canónica.
+# Solo quita el sufijo ".0" literal: "7.30" NO se toca, y "7.0.0" -> "7.0".
+normalize_version() {
+  local v="$1"
+  while [[ "$v" =~ ^([0-9]+\.[0-9]+)\.0$ ]]; do
+    v="${BASH_REMATCH[1]}"
+  done
+  printf '%s\n' "$v"
+}
+
+# ¿La versión $1 (forma del árbol/uname/pkgver) corresponde a la release $2
+# (forma canónica de kernel.org)? Normaliza LOS DOS lados y, si no coinciden,
+# prueba también con el patrón de sufijo usado en las comparaciones de árbol
+# (X.Y.Z-extra / X.Y-extra).
+version_matches() {
+  local a b
+  a="$(normalize_version "$1")"
+  b="$(normalize_version "$2")"
+  [ "$a" = "$b" ] && return 0
+  [[ "$1" == "$2"-* ]] && return 0
+  return 1
+}
+
+# Forma "llena" (la del Makefile) de una release canónica: X.Y -> X.Y.0.
+# Es con la que se escriben las identidades derivadas del KERNELRELEASE
+# (pkgver, /usr/lib/modules, uname -r, nombre de paquete, .afdo): el kernel
+# compilado SE LLAMA 7.3.0-cizen-v3 aunque kernel.org lo llame 7.3.
+kernel_version_full() {
+  local v="${1:-$VERSION}"
+  if [[ "$v" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    printf '%s.0\n' "$v"
+  else
+    printf '%s\n' "$v"
+  fi
+}
+
+# Nombre completo del release que este build produce, en la forma real del
+# KERNELRELEASE: "7.3" + "-cizen-v3" -> "7.3.0-cizen-v3". Es el que compone
+# pkgver, /usr/lib/modules/<release>, uname -r, archives de rollback y
+# etiquetas; usar la forma canónica aquí rompe cada una de esas identidades en
+# una release X.Y.0.
+kernel_release_name() {
+  printf '%s%s\n' "$(kernel_version_full "${1:-$VERSION}")" "${2:-$LOCALVERSION_SUFFIX}"
+}
+
 get_local_kernel_version() {
   local installed path base candidate="" best_local_version=""
 
@@ -1239,6 +1290,11 @@ resolve_latest_release() {
   REMOTE_STABLE_VERSION="$latest"
 
   local_version="$(get_local_kernel_version)"
+  # La forma del pkgver instalado es la del Makefile (7.3.0_cizen_v3 para la
+  # release 7.3): sin normalizar, LOCAL="7.3.0" hacía que el flujo de build
+  # fijara VERSION="$LOCAL" (URL linux-7.3.0.tar.xz -> 404) y que check-update
+  # comparara 7.3 contra 7.3.0 como si fueran releases distintas.
+  [ -z "$local_version" ] || local_version="$(normalize_version "$local_version")"
   LOCAL_KERNEL_VERSION="$local_version"
 
   case "${CIZEN_KERNEL_TRACK:-stable}" in
@@ -3005,7 +3061,7 @@ cleanup_old_source_trees() {
     [ -d "$dir" ] || continue
     name="$(basename -- "$dir")"
     version_num="${name#linux-}"
-    [ "$version_num" = "$VERSION" ] && continue
+    version_matches "$version_num" "$VERSION" && continue
 
     if [ -f "$dir/Makefile" ]; then
       log "Eliminando árbol de fuentes antiguo del tmpfs: $dir"
@@ -3064,7 +3120,7 @@ reconcile_tmpfs_trees() {
     fi
     if [ -f "$TMPFS_ROOT/.cizen-extracting-$ver" ] || [ -f "$TMPFS_ROOT/.cizen-extracting-$VERSION" ]; then
       warn "Descartando $dir: extracción interrumpida (a medias, versión $ver). No se reutiliza un árbol incompleto."
-    elif [ "$ver" = "$VERSION" ] || [[ "$ver" == "$VERSION"-* ]]; then
+    elif version_matches "$ver" "$VERSION"; then
       warn "Descartando $dir: es $kind y este build compila $KERNEL_TREE${TREE_FORCE_NOTE:+ ($TREE_FORCE_NOTE)}. Un árbol de otro tipo no se reutiliza nunca (los parches -cachy no aplican sobre vanilla y al revés)."
     else
       warn "Descartando $dir: es $ver y este build compila $VERSION."
@@ -3674,7 +3730,7 @@ tree_usable_for() {
   tree_identity_into "$dir" id
   ver="${id%%|*}"
   kind="${id#*|}"
-  [ "$ver" = "$ver_want" ] || [[ "$ver" == "$ver_want"-* ]] || return 1
+  version_matches "$ver" "$ver_want" || return 1
   case "$kind_want" in
     vanilla|cachyos) [ "$kind" = "$kind_want" ] || return 1 ;;
   esac
@@ -3836,7 +3892,7 @@ extract_tarball() {
       # creó entre medias) se descarta igualmente: reutilizar un árbol de otro
       # tipo o de otra versión compilaría el kernel equivocado sin avisar.
       kver="$(make -C "$SRC" -s kernelversion 2>/dev/null || true)"
-      if [ "$kver" = "$VERSION" ] || [[ "$kver" == "$VERSION"-* ]]; then
+      if version_matches "$kver" "$VERSION"; then
         warn "El árbol conservado es $(source_tree_kind "$SRC") y este build compila $KERNEL_TREE${TREE_FORCE_NOTE:+ ($TREE_FORCE_NOTE)}; se descarta y se vuelve a extraer $VERSION."
       else
         warn "El árbol existente es ${kver:-?} y este build compila $VERSION; se descarta y se vuelve a extraer."
@@ -3883,7 +3939,7 @@ extract_tarball() {
   fi
 
   kver="$(make -C "$SRC" -s kernelversion 2>/dev/null || true)"
-  if [ "$kver" != "$VERSION" ] && [[ "$kver" != "$VERSION"-* ]]; then
+  if ! version_matches "$kver" "$VERSION"; then
   err "La versión del árbol extraído no coincide con $VERSION (obtenida: '${kver:-?}')"
   rm -rf "$SRC"
   return 1
@@ -7594,9 +7650,10 @@ absorb_rebels_to_profile() {
 # ============================================================
 # REPRODUCIBILIDAD / PACKAGE DISCOVERY
 # ============================================================
-# El nombre del kernel uname -r sigue siendo VERSION-cizen-v3. El nombre de
-# paquete Arch es linux-cizen-v3 y es deliberadamente distinto: mkinitcpio
-# toma pkgbase del paquete para usar linux-cizen-v3.preset.
+# El nombre del kernel uname -r es kernel_release_name (la forma real del
+# KERNELRELEASE: VERSION-cizen-v3, o VERSION.0-cizen-v3 en una X.Y.0). El
+# nombre de paquete Arch es linux-cizen-v3 y es deliberadamente distinto:
+# mkinitcpio toma pkgbase del paquete para usar linux-cizen-v3.preset.
 
 verify_build_tree() {
   [ -f .config ] || fatal "No existe .config antes de compilar."
@@ -7607,7 +7664,7 @@ verify_build_tree() {
   # local: sin esto el nombre se filtra al ambito global y shellcheck avisa (SC2154).
   local __vid
   tree_identity_into "$SRC" __vid
-  [ "${__vid%%|*}" = "$VERSION" ] || fatal "La versión del árbol no coincide con $VERSION."
+  version_matches "${__vid%%|*}" "$VERSION" || fatal "La versión del árbol no coincide con $VERSION."
 
   # Estos cuatro símbolos deben quedar compilados DIRECTAMENTE en el kernel
   # (=y, nunca módulo) porque el arranque de este equipo depende de una UKI
@@ -7793,7 +7850,12 @@ restore_package_pruning_override() {
 determine_pkgrel() {
   local pattern file base rel max_rel=0 installed_ver installed_rel
 
-  PKGVER_BASE="${VERSION}${LOCALVERSION_SUFFIX}"
+  # La forma es la del KERNELRELEASE del build (7.3.0_cizen_v3 para la release
+  # 7.3): el pkgver del paquete lo genera el PKGBUILD desde kernelrelease, así
+  # que el patrón de builds anteriores y la comprobación del instalado deben
+  # usar ESA forma; con "7.3_cizen_v3" el pkgrel volvía a 1 en cada rebuild de
+  # una X.Y.0.
+  PKGVER_BASE="$(kernel_release_name)"
   PKGVER_BASE="${PKGVER_BASE//-/_}"
   pattern="${CIZEN_PKGBASE}-${PKGVER_BASE}-*-x86_64.pkg.tar.zst"
 
@@ -7926,7 +7988,7 @@ collect_build_artifact() {
         err "No se encontró ningún .deb tras make deb-pkg en $TMPFS_ROOT."
         return 1
       fi
-      PKG="$newest"; PKG_NAME="linux-image-cizen"; PKG_VERSION="$VERSION-cizen-v3"
+      PKG="$newest"; PKG_NAME="linux-image-cizen"; PKG_VERSION="$(kernel_version_full "$VERSION")-cizen-v3"
       ok "Artefacto .deb detectado: $(basename "$PKG")"
       ;;
     rpm)
@@ -7937,13 +7999,13 @@ collect_build_artifact() {
         err "No se encontró ningún .rpm tras make rpm-pkg en $TMPFS_ROOT."
         return 1
       fi
-      PKG="$newest"; PKG_NAME="linux-cizen"; PKG_VERSION="$VERSION-cizen-v3"
+      PKG="$newest"; PKG_NAME="linux-cizen"; PKG_VERSION="$(kernel_version_full "$VERSION")-cizen-v3"
       ok "Artefacto .rpm detectado: $(basename "$PKG")"
       ;;
     generic|gentoo)
       PKG=""
       PKG_NAME="linux-cizen-v3"
-      PKG_VERSION="$VERSION-cizen-v3"
+      PKG_VERSION="$(kernel_version_full "$VERSION")-cizen-v3"
       ok "Backend $CIZEN_PKG_BACKEND: sin paquete; se instala desde el árbol (modules_install + vmlinuz)."
       ;;
   esac
@@ -8178,7 +8240,7 @@ preserve_rollback_package() {
   rollback_manifest_set_many \
     pkgbase "$CIZEN_PKGBASE" \
     pkgver  "$pkgver" \
-    release "${VERSION}${LOCALVERSION_SUFFIX}" \
+    release "$(kernel_release_name)" \
     sched   "$(effective_scheduler)" \
     pkgfile "$name" \
     ts      "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -8191,7 +8253,7 @@ preserve_rollback_package() {
   # un archive que corresponde a otro build —justo lo que el comentario de arriba
   # dice querer evitar— y, como el prune posterior borra ese .tar.xz, acababa
   # apuntando a un fichero inexistente. Para desincular está rollback_manifest_unset.
-  if [ ! -f "$ROLLBACK_DIR/${VERSION}${LOCALVERSION_SUFFIX}.tar.xz" ]; then
+  if [ ! -f "$ROLLBACK_DIR/$(kernel_release_name).tar.xz" ]; then
     rollback_manifest_unset archive
   fi
 
@@ -8428,7 +8490,7 @@ write_verify_signature() {
   local profile_hash="" rel
   mkdir -p -- "$VERIFY_STATE_DIR" 2>/dev/null || true
   [ -f "$PROFILE_FILE" ] && profile_hash="$(sha256sum "$PROFILE_FILE" | cut -d' ' -f1 2>/dev/null || true)"
-  rel="${VERSION}${LOCALVERSION_SUFFIX}"
+  rel="$(kernel_release_name)"
   {
     printf 'version=%s\n' "$rel"
     printf 'bore=%s\n' "$([ "$BORE_ENABLED" = true ] && echo yes || echo no)"
@@ -8591,7 +8653,8 @@ cizen_uki_cleanup_efi_bak() {
 }
 
 find_cizen_installed_kernel() {
-    local rel="${VERSION}${LOCALVERSION_SUFFIX}"
+    local rel
+    rel="$(kernel_release_name)"
     local c
     local -a candidates=(
         "/boot/vmlinuz-${CIZEN_PKGBASE}"
@@ -9133,10 +9196,10 @@ build_cizen_uki() {
     cmdline_text="$(<"$cmdline_file")"
 
     # os-release propio embebido en la UKI (.osrel) para que systemd-boot
-    # muestre "Linux 7.2.7-cizen-v3" en el menú. Sin --os-release, ukify
-    # incrusta /etc/os-release por defecto y el menú mostraría el nombre del
-    # sistema ("Arch Linux (rolling)").
-    rel="${VERSION}${LOCALVERSION_SUFFIX}"
+    # muestre "Linux 7.3.0-cizen-v3" en el menú (la forma real del release).
+    # Sin --os-release, ukify incrusta /etc/os-release por defecto y el menú
+    # mostraría el nombre del sistema ("Arch Linux (rolling)").
+    rel="$(kernel_release_name)"
     osrel_file="$(mktemp /tmp/cizen-osrel.XXXXXX)" || {
         err "No pude crear el os-release temporal."
         return 1
@@ -11165,11 +11228,19 @@ pgo_list_profiles() { # un .afdo por línea, en orden de versión
 # puede usar (AutoFDO degrada por pesos, no rompe) pero es peor advice, así que
 # solo se propone como último recurso.
 pgo_pick_profile() {
-  local f best=""
+  local f best="" name rel_full
+  # El perfil lo guarda pgo-collect.sh como <uname -r>.afdo, es decir en la
+  # forma real del release (7.3.0-cizen-v3); se acepta también la canónica
+  # por si el fichero lo creó una versión anterior de la herramienta. Los
+  # nombres se resuelven UNA vez, no por fichero: cada $( ) en el bucle era
+  # un subshell más por iteración.
+  rel_full="$(kernel_release_name)"
   while IFS= read -r f; do
     [ -n "$f" ] || continue
-    if [ "$(basename -- "$f")" = "$VERSION-cizen-v3.afdo" ] \
-       || [ "$(basename -- "$f")" = "$VERSION.afdo" ]; then
+    name="$(basename -- "$f")"
+    if [ "$name" = "$rel_full.afdo" ] \
+       || [ "$name" = "$VERSION-cizen-v3.afdo" ] \
+       || [ "$name" = "$VERSION.afdo" ]; then
       best="$f"; break
     fi
     best="$f"
@@ -11535,7 +11606,7 @@ case "$CIZEN_PKG_BACKEND" in
     prepare_package_pruning_override
     ;;
   *)
-    PKGVER_BASE="${VERSION}-cizen-v3"
+    PKGVER_BASE="$(kernel_version_full "$VERSION")-cizen-v3"
     PKGREL=1
     info "Backend $CIZEN_PKG_BACKEND: pkgrel fijado a 1 (el contador de pkgrel es específico de pacman)."
     ;;
@@ -11654,14 +11725,14 @@ else
     err "Compilación falló (rc=$build_rc)."
   fi
   err "Fuentes conservadas en: $SRC"
-  notify_desktop "Kernel Cizen: compilación FALLÓ" "$VERSION-cizen-v3 (rc=$build_rc); fuentes en $SRC"
+  notify_desktop "Kernel Cizen: compilación FALLÓ" "$(kernel_release_name) (rc=$build_rc); fuentes en $SRC"
   exit 1
 fi
 
 END="$(date +%s)"
 DUR=$((END - START))
 ok "Compilación completada en $((DUR/60))m $((DUR%60))s"
-notify_desktop "Kernel Cizen: compilación terminada" "$VERSION-cizen-v3 ($((DUR/60))m $((DUR%60))s, $JOBS hilos; ahora instala/Uki)"
+notify_desktop "Kernel Cizen: compilación terminada" "$(kernel_release_name) ($((DUR/60))m $((DUR%60))s, $JOBS hilos; ahora instala/Uki)"
 restore_package_revision_override
 restore_package_identity_override
 
@@ -11682,13 +11753,13 @@ fi
 # v27.31.52: el KERNELRELEASE del build se resuelve UNA vez. Había tres sitios
 # (check_installed_release_generic, module_sign_installed y la auditoría LUKS/FDE)
 # lanzando `make -C $SRC -s kernelrelease` por separado, cada uno con su propio
-# `|| echo "$VERSION-cizen-v3"` de respaldo: tres subshells y tres make, y si
+# `|| <fallback>` de respaldo: tres subshells y tres make, y si
 # alguno fallaba de forma distinta los tres reportaban un release diferente para
 # el MISMO build. El release no cambia durante la ejecución (el árbol ya está
 # configurado), así que se calcula una vez y se reparte.
 kernel_release() {
   if [ -z "${KERNEL_RELEASE:-}" ]; then
-    KERNEL_RELEASE="$(make -C "$SRC" -s kernelrelease 2>/dev/null || echo "$VERSION-cizen-v3")"
+    KERNEL_RELEASE="$(make -C "$SRC" -s kernelrelease 2>/dev/null || kernel_release_name)"
   fi
   printf '%s\n' "$KERNEL_RELEASE"
 }
@@ -11958,7 +12029,7 @@ uki_backup_prune() { # conserva los CIZEN_UKI_BACKUP_KEEP más recientes
 uki_backup_prev() {
   [ "$CIZEN_UKI_BACKUP" = "1" ] || return 0
   local tgt dst rel n
-  rel="$VERSION-cizen-v3"
+  rel="$(kernel_release_name)"
   if [ ! -d "$CIZEN_UKI_BACKUP_DIR" ]; then
     sudo mkdir -p "$CIZEN_UKI_BACKUP_DIR" || { warn "No se pudo crear $CIZEN_UKI_BACKUP_DIR; se omite el backup del UKI."; return 0; }
   fi
@@ -12015,7 +12086,7 @@ uki_archive_current() {
   [ -n "$name" ] || { warn "No se conoce el nombre del UKI; no se archiva copia local."; return 0; }
   # La etiqueta lleva pkgrel, no solo uname -r: dos builds distintos pueden
   # llamarse igual (v27.33.7) y un rollback necesita saber cuál es cuál.
-  lbl="$VERSION$LOCALVERSION_SUFFIX-$PKGREL"
+  lbl="$(kernel_release_name)-$PKGREL"
   ts="$(date +%Y%m%d-%H%M%S)"
   if ! mkdir -p -- "$dir" 2>/dev/null; then
     warn "No se pudo crear $dir; no se archiva copia local del UKI."
@@ -12748,7 +12819,7 @@ cat <<SUMMARY
 ===============================================================
 ACTUALIZACIÓN COMPLETADA — CIZEN v$SCRIPT_VERSION
 ===============================================================
- Versión     : $VERSION-cizen-v3
+ Versión     : $(kernel_release_name)
  pkgrel      : $PKGREL
 Perfil      : $PROFILE
   Parches     : ${PATCHES_APPLIED[*]:---}
